@@ -1,8 +1,13 @@
 use gpui::{App, KeyBinding, actions};
 use terminal::{Copy, Paste, ScrollPageDown, ScrollPageUp, ScrollToBottom};
+use workspace::pane::{
+    ActivateNextItem, ActivatePreviousItem, CloseActiveItem, CloseAllItems, CloseOtherItems,
+    SplitDown, SplitRight,
+};
+use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
-actions!(zmux, [Quit]);
+actions!(zmux, [NewTerminal, Quit]);
 
 pub fn configure_keybindings(cx: &mut App) {
     cx.bind_keys([
@@ -17,6 +22,17 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("pagedown", ScrollPageDown, None),
         KeyBinding::new("shift-pagedown", ScrollPageDown, None),
         KeyBinding::new("end", ScrollToBottom, None),
+        KeyBinding::new("ctrl-shift-t", NewTerminal, None),
+        KeyBinding::new("ctrl-shift-n", NewTerminal, None),
+        KeyBinding::new("ctrl-tab", ActivateNextItem::default(), None),
+        KeyBinding::new("ctrl-shift-tab", ActivatePreviousItem::default(), None),
+        KeyBinding::new("ctrl-shift-w", CloseActiveItem::default(), None),
+        KeyBinding::new("ctrl-shift-alt-w", CloseAllItems::default(), None),
+        KeyBinding::new("ctrl-shift-o", CloseOtherItems::default(), None),
+        KeyBinding::new("alt-right", ActivateNextPane, None),
+        KeyBinding::new("alt-left", ActivatePreviousPane, None),
+        KeyBinding::new("ctrl-shift-d", SplitRight::default(), None),
+        KeyBinding::new("ctrl-shift-alt-d", SplitDown::default(), None),
         KeyBinding::new("ctrl-=", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl-+", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl--", DecreaseBufferFontSize { persist: false }, None),

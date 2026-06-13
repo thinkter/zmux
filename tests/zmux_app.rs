@@ -6,8 +6,18 @@ use settings::Settings;
 use task::Shell;
 use terminal::terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use terminal::{TerminalBounds, TerminalBuilder};
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use util::paths::PathStyle;
-use zmux::{configure_keybindings, configure_terminal_fonts, configure_zoom_actions, terminal_env};
+use workspace::dock::Panel;
+use workspace::pane::{
+    ActivateNextItem, ActivatePreviousItem, CloseActiveItem, CloseAllItems, CloseOtherItems,
+    SplitDown, SplitRight,
+};
+use workspace::{ActivateNextPane, ActivatePreviousPane};
+use zmux::{
+    NewTerminal as ZmuxNewTerminal, configure_keybindings, configure_terminal_fonts,
+    configure_zoom_actions, init_zmux, open_zmux_workspace, terminal_env,
+};
 
 #[test]
 fn terminal_bounds_round_down_to_complete_cells() {
@@ -59,6 +69,7 @@ async fn display_only_terminal_output_is_available_to_zmux(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn terminal_builder_runs_deterministic_command(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
     cx.update(|cx| {
         settings::init(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -176,6 +187,114 @@ async fn zoom_actions_adjust_terminal_effective_font_size(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn workspace_shell_opens_first_terminal_as_center_tab(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace(None, cx)
+    });
+
+    let opened = open_task
+        .await
+        .expect("workspace shell should open without panicking");
+
+    for _ in 0..50 {
+        cx.run_until_parked();
+        let center_terminal_count = opened.workspace.read_with(cx, center_terminal_count);
+        if center_terminal_count > 0 {
+            let (center_item_count, welcome_event, bottom_terminal_count) =
+                opened.workspace.update(cx, |workspace, cx| {
+                    let (center_item_count, welcome_event) = {
+                        let center_pane = workspace.active_pane();
+                        let center_pane = center_pane.read(cx);
+                        (
+                            center_pane.items_len(),
+                            center_pane
+                                .items()
+                                .find_map(|item| item.telemetry_event_text(cx)),
+                        )
+                    };
+                    (
+                        center_item_count,
+                        welcome_event,
+                        bottom_terminal_count(workspace, cx),
+                    )
+                });
+
+            assert_eq!(center_terminal_count, 1);
+            assert_eq!(center_item_count, 2);
+            assert_eq!(welcome_event, Some("Zmux Welcome Page Opened"));
+            assert_eq!(bottom_terminal_count, 0);
+            assert!(
+                opened.workspace.read_with(cx, |workspace, cx| workspace
+                    .panel::<TerminalPanel>(cx)
+                    .is_none()),
+                "terminal panel should not be installed for startup terminal creation"
+            );
+
+            return;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+
+    let center_terminal_count = opened.workspace.read_with(cx, center_terminal_count);
+    let bottom_terminal_count = opened.workspace.read_with(cx, bottom_terminal_count);
+    assert_eq!(bottom_terminal_count, 0);
+    assert!(
+        center_terminal_count > 0,
+        "expected at least one center terminal item"
+    );
+}
+
+#[gpui::test]
+async fn zmux_new_terminal_action_adds_center_tab_not_bottom_panel(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace(None, cx)
+    });
+
+    let opened = open_task
+        .await
+        .expect("workspace shell should open without panicking");
+
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if opened.workspace.read_with(cx, center_terminal_count) == 1 {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+
+    assert_eq!(opened.workspace.read_with(cx, center_terminal_count), 1);
+    assert_eq!(opened.workspace.read_with(cx, bottom_terminal_count), 0);
+
+    opened
+        .window
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(ZmuxNewTerminal.boxed_clone(), cx);
+        })
+        .expect("window should still be open");
+
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if opened.workspace.read_with(cx, center_terminal_count) == 2 {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+
+    assert_eq!(opened.workspace.read_with(cx, center_terminal_count), 2);
+    assert_eq!(opened.workspace.read_with(cx, bottom_terminal_count), 0);
+}
+
+#[gpui::test]
 async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppContext) {
     cx.update(|cx| {
         configure_keybindings(cx);
@@ -228,7 +347,35 @@ async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppCon
             "cmd-0",
             &zed_actions::ResetBufferFontSize { persist: false },
         );
+        assert_bound(cx, "ctrl-shift-t", &ZmuxNewTerminal);
+        assert_bound(cx, "ctrl-shift-n", &ZmuxNewTerminal);
+        assert_bound(cx, "ctrl-tab", &ActivateNextItem::default());
+        assert_bound(cx, "ctrl-shift-tab", &ActivatePreviousItem::default());
+        assert_bound(cx, "ctrl-shift-w", &CloseActiveItem::default());
+        assert_bound(cx, "ctrl-shift-alt-w", &CloseAllItems::default());
+        assert_bound(cx, "ctrl-shift-o", &CloseOtherItems::default());
+        assert_bound(cx, "alt-right", &ActivateNextPane);
+        assert_bound(cx, "alt-left", &ActivatePreviousPane);
+        assert_bound(cx, "ctrl-shift-d", &SplitRight::default());
+        assert_bound(cx, "ctrl-shift-alt-d", &SplitDown::default());
     });
+}
+
+fn center_terminal_count(workspace: &workspace::Workspace, cx: &gpui::App) -> usize {
+    workspace
+        .active_pane()
+        .read(cx)
+        .items()
+        .filter(|item| item.act_as::<TerminalView>(cx).is_some())
+        .count()
+}
+
+fn bottom_terminal_count(workspace: &workspace::Workspace, cx: &gpui::App) -> usize {
+    workspace
+        .panel::<TerminalPanel>(cx)
+        .and_then(|panel| panel.read(cx).pane())
+        .map(|pane| pane.read(cx).items_len())
+        .unwrap_or(0)
 }
 
 fn assert_bound(cx: &gpui::App, keystroke: &str, action: &dyn Action) {
