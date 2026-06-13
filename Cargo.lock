@@ -3508,7 +3508,6 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "parking_lot",
- "rand 0.9.4",
  "regex",
  "rope",
  "schemars",
@@ -10285,7 +10284,6 @@ dependencies = [
  "mach2 0.5.0",
  "nix 0.29.0",
  "percent-encoding",
- "rand 0.9.4",
  "regex",
  "rust-embed",
  "schemars",
@@ -10299,7 +10297,6 @@ dependencies = [
  "tendril",
  "unicase",
  "url",
- "util_macros",
  "walkdir",
  "which 6.0.3",
 ]

@@ -53,7 +53,7 @@ gpui_platform = { workspace = true }
 [dev-dependencies]
 async-channel = "2"
 gpui = { workspace = true, features = ["test-support"] }
-terminal = { workspace = true, features = ["test-support"] }
+terminal = { workspace = true }
 
 [profile.release]
 strip = "symbols"
