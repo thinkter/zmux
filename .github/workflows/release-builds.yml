@@ -1,0 +1,103 @@
+name: Release builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            os: ubuntu-latest
+            artifact: zmux-linux-x86_64
+            archive: zmux-linux-x86_64.tar.gz
+          - label: macOS aarch64
+            os: macos-14
+            artifact: zmux-macos-aarch64
+            archive: zmux-macos-aarch64.tar.gz
+          - label: macOS x86_64
+            os: macos-13
+            artifact: zmux-macos-x86_64
+            archive: zmux-macos-x86_64.tar.gz
+          - label: Windows x86_64
+            os: windows-latest
+            artifact: zmux-windows-x86_64
+            archive: zmux-windows-x86_64.zip
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            elfutils \
+            g++ \
+            gcc \
+            gettext-base \
+            git \
+            jq \
+            libasound2-dev \
+            libfontconfig-dev \
+            libgit2-dev \
+            libglib2.0-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            libva-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            lld \
+            llvm \
+            make \
+            musl-dev \
+            musl-tools \
+            pipewire \
+            xdg-desktop-portal
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.archive }}" -C target/release zmux
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive -Path target/release/zmux.exe -DestinationPath "dist/${{ matrix.archive }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
