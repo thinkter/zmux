@@ -25,10 +25,6 @@ jobs:
             os: macos-14
             artifact: zmux-macos-aarch64
             archive: zmux-macos-aarch64.tar.gz
-          - label: macOS x86_64
-            os: macos-13
-            artifact: zmux-macos-x86_64
-            archive: zmux-macos-x86_64.tar.gz
           - label: Windows x86_64
             os: windows-latest
             artifact: zmux-windows-x86_64
