@@ -7,7 +7,7 @@ use workspace::pane::{
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
-actions!(zmux, [NewTerminal, Quit]);
+actions!(zmux, [NewTerminal, OpenSettings, Quit]);
 
 pub fn configure_keybindings(cx: &mut App) {
     cx.bind_keys([
