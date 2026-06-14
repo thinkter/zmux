@@ -68,8 +68,13 @@ pub fn open_zmux_workspace(
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
     let app_state = AppState::global(cx);
+
+    let initial_dirs = crate::env::current_working_directory()
+        .map(|p| vec![p])
+        .unwrap_or_default();
+
     Workspace::new_local(
-        Vec::new(),
+        initial_dirs,
         app_state,
         requesting_window,
         Some(terminal_env()),
