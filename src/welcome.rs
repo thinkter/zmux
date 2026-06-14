@@ -1,4 +1,5 @@
 use crate::NewTerminal;
+use crate::keymap::OpenSettings;
 use gpui::{
     Action, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
     Render, SharedString, Styled, Window,
@@ -202,11 +203,13 @@ impl Render for ZmuxWelcome {
                         v_flex()
                             .min_w_full()
                             .child(SectionHeader::new("Configure"))
-                            .child(InertButton::new(
+                            .child(ActionButton::new(
                                 "open-settings",
                                 "Open Settings",
                                 IconName::Settings,
+                                &OpenSettings,
                                 2,
+                                self.focus_handle.clone(),
                             ))
                             .child(InertButton::new(
                                 "customize-keymaps",
