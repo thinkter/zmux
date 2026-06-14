@@ -100,7 +100,7 @@ impl Render for ZmuxTerminal {
                     .size_full()
                     .bg(gpui::rgb(0x101010))
                     .text_color(gpui::rgb(0xd8d8d8))
-                    .font_family("JetBrains Mono")
+                    .font_family("monospace")
                     .text_size(px(14.0))
                     .line_height(px(18.0))
                     .child(
