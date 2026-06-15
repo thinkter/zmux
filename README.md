@@ -12,8 +12,23 @@ Shortcuts:
 
 - Copy: `Ctrl-Shift-C`, `Ctrl-Insert`, or `Cmd-C`.
 - Paste: `Ctrl-Shift-V`, `Shift-Insert`, or `Cmd-V`.
+- New terminal tab: `Ctrl-Shift-T` or `Ctrl-Shift-N`.
+- New workspace: `Ctrl-Shift-E`. Toggle the workspaces sidebar: `Ctrl-Shift-B`.
 - Zoom terminal font: `Ctrl-=`/`Ctrl-+`, `Ctrl--`, `Ctrl-0`; macOS-style `Cmd` variants are also bound.
 - Plain `Ctrl-C` is intentionally left for the shell interrupt signal.
+
+## Workspaces
+
+The left sidebar lists independent **workspaces**. Each workspace keeps its own
+open terminal tabs *and* their split layout. Switching is instant: the active
+workspace lives in the center pane group, while inactive ones are detached and
+parked with their terminals still running (no PTY restart), so a build or watch
+process keeps going in the background while you work elsewhere.
+
+- Click **+** (or press `Ctrl-Shift-E`) to create a workspace.
+- Click a workspace to switch to it.
+- Double-click a workspace (or use the pencil button) to rename it inline.
+- Use the trash button to close a workspace; the last one can't be closed.
 
 Build notes:
 

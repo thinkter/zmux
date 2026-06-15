@@ -7,6 +7,8 @@ use workspace::pane::{
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
+use crate::workspaces::{NewWorkspace, ToggleWorkspacesPanel};
+
 actions!(zmux, [NewTerminal, OpenSettings, Quit]);
 
 pub fn configure_keybindings(cx: &mut App) {
@@ -24,6 +26,8 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("end", ScrollToBottom, None),
         KeyBinding::new("ctrl-shift-t", NewTerminal, None),
         KeyBinding::new("ctrl-shift-n", NewTerminal, None),
+        KeyBinding::new("ctrl-shift-e", NewWorkspace, None),
+        KeyBinding::new("ctrl-shift-b", ToggleWorkspacesPanel, None),
         KeyBinding::new("ctrl-tab", ActivateNextItem::default(), None),
         KeyBinding::new("ctrl-shift-tab", ActivatePreviousItem::default(), None),
         KeyBinding::new("ctrl-shift-w", CloseActiveItem::default(), None),

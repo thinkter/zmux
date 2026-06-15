@@ -61,6 +61,7 @@ pub fn configure_terminal_fonts(cx: &mut App) {
 
     let settings_json = format!(
         r#"{{
+  "disable_ai": true,
   "buffer_font_family": "{primary}",
   "buffer_font_features": {{ }},
   "buffer_font_size": 14,

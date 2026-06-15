@@ -18,9 +18,10 @@ use crate::env::terminal_env;
 use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
+use crate::workspaces::{NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};
 
 pub fn run() -> anyhow::Result<()> {
-    application().run(|cx: &mut App| {
+    application().with_assets(crate::assets::Assets).run(|cx: &mut App| {
         init_zmux(cx);
 
         cx.spawn(async move |cx| {
@@ -88,8 +89,32 @@ pub fn open_zmux_workspace(
             workspace
                 .bottom_dock()
                 .update(cx, |dock, cx| dock.set_open(false, window, cx));
+
+            let panel = cx.new(|cx| WorkspacesPanel::new(workspace.weak_handle(), window, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.open_panel::<WorkspacesPanel>(window, cx);
+
             workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
                 create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+            });
+            workspace.register_action(|workspace, _: &NewWorkspace, window, cx| {
+                let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                    return;
+                };
+                // Defer to the *app* level (not `defer_in`, which re-enters this
+                // `Workspace` update) so the panel can swap the center — which
+                // itself updates the workspace — without a re-entrant update.
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            panel.update(cx, |panel, cx| panel.create_workspace(window, cx));
+                        })
+                        .ok();
+                });
+            });
+            workspace.register_action(|workspace, _: &ToggleWorkspacesPanel, window, cx| {
+                workspace.toggle_panel_focus::<WorkspacesPanel>(window, cx);
             });
             create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
         })),
@@ -98,7 +123,7 @@ pub fn open_zmux_workspace(
     )
 }
 
-fn create_center_terminal(
+pub(crate) fn create_center_terminal(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,

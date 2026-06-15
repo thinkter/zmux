@@ -5,6 +5,7 @@
 .env
 .env.*
 !.env.example
+.claude
 
 # Editor and IDE state
 .vscode/
