@@ -24,7 +24,7 @@ use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::create_center_terminal;
 
-actions!(zmux, [NewWorkspace, ToggleWorkspacesPanel]);
+actions!(zmux, [NewWorkspace, ToggleWorkspacesPanel, ActivateNextWorkspace, ActivatePreviousWorkspace]);
 
 const PANEL_WIDTH: f32 = 240.0;
 
@@ -146,6 +146,32 @@ impl WorkspacesPanel {
         }
         self.active = id;
         cx.notify();
+    }
+
+    pub fn activate_next_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == self.active)
+            .unwrap_or(0);
+        let next_index = (current_index + 1) % self.entries.len();
+        let next_id = self.entries[next_index].id;
+        self.activate_workspace(next_id, window, cx);
+    }
+
+    pub fn activate_previous_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == self.active)
+            .unwrap_or(0);
+        let prev_index = if current_index == 0 {
+            self.entries.len() - 1
+        } else {
+            current_index - 1
+        };
+        let prev_id = self.entries[prev_index].id;
+        self.activate_workspace(prev_id, window, cx);
     }
 
     /// Close a workspace. Its terminals are dropped along with the entry. The

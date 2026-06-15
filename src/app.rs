@@ -18,7 +18,7 @@ use crate::env::terminal_env;
 use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
-use crate::workspaces::{NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};
+use crate::workspaces::{ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};
 
 pub fn run() -> anyhow::Result<()> {
     application().with_assets(crate::assets::Assets).run(|cx: &mut App| {
@@ -115,6 +115,32 @@ pub fn open_zmux_workspace(
             });
             workspace.register_action(|workspace, _: &ToggleWorkspacesPanel, window, cx| {
                 workspace.toggle_panel_focus::<WorkspacesPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &ActivateNextWorkspace, window, cx| {
+                let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                    return;
+                };
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            panel.update(cx, |panel, cx| panel.activate_next_workspace(window, cx));
+                        })
+                        .ok();
+                });
+            });
+            workspace.register_action(|workspace, _: &ActivatePreviousWorkspace, window, cx| {
+                let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                    return;
+                };
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            panel.update(cx, |panel, cx| panel.activate_previous_workspace(window, cx));
+                        })
+                        .ok();
+                });
             });
             create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
         })),
