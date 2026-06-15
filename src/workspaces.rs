@@ -112,6 +112,17 @@ impl WorkspacesPanel {
             name,
             stored: None,
         });
+
+        self.entries.sort_by_key(|entry| entry.id);
+
+        // debug purposes
+        // let ids = self
+        //     .entries
+        //     .iter()
+        //     .map(|entry| entry.id)
+        //     .collect::<Vec<_>>();
+        // println!("Created workspace {:#?}", ids);
+
         self.activate_workspace(id, window, cx);
     }
 
