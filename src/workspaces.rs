@@ -23,6 +23,7 @@ use workspace::item::ItemHandle;
 use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::create_center_terminal;
+use crate::welcome::ZmuxWelcome;
 
 actions!(
     zmux,
@@ -166,6 +167,13 @@ impl WorkspacesPanel {
             match target_layout {
                 Some(layout) => restore_layout(workspace, target_pane, layout, window, cx),
                 None => {
+                    //spawning a new terminal sometimes fails...
+                    // this a good workarround for now. gotta add some sorta retry logic
+                    let welcome = cx.new(ZmuxWelcome::new);
+                    let target_pane = workspace.active_pane().clone();
+                    target_pane.update(cx, |pane, cx| {
+                        pane.add_item(Box::new(welcome), true, true, None, window, cx);
+                    });
                     create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
                 }
             }
