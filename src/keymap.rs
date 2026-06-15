@@ -11,7 +11,20 @@ use crate::workspaces::{ActivateNextWorkspace, ActivatePreviousWorkspace, NewWor
 
 actions!(zmux, [NewTerminal, OpenSettings, Quit]);
 
+#[cfg(target_os = "macos")]
+const DEFAULT_KEYMAP: &str = "keymaps/default-macos.json";
+#[cfg(target_os = "linux")]
+const DEFAULT_KEYMAP: &str = "keymaps/default-linux.json";
+#[cfg(target_os = "windows")]
+const DEFAULT_KEYMAP: &str = "keymaps/default-windows.json";
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+const DEFAULT_KEYMAP: &str = "keymaps/default-linux.json";
+
 pub fn configure_keybindings(cx: &mut App) {
+    if let Ok(bindings) = settings::KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP, cx) {
+        cx.bind_keys(bindings);
+    }
+
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, None),
         KeyBinding::new("cmd-v", Paste, None),
