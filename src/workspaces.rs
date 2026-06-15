@@ -24,7 +24,15 @@ use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::create_center_terminal;
 
-actions!(zmux, [NewWorkspace, ToggleWorkspacesPanel, ActivateNextWorkspace, ActivatePreviousWorkspace]);
+actions!(
+    zmux,
+    [
+        NewWorkspace,
+        ToggleWorkspacesPanel,
+        ActivateNextWorkspace,
+        ActivatePreviousWorkspace
+    ]
+);
 
 const PANEL_WIDTH: f32 = 240.0;
 
@@ -69,7 +77,11 @@ pub struct WorkspacesPanel {
 }
 
 impl WorkspacesPanel {
-    pub fn new(workspace: WeakEntity<Workspace>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let entries = vec![WorkspaceEntry {
             id: 1,
@@ -89,7 +101,11 @@ impl WorkspacesPanel {
     /// Create a fresh, empty workspace and switch to it.
     pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_id;
-        self.next_id += 1;
+        if self.next_id <= self.entries.len() as u64 {
+            self.next_id = self.entries.len() as u64 + 2;
+        } else {
+            self.next_id += 1;
+        }
         let name = format!("Workspace {id}");
         self.entries.push(WorkspaceEntry {
             id,
@@ -102,7 +118,12 @@ impl WorkspacesPanel {
     /// Switch the center to display the given workspace, parking the currently
     /// active one. The whole swap happens in a single [`Workspace`] update so the
     /// user never sees an intermediate state.
-    pub fn activate_workspace(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn activate_workspace(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if id == self.active {
             if let Some(workspace) = self.workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| workspace.focus_center_pane(window, cx));
@@ -191,6 +212,9 @@ impl WorkspacesPanel {
                 self.activate_workspace(fallback, window, cx);
             }
         }
+
+        self.next_id = id;
+
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
         cx.notify();
@@ -265,7 +289,11 @@ impl WorkspacesPanel {
             .child(
                 Icon::new(IconName::Terminal)
                     .size(IconSize::Small)
-                    .color(if is_active { Color::Default } else { Color::Muted }),
+                    .color(if is_active {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
             )
             .map(|this| match &editor {
                 Some(editor) => this.child(
@@ -283,7 +311,11 @@ impl WorkspacesPanel {
                 None => this.child(
                     Label::new(entry.name.clone())
                         .size(LabelSize::Small)
-                        .color(if is_active { Color::Default } else { Color::Muted })
+                        .color(if is_active {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
                         .single_line(),
                 ),
             })
@@ -418,7 +450,12 @@ impl Panel for WorkspacesPanel {
         position == DockPosition::Left
     }
 
-    fn set_position(&mut self, _position: DockPosition, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
@@ -576,9 +613,12 @@ fn collect_items(layout: StoredLayout, out: &mut Vec<Box<dyn ItemHandle>>) {
 fn clear_center(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     workspace.join_all_panes(window, cx);
     let pane = workspace.active_pane().clone();
-    pane.update(cx, |pane, cx| {
-        while pane.take_active_item(window, cx).is_some() {}
-    });
+    pane.update(
+        cx,
+        |pane, cx| {
+            while pane.take_active_item(window, cx).is_some() {}
+        },
+    );
 }
 
 /// Rebuild a [`StoredLayout`] into the center, starting from a single empty pane.
@@ -664,13 +704,19 @@ mod tests {
 
     #[test]
     fn side_by_side_panes_become_a_horizontal_split() {
-        let tree = build_tree(vec![leaf(0.0, 0.0, 50.0, 100.0), leaf(50.0, 0.0, 50.0, 100.0)]);
+        let tree = build_tree(vec![
+            leaf(0.0, 0.0, 50.0, 100.0),
+            leaf(50.0, 0.0, 50.0, 100.0),
+        ]);
         assert_eq!(shape(&tree), "H(·,·)");
     }
 
     #[test]
     fn stacked_panes_become_a_vertical_split() {
-        let tree = build_tree(vec![leaf(0.0, 0.0, 100.0, 50.0), leaf(0.0, 50.0, 100.0, 50.0)]);
+        let tree = build_tree(vec![
+            leaf(0.0, 0.0, 100.0, 50.0),
+            leaf(0.0, 50.0, 100.0, 50.0),
+        ]);
         assert_eq!(shape(&tree), "V(·,·)");
     }
 
