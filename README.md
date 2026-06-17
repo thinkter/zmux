@@ -14,6 +14,9 @@ Shortcuts:
 - Paste: `Ctrl-Shift-V`, `Shift-Insert`, or `Cmd-V`.
 - New terminal tab: `Ctrl-Shift-T` or `Ctrl-Shift-N`.
 - New workspace: `Ctrl-Shift-E`. Toggle the workspaces sidebar: `Ctrl-Shift-B`.
+- Notify the current terminal pane (manual test trigger): `Ctrl-Shift-M`.
+- Jump to the latest unread notification: `Ctrl-Shift-U`.
+- CLI: `zmux notify "Title" "Body"` or `zmux notify --title "Title" --body "Body"`.
 - Zoom terminal font: `Ctrl-=`/`Ctrl-+`, `Ctrl--`, `Ctrl-0`; macOS-style `Cmd` variants are also bound.
 - Plain `Ctrl-C` is intentionally left for the shell interrupt signal.
 
@@ -29,6 +32,7 @@ process keeps going in the background while you work elsewhere.
 - Click a workspace to switch to it.
 - Double-click a workspace (or use the pencil button) to rename it inline.
 - Drag a workspace up or down to reorder the list.
+- Workspaces with unread agent notifications show a dot; the latest notification appears at the bottom of the sidebar.
 - Use the trash button to close a workspace; the last one can't be closed.
 
 Build notes:

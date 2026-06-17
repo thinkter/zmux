@@ -5,7 +5,7 @@ use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
     App, AppContext, Bounds, Context, Task, TaskExt, WeakEntity, Window, WindowBounds,
-    WindowHandle, WindowOptions, px, size,
+    WindowHandle, WindowOptions, actions, px, size,
 };
 use gpui_platform::application;
 use http_client::{BlockedHttpClient, HttpClientWithUrl};
@@ -14,11 +14,15 @@ use settings::Settings;
 use terminal_view::{default_working_directory, terminal_panel::TerminalPanel};
 use workspace::{AppState, MultiWorkspace, OpenMode, OpenResult, Workspace, WorkspaceStore};
 
+use crate::cli_server::CliServer;
 use crate::env::terminal_env;
 use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
+use crate::notifications::{NotificationSource, NotificationStore};
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};
+
+actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
 
 pub fn run() -> anyhow::Result<()> {
     application().with_assets(crate::assets::Assets).run(|cx: &mut App| {
@@ -42,6 +46,10 @@ pub fn run() -> anyhow::Result<()> {
 pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     if !cx.has_global::<db::AppDatabase>() {
         cx.set_global(db::AppDatabase::new());
+    }
+
+    if !cx.has_global::<NotificationStore>() {
+        cx.set_global(NotificationStore::new());
     }
 
     settings::init(cx);
@@ -91,8 +99,10 @@ pub fn open_zmux_workspace(
                 .update(cx, |dock, cx| dock.set_open(false, window, cx));
 
             let panel = cx.new(|cx| WorkspacesPanel::new(workspace.weak_handle(), window, cx));
-            workspace.add_panel(panel, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
             workspace.open_panel::<WorkspacesPanel>(window, cx);
+            let cli_server = CliServer::start(workspace.weak_handle(), panel.downgrade(), cx);
+            cx.set_global(cli_server);
 
             workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
                 create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
@@ -141,6 +151,60 @@ pub fn open_zmux_workspace(
                         })
                         .ok();
                 });
+            });
+            workspace.register_action(|workspace, _: &NotifyCurrentPane, _window, cx| {
+                let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                    return;
+                };
+                let workspace_id = panel.read(cx).active_workspace_id();
+                let active_pane = workspace.active_pane().clone();
+                let Some(item) = active_pane.read(cx).active_item() else {
+                    return;
+                };
+                if item.act_as::<terminal_view::TerminalView>(cx).is_none() {
+                    return;
+                }
+                let item_id = item.item_id();
+                NotificationStore::global_mut(cx).add(
+                    item_id,
+                    Some(workspace_id),
+                    NotificationSource::Manual,
+                    "Manual notification".to_string(),
+                    "Test notification from current pane".to_string(),
+                );
+                panel.update(cx, |_, cx| cx.notify());
+            });
+            workspace.register_action(|workspace, _: &JumpToLatestNotification, window, cx| {
+                let Some(notification) = NotificationStore::global(cx).latest_unread().cloned() else {
+                    return;
+                };
+                let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                    return;
+                };
+
+                if let Some(workspace_id) = notification.workspace_id {
+                    let is_active = panel.read(cx).active_workspace_id() == workspace_id;
+                    if !is_active {
+                        panel.update(cx, |panel, cx| {
+                            panel.activate_workspace(workspace_id, window, cx);
+                        });
+                    }
+                }
+
+                if let Some(pane) = workspace.pane_for_item_id(notification.item_id) {
+                    let index = pane
+                        .read(cx)
+                        .items()
+                        .position(|item| item.item_id() == notification.item_id);
+                    if let Some(index) = index {
+                        pane.update(cx, |pane, cx| {
+                            pane.activate_item(index, true, true, window, cx);
+                        });
+                    }
+                }
+
+                NotificationStore::global_mut(cx).mark_pane_read(notification.item_id);
+                panel.update(cx, |_, cx| cx.notify());
             });
             create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
         })),

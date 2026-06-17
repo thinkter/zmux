@@ -12614,6 +12614,8 @@ dependencies = [
  "node_runtime",
  "project",
  "rust-embed",
+ "serde",
+ "serde_json",
  "session",
  "settings",
  "task",
