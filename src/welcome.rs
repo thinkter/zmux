@@ -6,7 +6,7 @@ use gpui::{
 };
 use ui::{
     ButtonLike, Color, Divider, DividerColor, Headline, Icon, IconName, IconSize, IntoElement,
-    Label, LabelSize, RenderOnce, Vector, VectorName, h_flex, prelude::*, rems_from_px, v_flex,
+    Label, LabelSize, RenderOnce, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent};
 use zed_actions::command_palette;
@@ -168,7 +168,7 @@ impl Render for ZmuxWelcome {
                             .justify_center()
                             .mb_4()
                             .gap_4()
-                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45.)))
+                            // .child(Vector::square(VectorName::ZedLogo, rems_from_px(45.)))
                             .child(
                                 v_flex().child(Headline::new("Welcome to Zmux")).child(
                                     Label::new("Crossplatform terminal workspace")
