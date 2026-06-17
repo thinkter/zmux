@@ -17,12 +17,13 @@ use gpui::{
     div, point, px, size,
 };
 use ui::prelude::*;
-use ui::{IconButtonShape, Tooltip};
+use ui::{IconButtonShape, Indicator, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::item::ItemHandle;
 use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::create_center_terminal;
+use crate::notifications::{NotificationStore, WorkspaceId};
 use crate::welcome::ZmuxWelcome;
 
 actions!(
@@ -36,8 +37,6 @@ actions!(
 );
 
 const PANEL_WIDTH: f32 = 240.0;
-
-type WorkspaceId = u64;
 
 /// A detached snapshot of a workspace's center: the split tree plus the live
 /// terminal item handles, which keep the underlying terminals running while the
@@ -118,6 +117,10 @@ impl WorkspacesPanel {
             next_id: 2,
             rename: None,
         }
+    }
+
+    pub fn active_workspace_id(&self) -> WorkspaceId {
+        self.active
     }
 
     /// Create a fresh, empty workspace and switch to it.
@@ -332,6 +335,7 @@ impl WorkspacesPanel {
     ) -> impl IntoElement + use<> {
         let id = entry.id;
         let is_active = id == self.active;
+        let has_unread = NotificationStore::global(cx).workspace_has_unread(id);
         let renaming = self
             .rename
             .as_ref()
@@ -390,6 +394,9 @@ impl WorkspacesPanel {
                         }
                     },
                 ))
+            })
+            .when(has_unread, |this| {
+                this.child(Indicator::dot().color(Color::Accent))
             });
 
         let drag_ix = self
@@ -488,6 +495,9 @@ impl Render for WorkspacesPanel {
             })
             .collect();
 
+        let latest = NotificationStore::global(cx).latest_unread().cloned();
+        let unread_count = NotificationStore::global(cx).unread_count();
+
         v_flex()
             .key_context("WorkspacesPanel")
             .track_focus(&self.focus_handle)
@@ -521,8 +531,40 @@ impl Render for WorkspacesPanel {
                     .p_1()
                     .gap_0p5()
                     .overflow_y_scroll()
+                    .flex_1()
                     .children(rows.iter().map(|entry| self.render_entry(entry, cx))),
             )
+            .when_some(latest, |this, notification| {
+                this.child(
+                    v_flex()
+                        .p_2()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Indicator::dot().color(Color::Accent))
+                                .child(
+                                    Label::new(format!("{} unread", unread_count))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .child(
+                            Label::new(notification.title.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Default)
+                                .single_line(),
+                        )
+                        .child(
+                            Label::new(notification.body.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .line_clamp(2),
+                        ),
+                )
+            })
     }
 }
 
@@ -557,6 +599,11 @@ impl Panel for WorkspacesPanel {
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
         Some(IconName::ListCollapse)
+    }
+
+    fn icon_label(&self, _window: &Window, cx: &App) -> Option<String> {
+        let count = NotificationStore::global(cx).unread_count();
+        (count > 0).then(|| count.to_string())
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
