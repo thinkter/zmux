@@ -28,6 +28,7 @@ process keeps going in the background while you work elsewhere.
 - Click **+** (or press `Ctrl-Shift-E`) to create a workspace.
 - Click a workspace to switch to it.
 - Double-click a workspace (or use the pencil button) to rename it inline.
+- Drag a workspace up or down to reorder the list.
 - Use the trash button to close a workspace; the last one can't be closed.
 
 Build notes:

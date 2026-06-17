@@ -68,6 +68,27 @@ struct RenameState {
     _subscription: Subscription,
 }
 
+#[derive(Clone)]
+struct DraggedWorkspace {
+    id: WorkspaceId,
+    name: String,
+    ix: usize,
+}
+
+impl Render for DraggedWorkspace {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .rounded_md()
+            .shadow_md()
+            .bg(cx.theme().colors().element_selected)
+            .child(Icon::new(IconName::Terminal).size(IconSize::Small))
+            .child(Label::new(self.name.clone()).size(LabelSize::Small))
+    }
+}
+
 pub struct WorkspacesPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -113,8 +134,6 @@ impl WorkspacesPanel {
             name,
             stored: None,
         });
-
-        self.entries.sort_by_key(|entry| entry.id);
 
         // debug purposes
         // let ids = self
@@ -239,6 +258,29 @@ impl WorkspacesPanel {
         cx.notify();
     }
 
+    /// Move the dragged workspace to the position indicated by the drop target.
+    /// The target's top border means "insert before" and the bottom border means
+    /// "insert after", matching the direction of the drag.
+    fn reorder_workspace(
+        &mut self,
+        dragged_id: WorkspaceId,
+        target_id: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged_id == target_id {
+            return;
+        }
+        let Some(drag_ix) = self.entries.iter().position(|entry| entry.id == dragged_id) else {
+            return;
+        };
+        let Some(target_ix) = self.entries.iter().position(|entry| entry.id == target_id) else {
+            return;
+        };
+        let entry = self.entries.remove(drag_ix);
+        self.entries.insert(target_ix, entry);
+        cx.notify();
+    }
+
     fn start_rename(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.iter().find(|entry| entry.id == id) else {
             return;
@@ -350,7 +392,15 @@ impl WorkspacesPanel {
                 ))
             });
 
+        let drag_ix = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .unwrap_or(0);
+        let target_ix = drag_ix;
+
         h_flex()
+            .id(("ws-row", id as usize))
             .group(group.clone())
             .w_full()
             .px_2()
@@ -361,6 +411,30 @@ impl WorkspacesPanel {
                 this.bg(cx.theme().colors().element_selected)
             })
             .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .on_drag(
+                DraggedWorkspace {
+                    id,
+                    name: entry.name.clone(),
+                    ix: drag_ix,
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
+            .drag_over::<DraggedWorkspace>(move |style, dragged, _window, cx| {
+                if dragged.ix < target_ix {
+                    style
+                        .border_b_2()
+                        .border_color(cx.theme().colors().drop_target_border)
+                } else if dragged.ix > target_ix {
+                    style
+                        .border_t_2()
+                        .border_color(cx.theme().colors().drop_target_border)
+                } else {
+                    style
+                }
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedWorkspace, _window, cx| {
+                this.reorder_workspace(dragged.id, id, cx);
+            }))
             .child(name_area)
             .child(
                 h_flex()
