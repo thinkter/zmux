@@ -20,25 +20,30 @@ use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_act
 use crate::notifications::{NotificationSource, NotificationStore};
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
-use crate::workspaces::{ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};
+use crate::workspaces::{
+    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel,
+    WorkspacesPanel,
+};
 
 actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
 
 pub fn run() -> anyhow::Result<()> {
-    application().with_assets(crate::assets::Assets).run(|cx: &mut App| {
-        init_zmux(cx);
+    application()
+        .with_assets(crate::assets::Assets)
+        .run(|cx: &mut App| {
+            init_zmux(cx);
 
-        cx.spawn(async move |cx| {
-            let open_task = cx.update(|cx| open_zmux_workspace(None, cx));
-            if let Err(error) = open_task.await {
-                cx.update(|cx| {
-                    eprintln!("failed to open zmux workspace: {error}");
-                    cx.quit();
-                });
-            }
-        })
-        .detach();
-    });
+            cx.spawn(async move |cx| {
+                let open_task = cx.update(|cx| open_zmux_workspace(None, cx));
+                if let Err(error) = open_task.await {
+                    cx.update(|cx| {
+                        eprintln!("failed to open zmux workspace: {error}");
+                        cx.quit();
+                    });
+                }
+            })
+            .detach();
+        });
 
     Ok(())
 }
@@ -147,7 +152,9 @@ pub fn open_zmux_workspace(
                 cx.defer(move |cx| {
                     window_handle
                         .update(cx, |_, window, cx| {
-                            panel.update(cx, |panel, cx| panel.activate_previous_workspace(window, cx));
+                            panel.update(cx, |panel, cx| {
+                                panel.activate_previous_workspace(window, cx)
+                            });
                         })
                         .ok();
                 });
@@ -175,7 +182,8 @@ pub fn open_zmux_workspace(
                 panel.update(cx, |_, cx| cx.notify());
             });
             workspace.register_action(|workspace, _: &JumpToLatestNotification, window, cx| {
-                let Some(notification) = NotificationStore::global(cx).latest_unread().cloned() else {
+                let Some(notification) = NotificationStore::global(cx).latest_unread().cloned()
+                else {
                     return;
                 };
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
