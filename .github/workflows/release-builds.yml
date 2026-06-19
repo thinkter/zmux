@@ -21,14 +21,16 @@ jobs:
             os: ubuntu-latest
             artifact: zmux-linux-x86_64
             archive: zmux-linux-x86_64.tar.gz
+            upload_path: dist/zmux-linux-x86_64.tar.gz
           - label: macOS aarch64
             os: macos-14
             artifact: zmux-macos-aarch64
             archive: zmux-macos-aarch64.tar.gz
+            upload_path: dist/zmux-macos-aarch64.tar.gz
           - label: Windows x86_64
             os: windows-latest
             artifact: zmux-windows-x86_64
-            archive: zmux-windows-x86_64.zip
+            upload_path: dist/zmux.exe
 
     env:
       CARGO_TERM_COLOR: always
@@ -89,11 +91,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path target/release/zmux.exe -DestinationPath "dist/${{ matrix.archive }}" -Force
+          Copy-Item -Path target/release/zmux.exe -Destination dist/zmux.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.archive }}
+          path: ${{ matrix.upload_path }}
           if-no-files-found: error
