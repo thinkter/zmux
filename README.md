@@ -2,6 +2,8 @@
 
 A small GPUI terminal shell around Zed's `terminal` and `terminal_view` crates.
 
+![zmux welcome screen](assets/zmux_welcome_screen.png)
+
 Run with:
 
 ```sh
