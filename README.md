@@ -7,7 +7,7 @@ A small GPUI terminal shell around Zed's `terminal` and `terminal_view` crates.
 Run with:
 
 ```sh
-cargo run
+cargo run --release
 ```
 
 Shortcuts:
