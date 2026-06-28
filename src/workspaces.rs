@@ -138,6 +138,8 @@ impl WorkspacesPanel {
             stored: None,
         });
 
+        self.entries.sort_by_key(|entry| entry.id);
+
         // debug purposes
         // let ids = self
         //     .entries
@@ -258,6 +260,7 @@ impl WorkspacesPanel {
 
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
+        self.entries.sort_by_key(|entry| entry.id);
         cx.notify();
     }
 
@@ -439,9 +442,11 @@ impl WorkspacesPanel {
                     style
                 }
             })
-            .on_drop(cx.listener(move |this, dragged: &DraggedWorkspace, _window, cx| {
-                this.reorder_workspace(dragged.id, id, cx);
-            }))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedWorkspace, _window, cx| {
+                    this.reorder_workspace(dragged.id, id, cx);
+                }),
+            )
             .child(name_area)
             .child(
                 h_flex()
