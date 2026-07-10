@@ -50,6 +50,13 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
 
+[features]
+# Browser automation is an opt-in abstraction. The feature deliberately has no
+# native WebView dependency: terminal-only builds never link a WebView library,
+# and host adapters must opt in to their platform framework separately.
+default = []
+browser = []
+
 [dependencies]
 anyhow = "1"
 async-channel = "2"

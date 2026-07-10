@@ -60,4 +60,10 @@ Build notes:
 - Release builds strip symbols and use `panic = "abort"` to reduce artifact size without enabling slower size optimizations such as LTO by default.
 - Linux and FreeBSD builds enable `gpui_platform`'s `font-kit`, `wayland`, and `x11` backends. macOS and Windows avoid those Linux display features in this crate's target-specific dependency configuration.
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.
-- After `Cargo.lock` is committed, use `cargo build -j 6 --locked` and `cargo test -j 6 --locked` to reproduce the pinned dependency set.
+- Browser automation is optional: `--features browser` exposes the portable
+  browser-surface/control abstraction and deterministic mock fixtures without
+  linking a WebView. WKWebView, WebView2, and WebKitGTK remain explicit host
+  adapter seams until a platform binding is deliberately added; `discover`
+  reports them as unavailable instead of pretending they work.
+- After `Cargo.lock` is committed, use `cargo build -j 6 --locked` and
+  `cargo test -j 6 --locked` to reproduce the pinned dependency set.
