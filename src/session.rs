@@ -345,39 +345,7 @@ impl SessionStore {
 }
 
 fn default_session_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let root = std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("APPDATA"))
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        return root.join("zmux").join("session-v1.json");
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let root = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        return root
-            .join("Library")
-            .join("Application Support")
-            .join("zmux")
-            .join("session-v1.json");
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let root = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|home| home.join(".local").join("state"))
-            })
-            .unwrap_or_else(std::env::temp_dir);
-        root.join("zmux").join("session-v1.json")
-    }
+    paths::state_dir().join("session-v1.json")
 }
 
 #[cfg(test)]
