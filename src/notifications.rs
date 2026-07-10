@@ -167,6 +167,12 @@ impl NotificationStore {
         self.notifications.iter().rfind(|n| !n.read)
     }
 
+    pub fn latest_unread_for_workspace(&self, workspace_id: WorkspaceId) -> Option<&Notification> {
+        self.notifications.iter().rfind(|notification| {
+            notification.workspace_id == Some(workspace_id) && !notification.read
+        })
+    }
+
     pub fn unread_count(&self) -> usize {
         self.notifications.iter().filter(|n| !n.read).count()
     }

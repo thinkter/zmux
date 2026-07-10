@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
@@ -15,10 +15,16 @@ use terminal_view::default_working_directory;
 use workspace::{AppState, MultiWorkspace, OpenMode, OpenResult, Workspace, WorkspaceStore};
 
 use crate::cli_server::CliServer;
+use crate::config::{ConfigError, ConfigPathProvider, ConfigPaths, ConfigReload, ConfigStore};
 use crate::env::terminal_env_with_notification_endpoint;
-use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
+use crate::keymap::{
+    NewTerminal, OpenKeymaps, OpenSettings, Quit, ReloadConfig, ResetConfig,
+    configure_keybindings_with_config, configure_zoom_actions,
+};
+use crate::metadata::{NotificationSummary, WorkspaceMetadataStore};
 use crate::notifications::{NotificationSource, NotificationStore};
-use crate::theme::configure_terminal_fonts;
+use crate::settings_editor::{SettingsEditorMode, ZmuxSettingsEditor};
+use crate::theme::configure_terminal_fonts_with_config;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{
     ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, TerminalTarget,
@@ -49,8 +55,37 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
+    init_zmux_with_config_paths(
+        ConfigPaths::new(paths::config_dir().join("config.json")),
+        cx,
+    )
+}
+
+/// Initialize using a caller-owned location. A future shared `ZmuxPaths`
+/// implementation can satisfy [`ConfigPathProvider`] without this module
+/// knowing about Zed's path layer.
+pub fn init_zmux_with_config_path_provider(
+    provider: &impl ConfigPathProvider,
+    cx: &mut App,
+) -> Arc<AppState> {
+    init_zmux_with_config_paths(ConfigPaths::from_provider(provider), cx)
+}
+
+pub fn init_zmux_with_config_paths(paths: ConfigPaths, cx: &mut App) -> Arc<AppState> {
     if !cx.has_global::<db::AppDatabase>() {
         cx.set_global(init_database());
+    }
+
+    if !cx.has_global::<ConfigStore>() {
+        cx.set_global(ConfigStore::load_or_default(paths));
+    }
+
+    if !cx.has_global::<WorkspaceMetadataStore>() {
+        let config = ConfigStore::global(cx).config().clone();
+        cx.set_global(WorkspaceMetadataStore::new(
+            config.sidebar.max_log_entries,
+            Duration::from_secs(config.sidebar.metadata_refresh_seconds),
+        ));
     }
 
     if !cx.has_global::<NotificationStore>() {
@@ -61,7 +96,8 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     theme_settings::init(theme::LoadThemes::JustBase, cx);
     editor::init(cx);
     terminal::terminal_settings::TerminalSettings::register(cx);
-    configure_terminal_fonts(cx);
+    let config = ConfigStore::global(cx).config().clone();
+    configure_terminal_fonts_with_config(&config.terminal, cx);
 
     let app_state = init_app_state(cx);
     Project::init(&app_state.client, cx);
@@ -69,10 +105,19 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     workspace::init(app_state.clone(), cx);
     terminal_view::init(cx);
 
-    configure_keybindings(cx);
+    configure_keybindings_with_config(&config, cx);
     configure_zoom_actions(cx);
 
     cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &ReloadConfig, cx| {
+        let _ = reload_zmux_config(cx);
+    });
+    cx.on_action(|_: &ResetConfig, cx| {
+        if ConfigStore::global_mut(cx).reset().is_ok() {
+            apply_zmux_config(cx);
+        }
+    });
+    start_config_watcher(cx);
 
     app_state
 }
@@ -88,6 +133,58 @@ fn init_database() -> db::AppDatabase {
         *db::RELEASE_CHANNEL,
     ));
     db::AppDatabase(connection)
+}
+
+/// Reapply every runtime-owned setting from the already validated config.
+/// Invalid disk edits never get here because [`ConfigStore`] retains the last
+/// known-good document until a later reload parses successfully.
+pub(crate) fn apply_zmux_config(cx: &mut App) {
+    let config = ConfigStore::global(cx).config().clone();
+    configure_keybindings_with_config(&config, cx);
+    configure_terminal_fonts_with_config(&config.terminal, cx);
+    WorkspaceMetadataStore::global_mut(cx).configure(
+        config.sidebar.max_log_entries,
+        Duration::from_secs(config.sidebar.metadata_refresh_seconds),
+    );
+    cx.refresh_windows();
+}
+
+pub(crate) fn reload_zmux_config(cx: &mut App) -> Result<ConfigReload, ConfigError> {
+    let reload = ConfigStore::global_mut(cx).reload()?;
+    apply_zmux_config(cx);
+    Ok(reload)
+}
+
+/// A small polling watcher avoids coupling this feature to a platform-specific
+/// filesystem watcher. It reads only Zmux's tiny config file and uses
+/// content-based change detection, so saves with coarse mtimes still reload.
+struct ConfigWatcher {
+    _task: Task<()>,
+}
+
+impl gpui::Global for ConfigWatcher {}
+
+fn start_config_watcher(cx: &mut App) {
+    if cx.has_global::<ConfigWatcher>() {
+        return;
+    }
+    let task = cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
+            cx.update(|cx| match ConfigStore::global_mut(cx).reload_if_changed() {
+                Ok(Some(_)) => apply_zmux_config(cx),
+                Ok(None) => {}
+                Err(_) => {
+                    // The error is retained by ConfigStore for the settings
+                    // editor; redraw so an open editor can show current state.
+                    cx.refresh_windows();
+                }
+            });
+        }
+    });
+    cx.set_global(ConfigWatcher { _task: task });
 }
 
 pub fn open_zmux_workspace(
@@ -199,6 +296,12 @@ pub fn open_zmux_workspace(
                 )
                 .detach_and_log_err(cx);
             });
+            workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
+                open_settings_editor(workspace, SettingsEditorMode::Settings, window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenKeymaps, window, cx| {
+                open_settings_editor(workspace, SettingsEditorMode::Keymaps, window, cx);
+            });
             workspace.register_action(|workspace, _: &NewWorkspace, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
@@ -247,6 +350,9 @@ pub fn open_zmux_workspace(
                 });
             });
             workspace.register_action(|workspace, _: &NotifyCurrentPane, _window, cx| {
+                if !ConfigStore::global(cx).config().notifications.enabled {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
                 };
@@ -266,6 +372,7 @@ pub fn open_zmux_workspace(
                     "Manual notification".to_string(),
                     "Test notification from current pane".to_string(),
                 );
+                update_workspace_notification_metadata(workspace_id, cx);
                 panel.update(cx, |_, cx| cx.notify());
             });
             workspace.register_action(|workspace, _: &JumpToLatestNotification, window, cx| {
@@ -299,6 +406,9 @@ pub fn open_zmux_workspace(
                 }
 
                 NotificationStore::global_mut(cx).mark_pane_read(notification.item_id);
+                if let Some(workspace_id) = notification.workspace_id {
+                    update_workspace_notification_metadata(workspace_id, cx);
+                }
                 panel.update(cx, |_, cx| cx.notify());
             });
         })),
@@ -339,6 +449,37 @@ pub(crate) fn create_center_terminal(
         })?;
         Ok(terminal.downgrade())
     })
+}
+
+fn open_settings_editor(
+    workspace: &mut Workspace,
+    mode: SettingsEditorMode,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let editor = cx.new(|cx| ZmuxSettingsEditor::new(mode, window, cx));
+    let pane = workspace.active_pane().clone();
+    pane.update(cx, |pane, cx| {
+        pane.add_item(Box::new(editor), true, true, None, window, cx);
+    });
+}
+
+pub(crate) fn update_workspace_notification_metadata(
+    workspace_id: crate::notifications::WorkspaceId,
+    cx: &mut App,
+) {
+    let unread_count = NotificationStore::global(cx).workspace_unread_count(workspace_id);
+    let latest = NotificationStore::global(cx)
+        .latest_unread_for_workspace(workspace_id)
+        .map(|notification| NotificationSummary {
+            title: notification.title.clone(),
+            body: notification.body.clone(),
+        });
+    let _ = WorkspaceMetadataStore::global_mut(cx).set_notification_summary(
+        workspace_id,
+        unread_count,
+        latest,
+    );
 }
 
 fn init_app_state(cx: &mut App) -> Arc<AppState> {

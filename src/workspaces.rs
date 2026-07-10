@@ -23,6 +23,11 @@ use workspace::item::ItemHandle;
 use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::create_center_terminal;
+use crate::config::ConfigStore;
+use crate::metadata::{
+    AgentActivity, MetadataState, WorkspaceMetadata, WorkspaceMetadataStore,
+    collect_system_metadata,
+};
 use crate::notifications::{NotificationStore, WorkspaceId};
 use crate::session::{
     LayoutAxis, LayoutNodeSnapshot, Ratio, SessionSnapshot, SessionStore, SurfaceId,
@@ -256,6 +261,7 @@ pub struct WorkspacesPanel {
     persistence_suspended: bool,
     persistence_scheduled: bool,
     _workspace_observer: Option<Subscription>,
+    _metadata_refresh_task: gpui::Task<()>,
 }
 
 impl WorkspacesPanel {
@@ -319,6 +325,26 @@ impl WorkspacesPanel {
             }
         };
 
+        let initial_working_directory = crate::env::current_working_directory();
+        for entry in &entries {
+            WorkspaceMetadataStore::global_mut(cx)
+                .register_workspace(entry.id, initial_working_directory.clone());
+        }
+
+        let metadata_refresh_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.request_metadata_refresh(this.active, false, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         let mut panel = Self {
             workspace,
             focus_handle,
@@ -334,12 +360,14 @@ impl WorkspacesPanel {
             persistence_scheduled: false,
             surface_panes: HashMap::new(),
             _workspace_observer: None,
+            _metadata_refresh_task: metadata_refresh_task,
         };
         if let Some(workspace) = panel.workspace.upgrade() {
             panel._workspace_observer = Some(cx.observe(&workspace, |this, _, cx| {
                 this.schedule_persist(cx);
             }));
         }
+        panel.request_metadata_refresh(active, true, cx);
         panel
     }
 
@@ -460,7 +488,10 @@ impl WorkspacesPanel {
         });
         // Appending is intentional: visible order belongs to the user and must
         // never be rewritten based on opaque IDs.
+        WorkspaceMetadataStore::global_mut(cx)
+            .register_workspace(id, crate::env::current_working_directory());
         self.activate_workspace(id, window, cx);
+        self.request_metadata_refresh(id, true, cx);
     }
 
     /// Switch the center to display the given workspace, parking the currently
@@ -590,6 +621,7 @@ impl WorkspacesPanel {
                 .detach_and_log_err(cx);
             });
         }
+        self.request_metadata_refresh(id, false, cx);
         cx.notify();
         self.persist_session(cx);
     }
@@ -648,8 +680,31 @@ impl WorkspacesPanel {
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
         NotificationStore::global_mut(cx).clear_workspace(id);
+        WorkspaceMetadataStore::global_mut(cx).remove_workspace(id);
         cx.notify();
         self.persist_session(cx);
+    }
+
+    /// Metadata command execution never runs from `render`: it moves to a
+    /// background worker, has a short timeout/cancellation token, and only the
+    /// current generation may update the app-global snapshot.
+    fn request_metadata_refresh(&mut self, id: WorkspaceId, force: bool, cx: &mut Context<Self>) {
+        let request = match WorkspaceMetadataStore::global_mut(cx).begin_refresh(id, force) {
+            Ok(Some(request)) => request,
+            Ok(None) | Err(_) => return,
+        };
+        let collection_request = request.clone();
+        let task = cx.background_spawn(async move { collect_system_metadata(collection_request) });
+        cx.spawn(async move |this, cx| {
+            let collected = task.await;
+            this.update(cx, |_, cx| {
+                if WorkspaceMetadataStore::global_mut(cx).finish_refresh(&request, collected) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Move the dragged workspace to the position indicated by the drop target.
@@ -824,7 +879,23 @@ impl WorkspacesPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let is_active = id == self.active;
-        let has_unread = NotificationStore::global(cx).workspace_has_unread(id);
+        let (show_metadata, show_working_directory, show_git_status, show_unread_badges) = {
+            let config = ConfigStore::global(cx).config();
+            (
+                config.sidebar.show_metadata,
+                config.sidebar.show_working_directory,
+                config.sidebar.show_git_status,
+                config.notifications.show_unread_badges,
+            )
+        };
+        let has_unread =
+            show_unread_badges && NotificationStore::global(cx).workspace_has_unread(id);
+        let metadata_text = show_metadata
+            .then(|| WorkspaceMetadataStore::global(cx).snapshot(id))
+            .flatten()
+            .and_then(|metadata| {
+                workspace_row_metadata_text(&metadata, show_working_directory, show_git_status)
+            });
         let renaming = self
             .rename
             .as_ref()
@@ -835,9 +906,8 @@ impl WorkspacesPanel {
 
         let editor = renaming.clone();
         let is_renaming = renaming.is_some();
-        let name_area = h_flex()
-            .id(("ws-name", id as usize))
-            .flex_1()
+        let name_row = h_flex()
+            .id(("ws-name-row", id as usize))
             .gap_2()
             .overflow_hidden()
             .child(
@@ -886,6 +956,20 @@ impl WorkspacesPanel {
             })
             .when(has_unread, |this| {
                 this.child(Indicator::dot().color(Color::Accent))
+            });
+        let name_area = v_flex()
+            .id(("ws-name", id as usize))
+            .flex_1()
+            .gap_0p5()
+            .overflow_hidden()
+            .child(name_row)
+            .when_some(metadata_text, |this, text| {
+                this.child(
+                    Label::new(text)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line(),
+                )
             });
 
         let drag_ix = self
@@ -982,7 +1066,19 @@ impl Render for WorkspacesPanel {
             .map(|entry| (entry.id, entry.name.clone()))
             .collect();
 
-        let latest = NotificationStore::global(cx).latest_unread().cloned();
+        let (show_metadata, show_latest_summary) = {
+            let config = ConfigStore::global(cx).config();
+            (
+                config.sidebar.show_metadata,
+                config.notifications.show_latest_summary,
+            )
+        };
+        let active_metadata = show_metadata
+            .then(|| WorkspaceMetadataStore::global(cx).snapshot(self.active))
+            .flatten();
+        let latest = show_latest_summary
+            .then(|| NotificationStore::global(cx).latest_unread().cloned())
+            .flatten();
         let unread_count = NotificationStore::global(cx).unread_count();
 
         v_flex()
@@ -1024,6 +1120,29 @@ impl Render for WorkspacesPanel {
                             .map(|(id, name)| self.render_entry(*id, name, cx)),
                     ),
             )
+            .when_some(active_metadata, |this, metadata| {
+                this.child(
+                    v_flex()
+                        .p_2()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("Active workspace context")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        // This is deliberately real text rather than icon-only
+                        // metadata, making the same state available to screen
+                        // readers and minimal/unsupported backends.
+                        .child(
+                            Label::new(metadata.accessible_summary())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .line_clamp(4),
+                        ),
+                )
+            })
             .when_some(latest, |this, notification| {
                 this.child(
                     v_flex()
@@ -1092,6 +1211,13 @@ impl Panel for WorkspacesPanel {
     }
 
     fn icon_label(&self, _window: &Window, cx: &App) -> Option<String> {
+        if !ConfigStore::global(cx)
+            .config()
+            .notifications
+            .show_unread_badges
+        {
+            return None;
+        }
         let count = NotificationStore::global(cx).unread_count();
         (count > 0).then(|| count.to_string())
     }
@@ -1108,8 +1234,8 @@ impl Panel for WorkspacesPanel {
         0
     }
 
-    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
-        true
+    fn starts_open(&self, _window: &Window, cx: &App) -> bool {
+        ConfigStore::global(cx).config().sidebar.starts_open
     }
 }
 
@@ -1131,6 +1257,53 @@ fn entries_from_snapshot(
         })
         .collect();
     (entries, active, next_surface_id)
+}
+
+fn workspace_row_metadata_text(
+    metadata: &WorkspaceMetadata,
+    show_working_directory: bool,
+    show_git_status: bool,
+) -> Option<String> {
+    let mut details = Vec::new();
+    if show_working_directory && let Some(directory) = &metadata.working_directory {
+        details.push(directory.display().to_string());
+    }
+    if show_git_status {
+        match &metadata.git {
+            MetadataState::Ready(git) => {
+                let state = if git.is_clean() {
+                    "clean".to_string()
+                } else {
+                    format!("{} changed", git.dirty_files)
+                };
+                details.push(format!("{} {state}", git.branch));
+            }
+            MetadataState::Pending => details.push("git refreshing".to_string()),
+            MetadataState::Unavailable(_) | MetadataState::Error(_) => {
+                details.push("git unavailable".to_string())
+            }
+            MetadataState::NotRequested => {}
+        }
+    }
+    if let MetadataState::Ready(ports) = &metadata.listening_ports
+        && !ports.is_empty()
+    {
+        details.push(format!(
+            "{} listening port{}",
+            ports.len(),
+            if ports.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if metadata.agent_activity != AgentActivity::Unknown {
+        details.push(metadata.agent_activity.accessible_text().to_string());
+    }
+    if let Some(status) = metadata.status_pills.values().next() {
+        details.push(status.accessible_text());
+    }
+    if let Some(progress) = metadata.progress.values().next() {
+        details.push(format!("{} {}%", progress.label, progress.percent()));
+    }
+    (!details.is_empty()).then(|| details.join(" · "))
 }
 
 fn max_surface_id_in_snapshot(snapshot: &SessionSnapshot) -> SurfaceId {

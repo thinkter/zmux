@@ -1,5 +1,5 @@
 use crate::NewTerminal;
-use crate::keymap::OpenSettings;
+use crate::keymap::{OpenKeymaps, OpenSettings};
 use gpui::{
     Action, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
     Render, SharedString, Styled, Window,
@@ -211,11 +211,13 @@ impl Render for ZmuxWelcome {
                                 2,
                                 self.focus_handle.clone(),
                             ))
-                            .child(InertButton::new(
+                            .child(ActionButton::new(
                                 "customize-keymaps",
                                 "Customize Keymaps",
                                 IconName::Keyboard,
+                                &OpenKeymaps,
                                 3,
+                                self.focus_handle.clone(),
                             ))
                             .child(InertButton::new(
                                 "explore-extensions",

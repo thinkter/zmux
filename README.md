@@ -22,6 +22,94 @@ Shortcuts:
 - Zoom terminal font: `Ctrl-=`/`Ctrl-+`, `Ctrl--`, `Ctrl-0`; macOS-style `Cmd` variants are also bound.
 - Plain `Ctrl-C` is intentionally left for the shell interrupt signal.
 
+## Configuration and keymaps
+
+Zmux has one versioned configuration document and never reads or writes a
+Zed-owned settings or keymap path. Its platform-default location is:
+
+- Linux and other XDG systems: `$XDG_CONFIG_HOME/zmux/config.json`, falling
+  back to `$HOME/.config/zmux/config.json`.
+- macOS: `$HOME/Library/Application Support/zmux/config.json`.
+- Windows: `%APPDATA%\zmux\config.json` (with a `%USERPROFILE%` fallback).
+
+Embedders/tests can inject a `ConfigPathProvider`; this is how the config layer
+will plug into Zmux's shared path provider without coupling it to Zed paths.
+The effective configuration is deterministic: built-in defaults are loaded
+first, then the one Zmux config file is validated and applied. There is no
+project-local config precedence and `allow_trusted_project_commands` remains
+off by default; it is only a reserved policy field until an explicit trust
+model exists.
+
+Open **Settings** from the welcome page (or `Ctrl-,`) to edit the actual JSON
+document in-app. **Customize Keymaps** (or `Ctrl-Shift-,`) opens the same
+validated document with keymap-specific help. The editor has explicit **Save**,
+**Reload**, and **Reset Defaults** controls. Zmux also polls its small config
+file for changes, so a validated external edit applies live; a malformed edit
+keeps the last known-good configuration active and is left on disk for repair.
+
+The current schema is version 1:
+
+```json
+{
+  "schema_version": 1,
+  "keybindings": {
+    "overrides": { "new_terminal": "ctrl-alt-t" },
+    "disabled": ["quit"]
+  },
+  "terminal": {
+    "font_family": null,
+    "font_size": 14,
+    "line_height": 1.2
+  },
+  "sidebar": {
+    "starts_open": true,
+    "show_metadata": true,
+    "show_working_directory": true,
+    "show_git_status": true,
+    "metadata_refresh_seconds": 5,
+    "max_log_entries": 100
+  },
+  "notifications": {
+    "enabled": true,
+    "show_unread_badges": true,
+    "show_latest_summary": true
+  },
+  "automation": {
+    "allow_cli_notifications": true,
+    "allow_trusted_project_commands": false
+  }
+}
+```
+
+`keybindings.overrides` replaces all built-in shortcuts for that action;
+`disabled` removes its built-in shortcuts. Valid action names are documented in
+the Keymaps editor and include terminal copy/paste, workspace navigation,
+tabs/panes, font zoom, notifications, and Settings/Keymaps/reload/reset.
+Unknown fields, unknown actions, invalid key sequences, unsafe numeric ranges,
+and future schema versions are rejected before they replace live state.
+
+Pre-versioned development files are migrated deterministically: legacy
+`shortcuts` becomes `keybindings.overrides`, and `terminal_font_size` becomes
+`terminal.font_size`. The conversion is in memory until the user saves; Save
+writes a canonical version-1 document through a same-directory temporary file
+and rename. A future version is rejected rather than silently discarded.
+
+## Workspace metadata
+
+The workspace sidebar consumes a rendering-independent, bounded metadata store.
+It tracks a working directory, best-effort Git state, listening-port capability,
+agent activity, unread/latest notification state, scriptable status pills,
+progress values, and retained logs. UI rendering does not run shell commands.
+
+Background refreshes are short, cancellable, generation-checked jobs. A rapid
+workspace switch or close cancels the old request; any late result is ignored.
+Git status is collected portably with a bounded `git status` invocation. Linux
+uses `ss` for a best-effort local listener list; unsupported platforms expose
+an explicit unavailable state instead of failing the sidebar. Status/progress/
+log primitives are addressed by immutable workspace IDs through
+`WorkspaceMetadataStore::apply_update`, ready for the versioned control API.
+All sidebar state also has textual labels/summaries rather than icon-only data.
+
 ## Workspaces
 
 The left sidebar lists independent **workspaces**. Each workspace keeps its own

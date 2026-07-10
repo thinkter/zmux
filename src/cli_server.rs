@@ -28,6 +28,8 @@ use smol::io::AsyncReadExt as _;
 use tempfile::TempDir;
 
 use crate::{
+    app::update_workspace_notification_metadata,
+    config::ConfigStore,
     ipc::{LocalIpcTransport, PlatformLocalIpc},
     notifications::{NotificationSource, NotificationStore},
     workspaces::WorkspacesPanel,
@@ -366,6 +368,13 @@ impl CliServer {
             };
 
             cx.update(|cx| {
+                if !ConfigStore::global(cx)
+                    .config()
+                    .automation
+                    .allow_cli_notifications
+                {
+                    return;
+                }
                 workspace.update(cx, |workspace, cx| {
                     let active_pane = workspace.active_pane().clone();
                     let Some(item) = active_pane.read(cx).active_item() else {
@@ -384,6 +393,7 @@ impl CliServer {
                         msg.title,
                         msg.body,
                     );
+                    update_workspace_notification_metadata(workspace_id, cx);
                     panel.update(cx, |_, cx| cx.notify());
                 });
             });
