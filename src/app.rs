@@ -50,7 +50,7 @@ pub fn run() -> anyhow::Result<()> {
 
 pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     if !cx.has_global::<db::AppDatabase>() {
-        cx.set_global(db::AppDatabase::new());
+        cx.set_global(init_database());
     }
 
     if !cx.has_global::<NotificationStore>() {
@@ -75,6 +75,19 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     cx.on_action(|_: &Quit, cx| cx.quit());
 
     app_state
+}
+
+/// Open the application database under zmux's namespaced data directory.
+///
+/// `paths` is a small, pinned fork of Zed's path crate with `APP_NAME =
+/// "Zmux"`, so this also keeps the shared key-value store used by sessions
+/// separate from any Zed installation.
+fn init_database() -> db::AppDatabase {
+    let connection = gpui::block_on(db::open_db::<db::AppMigrator>(
+        paths::database_dir(),
+        *db::RELEASE_CHANNEL,
+    ));
+    db::AppDatabase(connection)
 }
 
 pub fn open_zmux_workspace(

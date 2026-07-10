@@ -1,6 +1,11 @@
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("zmux {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if args.len() >= 2 && args[1] == "notify" {
         let (title, body) = parse_notify_args(&args)?;
         zmux::CliServer::notify(title, body)?;
@@ -20,8 +25,6 @@ fn parse_notify_args(args: &[String]) -> anyhow::Result<(String, String)> {
         let body = args[3..].join(" ");
         Ok((title, body))
     } else {
-        anyhow::bail!(
-            "Usage: zmux notify [--title TITLE --body BODY] [TITLE] [BODY]"
-        )
+        anyhow::bail!("Usage: zmux notify [--title TITLE --body BODY] [TITLE] [BODY]")
     }
 }

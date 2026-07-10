@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fs, path::PathBuf, time::Duration};
 
 use gpui::prelude::*;
 use gpui::{Action, Bounds, Keystroke, TestAppContext, point, px, size};
@@ -189,8 +189,14 @@ async fn zoom_actions_adjust_terminal_effective_font_size(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-async fn workspace_shell_opens_first_terminal_as_center_tab(cx: &mut TestAppContext) {
+async fn zmux_starts_clean_when_zed_user_state_exists(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
+    let zed_state = zed_state_fixture();
+    assert!(!paths::data_dir().starts_with(&zed_state));
+    assert!(!paths::config_dir().starts_with(&zed_state));
+    assert!(!paths::cache_dir().starts_with(&zed_state));
+    assert!(!paths::state_dir().starts_with(&zed_state));
+
     let open_task = cx.update(|cx| {
         init_zmux(cx);
         open_zmux_workspace(None, cx)
@@ -232,6 +238,14 @@ async fn workspace_shell_opens_first_terminal_as_center_tab(cx: &mut TestAppCont
                     .panel::<TerminalPanel>(cx)
                     .is_none()),
                 "terminal panel should not be installed for startup terminal creation"
+            );
+            assert_eq!(
+                fs::read_to_string(zed_state.join("db/0-dev/db.sqlite")).unwrap(),
+                "zed-session-fixture"
+            );
+            assert_eq!(
+                fs::read_to_string(zed_state.join("config/settings.json")).unwrap(),
+                "{\"terminal\": {\"restore_session\": true}}"
             );
 
             return;
@@ -378,6 +392,17 @@ fn bottom_terminal_count(workspace: &workspace::Workspace, cx: &gpui::App) -> us
         .and_then(|panel| panel.read(cx).pane())
         .map(|pane| pane.read(cx).items_len())
         .unwrap_or(0)
+}
+
+fn zed_state_fixture() -> PathBuf {
+    let root = paths::test_root().join("zed-user-state");
+    let database = root.join("db/0-dev/db.sqlite");
+    let settings = root.join("config/settings.json");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&database, "zed-session-fixture").unwrap();
+    fs::write(&settings, "{\"terminal\": {\"restore_session\": true}}").unwrap();
+    root
 }
 
 fn assert_bound(cx: &gpui::App, keystroke: &str, action: &dyn Action) {

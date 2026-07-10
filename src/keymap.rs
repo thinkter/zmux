@@ -8,7 +8,9 @@ use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 use crate::app::{JumpToLatestNotification, NotifyCurrentPane};
-use crate::workspaces::{ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel};
+use crate::workspaces::{
+    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel,
+};
 
 actions!(zmux, [NewTerminal, OpenSettings, Quit]);
 
@@ -22,7 +24,8 @@ const DEFAULT_KEYMAP: &str = "keymaps/default-windows.json";
 const DEFAULT_KEYMAP: &str = "keymaps/default-linux.json";
 
 pub fn configure_keybindings(cx: &mut App) {
-    if let Ok(bindings) = settings::KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP, cx) {
+    if let Ok(bindings) = settings::KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP, cx)
+    {
         cx.bind_keys(bindings);
     }
 

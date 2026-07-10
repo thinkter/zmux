@@ -7,7 +7,7 @@ A small GPUI terminal shell around Zed's `terminal` and `terminal_view` crates.
 Run with:
 
 ```sh
-cargo run --release
+cargo run -j 6 --release
 ```
 
 Shortcuts:
@@ -37,10 +37,27 @@ process keeps going in the background while you work elsewhere.
 - Workspaces with unread agent notifications show a dot; the latest notification appears at the bottom of the sidebar.
 - Use the trash button to close a workspace; the last one can't be closed.
 
+## State isolation and reset
+
+zmux intentionally does not read, write, or migrate Zed's user state. Settings,
+sessions, databases, cache, and logs use the `Zmux`/`zmux` application namespace:
+
+- Linux and FreeBSD: `$XDG_DATA_HOME/zmux`, `$XDG_CONFIG_HOME/zmux`,
+  `$XDG_CACHE_HOME/zmux`, and `$XDG_STATE_HOME/zmux` (with the usual XDG
+  defaults when those variables are unset).
+- macOS: `~/Library/Application Support/Zmux`, `~/.config/zmux`,
+  `~/Library/Caches/Zmux`, and `~/Library/Logs/Zmux`.
+- Windows: `%LOCALAPPDATA%\Zmux` for data/state and `%APPDATA%\Zmux` for
+  configuration.
+
+To reset zmux, quit it and delete only the matching **zmux** directories above.
+Do not delete or copy Zed's directories: zmux starts with a clean, independent
+database and session store by design.
+
 Build notes:
 
 - `zmux` wraps Zed's GPUI terminal view, which pulls in substantial editor/workspace/UI code. The required Zed crates are fetched from `https://github.com/zed-industries/zed` at the pinned revision recorded in `Cargo.toml` and `Cargo.lock`
 - Release builds strip symbols and use `panic = "abort"` to reduce artifact size without enabling slower size optimizations such as LTO by default.
 - Linux and FreeBSD builds enable `gpui_platform`'s `font-kit`, `wayland`, and `x11` backends. macOS and Windows avoid those Linux display features in this crate's target-specific dependency configuration.
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.
-- After `Cargo.lock` is committed, use `cargo build --locked` and `cargo test --locked` to reproduce the pinned dependency set.
+- After `Cargo.lock` is committed, use `cargo build -j 6 --locked` and `cargo test -j 6 --locked` to reproduce the pinned dependency set.
