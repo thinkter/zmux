@@ -2,6 +2,7 @@ mod app;
 mod assets;
 mod cli_server;
 mod control;
+mod desktop_notifications;
 mod env;
 mod ipc;
 mod keymap;
@@ -18,6 +19,9 @@ pub use control::{
     ControlErrorCode, ControlHandler, ControlRequest, ControlResponse, ControlResult,
     MAX_CONTROL_FRAME_BYTES, MAX_REQUEST_TIMEOUT, MAX_SCREEN_TEXT_BYTES, SplitDirection, SurfaceId,
     SurfaceKind, SurfaceSummary, WorkspaceSummary, decode_request, dispatch_frame, encode_response,
+};
+pub use desktop_notifications::{
+    DesktopDelivery, DesktopNotification, DesktopNotificationPolicy, deliver_desktop_notification,
 };
 pub use env::terminal_env;
 pub use keymap::{NewTerminal, configure_keybindings, configure_zoom_actions};
