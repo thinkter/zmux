@@ -215,15 +215,19 @@ impl NotificationStore {
         true
     }
 
-    /// Clear only the requested workspace's history. Workspace closure calls
-    /// this instead of allowing a future workspace to inherit unread state.
+    /// Remove every notification associated with a workspace that was closed.
+    ///
+    /// Workspace identifiers are deliberately never recycled, but clearing the
+    /// entries is still important: it releases references to now-closed panes
+    /// and makes the close operation an explicit acknowledgement boundary rather
+    /// than letting stale unread state accumulate indefinitely. This also
+    /// prevents a future workspace from inheriting stale unread state.
     pub fn clear_workspace(&mut self, workspace_id: WorkspaceId) -> usize {
         let before = self.notifications.len();
         self.notifications
             .retain(|notification| notification.workspace_id != Some(workspace_id));
         before - self.notifications.len()
     }
-
     pub fn clear_all(&mut self) -> usize {
         let count = self.notifications.len();
         self.notifications.clear();
@@ -298,5 +302,6 @@ mod tests {
         assert_eq!(store.clear_workspace(1), 1);
         assert!(!store.workspace_has_unread(1));
         assert!(store.workspace_has_unread(2));
+        assert_eq!(store.unread_count(), 1);
     }
 }

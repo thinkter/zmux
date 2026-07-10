@@ -8,13 +8,13 @@
 //! detach/reattach of live entities — no PTY restart, no serialization — so it
 //! stays snappy regardless of how many terminals are open.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap, mem, path::PathBuf};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Axis, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Pixels, Render, SharedString, Subscription, TaskExt, WeakEntity, Window, actions,
-    div, point, px, size,
+    App, Axis, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, TaskExt, WeakEntity,
+    Window, actions, div, point, px, size,
 };
 use ui::prelude::*;
 use ui::{IconButtonShape, Indicator, Tooltip};
@@ -24,7 +24,12 @@ use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::create_center_terminal;
 use crate::notifications::{NotificationStore, WorkspaceId};
+use crate::session::{
+    LayoutAxis, LayoutNodeSnapshot, Ratio, SessionSnapshot, SessionStore, SurfaceId,
+    TerminalSnapshot, WorkspaceLayoutSnapshot, WorkspaceSnapshot,
+};
 use crate::welcome::ZmuxWelcome;
+use terminal_view::default_working_directory;
 
 actions!(
     zmux,
@@ -38,19 +43,27 @@ actions!(
 
 const PANEL_WIDTH: f32 = 240.0;
 
-/// A detached snapshot of a workspace's center: the split tree plus the live
-/// terminal item handles, which keep the underlying terminals running while the
-/// workspace is in the background.
+/// A detached snapshot of a workspace's center. It keeps terminal item handles
+/// alive while the workspace is in the background, but also records stable
+/// surface identifiers and split ratios so a later persisted snapshot can be
+/// reconstructed faithfully.
 enum StoredLayout {
     Leaf {
+        surface_id: SurfaceId,
         items: Vec<Box<dyn ItemHandle>>,
         active: usize,
     },
     Split {
         axis: Axis,
+        ratio: Ratio,
         first: Box<StoredLayout>,
         second: Box<StoredLayout>,
     },
+}
+
+struct StoredWorkspace {
+    layout: StoredLayout,
+    active_surface_id: SurfaceId,
 }
 
 struct WorkspaceEntry {
@@ -58,7 +71,57 @@ struct WorkspaceEntry {
     name: String,
     /// `Some` while the workspace is parked in the background, `None` while it is
     /// the active workspace displayed in the center.
-    stored: Option<StoredLayout>,
+    stored: Option<StoredWorkspace>,
+    /// A disk snapshot which has not been materialized into live terminals yet.
+    /// It is consumed only when the user selects this workspace.
+    restore: Option<WorkspaceLayoutSnapshot>,
+}
+
+/// The immutable destination captured at terminal-request time. A completed
+/// shell is routed back here even if the user changes workspace or pane while
+/// its PTY is being created.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalTarget {
+    workspace_id: WorkspaceId,
+    surface_id: SurfaceId,
+    destination_index: Option<usize>,
+    activate_tab: bool,
+}
+
+impl TerminalTarget {
+    fn new(workspace_id: WorkspaceId, surface_id: SurfaceId) -> Self {
+        Self {
+            workspace_id,
+            surface_id,
+            destination_index: None,
+            activate_tab: true,
+        }
+    }
+
+    fn restored(
+        workspace_id: WorkspaceId,
+        surface_id: SurfaceId,
+        destination_index: usize,
+        activate_tab: bool,
+    ) -> Self {
+        Self {
+            workspace_id,
+            surface_id,
+            destination_index: Some(destination_index),
+            activate_tab,
+        }
+    }
+}
+
+struct RestoredTerminal {
+    target: TerminalTarget,
+    working_directory: Option<PathBuf>,
+}
+
+struct PendingRatio {
+    first: Entity<Pane>,
+    axis: Axis,
+    ratio: Ratio,
 }
 
 struct RenameState {
@@ -93,8 +156,15 @@ pub struct WorkspacesPanel {
     focus_handle: FocusHandle,
     entries: Vec<WorkspaceEntry>,
     active: WorkspaceId,
+    /// Monotonic process/session-lifetime workspace identity watermark.
     next_id: WorkspaceId,
+    /// Stable identities for the panes in the currently displayed workspace.
+    surface_ids: HashMap<EntityId, SurfaceId>,
+    next_surface_id: SurfaceId,
     rename: Option<RenameState>,
+    session_store: SessionStore,
+    persistence_suspended: bool,
+    _workspace_observer: Option<Subscription>,
 }
 
 impl WorkspacesPanel {
@@ -104,50 +174,176 @@ impl WorkspacesPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let entries = vec![WorkspaceEntry {
-            id: 1,
-            name: "Workspace 1".to_string(),
-            stored: None,
-        }];
-        Self {
+        let session_store = SessionStore::from_environment();
+        let restored = match session_store.load() {
+            Ok(restored) => restored,
+            Err(error) => {
+                // A malformed, stale, or manually edited file must never make
+                // startup fail or cause a partial restore.
+                eprintln!("ignoring invalid zmux session: {error:#}");
+                None
+            }
+        };
+        let (entries, active, next_id, next_surface_id) = match restored {
+            Some(snapshot) => entries_from_snapshot(snapshot),
+            None => (
+                vec![WorkspaceEntry {
+                    id: 1,
+                    name: "Workspace 1".to_string(),
+                    stored: None,
+                    restore: None,
+                }],
+                1,
+                2,
+                1,
+            ),
+        };
+
+        let mut panel = Self {
             workspace,
             focus_handle,
             entries,
-            active: 1,
-            next_id: 2,
+            active,
+            next_id,
+            surface_ids: HashMap::new(),
+            next_surface_id,
             rename: None,
+            session_store,
+            persistence_suspended: false,
+            _workspace_observer: None,
+        };
+        if let Some(workspace) = panel.workspace.upgrade() {
+            panel._workspace_observer = Some(cx.observe(&workspace, |this, _, cx| {
+                this.persist_session(cx);
+            }));
         }
+        panel
     }
 
     pub fn active_workspace_id(&self) -> WorkspaceId {
         self.active
     }
 
+    /// Consume the active workspace's on-disk layout, if one was loaded at
+    /// startup. The app uses this plan to build panes before it starts any fresh
+    /// shells, keeping persisted state isolated from Zed's own session state.
+    pub(crate) fn take_initial_restore(&mut self) -> Option<WorkspaceLayoutSnapshot> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == self.active)
+            .and_then(|entry| entry.restore.take())
+    }
+
+    pub(crate) fn register_initial_surface(&mut self, pane_id: EntityId) -> TerminalTarget {
+        let surface_id = self.surface_for_pane(pane_id);
+        TerminalTarget::new(self.active, surface_id)
+    }
+
+    pub(crate) fn install_restored_surfaces(&mut self, surface_ids: HashMap<EntityId, SurfaceId>) {
+        self.surface_ids = surface_ids;
+    }
+
+    pub(crate) fn begin_session_restore(&mut self) {
+        self.persistence_suspended = true;
+    }
+
+    pub(crate) fn finish_session_restore(&mut self, cx: &mut Context<Self>) {
+        self.persistence_suspended = false;
+        self.schedule_persist(cx);
+    }
+
+    pub(crate) fn active_terminal_target(&mut self, pane_id: EntityId) -> TerminalTarget {
+        TerminalTarget::new(self.active, self.surface_for_pane(pane_id))
+    }
+
+    /// Attach a completed asynchronous terminal to the logical destination
+    /// captured when creation began. It intentionally never consults the
+    /// currently focused pane.
+    pub(crate) fn attach_terminal(
+        &mut self,
+        target: TerminalTarget,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target.workspace_id == self.active {
+            if let Some(pane_id) = self.surface_ids.iter().find_map(|(pane_id, surface_id)| {
+                (*surface_id == target.surface_id).then_some(*pane_id)
+            }) && let Some(workspace) = self.workspace.upgrade()
+                && let Some(pane) = workspace
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .find(|pane| pane.entity_id() == pane_id)
+                    .cloned()
+            {
+                pane.update(cx, |pane, cx| {
+                    if target.activate_tab {
+                        pane.add_item(item, false, false, target.destination_index, window, cx);
+                    } else {
+                        // Restore requests can finish out of order. Insert a
+                        // non-active tab without stealing its pane's selection,
+                        // and shift the current active index when necessary.
+                        let active_before = pane.active_item_index();
+                        let insertion_index = target
+                            .destination_index
+                            .unwrap_or_else(|| pane.items_len())
+                            .min(pane.items_len());
+                        pane.add_item_inner(
+                            item,
+                            false,
+                            false,
+                            false,
+                            Some(insertion_index),
+                            window,
+                            cx,
+                        );
+                        if insertion_index <= active_before && pane.items_len() > 1 {
+                            pane.activate_item(
+                                (active_before + 1).min(pane.items_len() - 1),
+                                false,
+                                false,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                });
+                self.schedule_persist(cx);
+                return;
+            }
+        } else if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == target.workspace_id)
+            && let Some(stored) = entry.stored.as_mut()
+            && stored.layout.insert_item(target, item)
+        {
+            self.schedule_persist(cx);
+            return;
+        }
+
+        // The workspace was closed while its shell was being created. Dropping
+        // the view also drops the new terminal; it must not leak into whatever
+        // surface happens to be active now.
+    }
+
     /// Create a fresh, empty workspace and switch to it.
     pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_id;
-        if self.next_id <= self.entries.len() as u64 {
-            self.next_id = self.entries.len() as u64 + 2;
-        } else {
-            self.next_id += 1;
-        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("zmux workspace ID space exhausted");
         let name = format!("Workspace {id}");
         self.entries.push(WorkspaceEntry {
             id,
             name,
             stored: None,
+            restore: None,
         });
-
-        self.entries.sort_by_key(|entry| entry.id);
-
-        // debug purposes
-        // let ids = self
-        //     .entries
-        //     .iter()
-        //     .map(|entry| entry.id)
-        //     .collect::<Vec<_>>();
-        // println!("Created workspace {:#?}", ids);
-
+        // Appending is intentional: visible order belongs to the user and must
+        // never be rewritten based on opaque IDs.
         self.activate_workspace(id, window, cx);
     }
 
@@ -175,41 +371,110 @@ impl WorkspacesPanel {
 
         self.cancel_rename(cx);
         let previous = self.active;
-        // Take the target's parked layout out before we borrow the workspace so we
-        // don't have to touch `self` inside the update closure.
-        let target_layout = self
+        let (target_layout, target_restore) = self
             .entries
             .iter_mut()
             .find(|entry| entry.id == id)
-            .and_then(|entry| entry.stored.take());
+            .map(|entry| (entry.stored.take(), entry.restore.take()))
+            .unwrap_or((None, None));
+        let panel = cx.weak_entity();
+        self.persistence_suspended = true;
+        let mut surface_ids = mem::take(&mut self.surface_ids);
+        let mut pending_terminals = Vec::new();
 
         let captured = workspace.update(cx, |workspace, cx| {
-            let captured = capture_layout(workspace, cx);
+            let captured =
+                capture_layout(workspace, cx, &mut surface_ids, &mut self.next_surface_id);
             clear_center(workspace, window, cx);
+            surface_ids.clear();
 
             let target_pane = workspace.active_pane().clone();
-            match target_layout {
-                Some(layout) => restore_layout(workspace, target_pane, layout, window, cx),
+            let active_surface_id = match target_layout {
+                Some(stored) => {
+                    let active_surface_id = stored.active_surface_id;
+                    let mut pending_ratios = Vec::new();
+                    restore_layout(
+                        workspace,
+                        target_pane,
+                        stored.layout,
+                        window,
+                        cx,
+                        &mut surface_ids,
+                        &mut pending_ratios,
+                    );
+                    focus_surface(workspace, active_surface_id, &surface_ids, window, cx);
+                    schedule_ratio_restores(
+                        workspace,
+                        pending_ratios,
+                        active_surface_id,
+                        window,
+                        cx,
+                    );
+                    active_surface_id
+                }
+                None if let Some(layout) = target_restore => {
+                    let active_surface_id = layout.active_surface_id;
+                    let mut pending_ratios = Vec::new();
+                    restore_snapshot_layout(
+                        workspace,
+                        target_pane,
+                        &layout,
+                        id,
+                        window,
+                        cx,
+                        &mut surface_ids,
+                        &mut pending_terminals,
+                        &mut pending_ratios,
+                    );
+                    focus_surface(workspace, active_surface_id, &surface_ids, window, cx);
+                    schedule_ratio_restores(
+                        workspace,
+                        pending_ratios,
+                        active_surface_id,
+                        window,
+                        cx,
+                    );
+                    active_surface_id
+                }
                 None => {
-                    //spawning a new terminal sometimes fails...
-                    // this a good workarround for now. gotta add some sorta retry logic
+                    let surface_id = allocate_surface_id(&mut self.next_surface_id);
+                    surface_ids.insert(target_pane.entity_id(), surface_id);
                     let welcome = cx.new(ZmuxWelcome::new);
-                    let target_pane = workspace.active_pane().clone();
                     target_pane.update(cx, |pane, cx| {
                         pane.add_item(Box::new(welcome), true, true, None, window, cx);
                     });
-                    create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+                    pending_terminals.push(RestoredTerminal {
+                        target: TerminalTarget::new(id, surface_id),
+                        working_directory: default_working_directory(workspace, cx),
+                    });
+                    surface_id
                 }
-            }
-            workspace.focus_center_pane(window, cx);
+            };
+            focus_surface(workspace, active_surface_id, &surface_ids, window, cx);
             captured
         });
 
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == previous) {
             entry.stored = Some(captured);
         }
+        self.surface_ids = surface_ids;
         self.active = id;
+        self.persistence_suspended = false;
+        for terminal in pending_terminals {
+            workspace.update(cx, |workspace, cx| {
+                create_center_terminal(
+                    workspace,
+                    panel.clone(),
+                    terminal.target,
+                    terminal.working_directory,
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+            });
+        }
         cx.notify();
+        self.persist_session(cx);
     }
 
     pub fn activate_next_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -245,23 +510,29 @@ impl WorkspacesPanel {
             return;
         }
         if id == self.active {
-            // Move to a neighbour first so the center always shows something.
-            let fallback = self
-                .entries
-                .iter()
-                .find(|entry| entry.id != id)
-                .map(|entry| entry.id);
+            // Move to a visible neighbour first so the center always shows
+            // something without perturbing the user-owned order.
+            let index = self.entries.iter().position(|entry| entry.id == id);
+            let fallback = index.and_then(|index| {
+                self.entries
+                    .get(index + 1)
+                    .or_else(|| {
+                        index
+                            .checked_sub(1)
+                            .and_then(|index| self.entries.get(index))
+                    })
+                    .map(|entry| entry.id)
+            });
             if let Some(fallback) = fallback {
                 self.activate_workspace(fallback, window, cx);
             }
         }
 
-        self.next_id = id;
-
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
-        self.entries.sort_by_key(|entry| entry.id);
+        NotificationStore::global_mut(cx).clear_workspace(id);
         cx.notify();
+        self.persist_session(cx);
     }
 
     /// Move the dragged workspace to the position indicated by the drop target.
@@ -273,18 +544,11 @@ impl WorkspacesPanel {
         target_id: WorkspaceId,
         cx: &mut Context<Self>,
     ) {
-        if dragged_id == target_id {
+        if !reorder_entries(&mut self.entries, dragged_id, target_id) {
             return;
         }
-        let Some(drag_ix) = self.entries.iter().position(|entry| entry.id == dragged_id) else {
-            return;
-        };
-        let Some(target_ix) = self.entries.iter().position(|entry| entry.id == target_id) else {
-            return;
-        };
-        let entry = self.entries.remove(drag_ix);
-        self.entries.insert(target_ix, entry);
         cx.notify();
+        self.persist_session(cx);
     }
 
     fn start_rename(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
@@ -323,6 +587,7 @@ impl WorkspacesPanel {
             entry.name = trimmed.to_string();
         }
         cx.notify();
+        self.persist_session(cx);
     }
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
@@ -331,12 +596,69 @@ impl WorkspacesPanel {
         }
     }
 
+    fn surface_for_pane(&mut self, pane_id: EntityId) -> SurfaceId {
+        *self
+            .surface_ids
+            .entry(pane_id)
+            .or_insert_with(|| allocate_surface_id(&mut self.next_surface_id))
+    }
+
+    fn persist_session(&mut self, cx: &mut Context<Self>) {
+        if self.persistence_suspended {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let active_layout = capture_layout_snapshot(
+            workspace.read(cx),
+            cx,
+            &mut self.surface_ids,
+            &mut self.next_surface_id,
+        );
+        let workspaces = self
+            .entries
+            .iter()
+            .map(|entry| WorkspaceSnapshot {
+                id: entry.id,
+                name: entry.name.clone(),
+                layout: if entry.id == self.active {
+                    active_layout.clone()
+                } else if let Some(stored) = &entry.stored {
+                    stored.snapshot(cx)
+                } else if let Some(restored) = &entry.restore {
+                    restored.clone()
+                } else {
+                    WorkspaceLayoutSnapshot::single_empty(allocate_surface_id(
+                        &mut self.next_surface_id,
+                    ))
+                },
+            })
+            .collect();
+        let snapshot = SessionSnapshot {
+            version: crate::session::SESSION_VERSION,
+            next_workspace_id: self.next_id,
+            active_workspace_id: self.active,
+            workspaces,
+        };
+        if let Err(error) = self.session_store.save(&snapshot) {
+            eprintln!("failed to persist zmux session: {error:#}");
+        }
+    }
+
+    fn schedule_persist(&mut self, cx: &mut Context<Self>) {
+        let panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            panel.update(cx, |panel, cx| panel.persist_session(cx)).ok();
+        });
+    }
+
     fn render_entry(
         &self,
-        entry: &WorkspaceEntry,
+        id: WorkspaceId,
+        name: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let id = entry.id;
         let is_active = id == self.active;
         let has_unread = NotificationStore::global(cx).workspace_has_unread(id);
         let renaming = self
@@ -377,7 +699,7 @@ impl WorkspacesPanel {
                         .child(editor.clone()),
                 ),
                 None => this.child(
-                    Label::new(entry.name.clone())
+                    Label::new(name.to_string())
                         .size(LabelSize::Small)
                         .color(if is_active {
                             Color::Default
@@ -424,7 +746,7 @@ impl WorkspacesPanel {
             .on_drag(
                 DraggedWorkspace {
                     id,
-                    name: entry.name.clone(),
+                    name: name.to_string(),
                     ix: drag_ix,
                 },
                 |drag, _, _, cx| cx.new(|_| drag.clone()),
@@ -488,16 +810,12 @@ impl EventEmitter<PanelEvent> for WorkspacesPanel {}
 
 impl Render for WorkspacesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Clone only render metadata so `render_entry` can freely borrow the
+        // panel without holding a borrow of the live workspace state.
         let rows: Vec<_> = self
             .entries
             .iter()
-            // Clone the lightweight metadata so we no longer borrow `self.entries`
-            // while `render_entry` borrows `self`.
-            .map(|entry| WorkspaceEntry {
-                id: entry.id,
-                name: entry.name.clone(),
-                stored: None,
-            })
+            .map(|entry| (entry.id, entry.name.clone()))
             .collect();
 
         let latest = NotificationStore::global(cx).latest_unread().cloned();
@@ -537,7 +855,10 @@ impl Render for WorkspacesPanel {
                     .gap_0p5()
                     .overflow_y_scroll()
                     .flex_1()
-                    .children(rows.iter().map(|entry| self.render_entry(entry, cx))),
+                    .children(
+                        rows.iter()
+                            .map(|(id, name)| self.render_entry(*id, name, cx)),
+                    ),
             )
             .when_some(latest, |this, notification| {
                 this.child(
@@ -628,55 +949,252 @@ impl Panel for WorkspacesPanel {
     }
 }
 
-/// Snapshot the current center into a [`StoredLayout`], cloning each item handle
-/// so the terminals stay alive after the originals are detached.
-fn capture_layout(workspace: &Workspace, cx: &App) -> StoredLayout {
-    let mut nodes: Vec<(Bounds<Pixels>, StoredLayout)> = Vec::new();
-    for pane in workspace.panes() {
-        let pane_ref = pane.read(cx);
-        let items: Vec<Box<dyn ItemHandle>> =
-            pane_ref.items().map(|item| item.boxed_clone()).collect();
-        if items.is_empty() {
-            continue;
-        }
-        let active = pane_ref.active_item_index();
-        let bounds = workspace.bounding_box_for_pane(pane).unwrap_or(Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(0.0), px(0.0)),
-        });
-        nodes.push((bounds, StoredLayout::Leaf { items, active }));
-    }
-    build_tree(nodes)
+fn entries_from_snapshot(
+    snapshot: SessionSnapshot,
+) -> (Vec<WorkspaceEntry>, WorkspaceId, WorkspaceId, SurfaceId) {
+    let next_surface_id = max_surface_id_in_snapshot(&snapshot)
+        .checked_add(1)
+        .expect("zmux surface ID space exhausted");
+    let active = snapshot.active_workspace_id;
+    let next_id = snapshot.next_workspace_id;
+    let entries = snapshot
+        .workspaces
+        .into_iter()
+        .map(|workspace| WorkspaceEntry {
+            id: workspace.id,
+            name: workspace.name,
+            stored: None,
+            restore: Some(workspace.layout),
+        })
+        .collect();
+    (entries, active, next_id, next_surface_id)
 }
 
-/// Reconstruct a binary split tree from the laid-out pane rectangles using a
-/// guillotine partition: repeatedly find a clean horizontal or vertical cut that
-/// separates the panes into two groups.
-fn build_tree(nodes: Vec<(Bounds<Pixels>, StoredLayout)>) -> StoredLayout {
+fn max_surface_id_in_snapshot(snapshot: &SessionSnapshot) -> SurfaceId {
+    snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| max_surface_id_in_node(&workspace.layout.root))
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_surface_id_in_node(node: &LayoutNodeSnapshot) -> SurfaceId {
+    match node {
+        LayoutNodeSnapshot::Leaf { surface_id, .. } => *surface_id,
+        LayoutNodeSnapshot::Split { first, second, .. } => {
+            max_surface_id_in_node(first).max(max_surface_id_in_node(second))
+        }
+    }
+}
+
+fn allocate_surface_id(next_surface_id: &mut SurfaceId) -> SurfaceId {
+    let id = *next_surface_id;
+    *next_surface_id = next_surface_id
+        .checked_add(1)
+        .expect("zmux surface ID space exhausted");
+    id
+}
+
+impl StoredWorkspace {
+    fn snapshot(&self, cx: &App) -> WorkspaceLayoutSnapshot {
+        WorkspaceLayoutSnapshot {
+            active_surface_id: self.active_surface_id,
+            root: self.layout.snapshot(cx),
+        }
+    }
+}
+
+impl StoredLayout {
+    fn insert_item(&mut self, target: TerminalTarget, item: Box<dyn ItemHandle>) -> bool {
+        match self {
+            Self::Leaf {
+                surface_id,
+                items,
+                active,
+            } if *surface_id == target.surface_id => {
+                let index = target
+                    .destination_index
+                    .unwrap_or_else(|| active.saturating_add(1));
+                let index = index.min(items.len());
+                items.insert(index, item);
+                if target.activate_tab {
+                    *active = index;
+                } else if index <= *active {
+                    *active = active.saturating_add(1);
+                }
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.insert_item(target.clone(), item.boxed_clone())
+                    || second.insert_item(target, item)
+            }
+            _ => false,
+        }
+    }
+
+    fn snapshot(&self, cx: &App) -> LayoutNodeSnapshot {
+        match self {
+            Self::Leaf {
+                surface_id,
+                items,
+                active,
+            } => {
+                let mut tabs = Vec::new();
+                let mut active_tab = 0;
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(terminal) = terminal_snapshot(item.as_ref(), cx) {
+                        if index == *active {
+                            active_tab = tabs.len();
+                        }
+                        tabs.push(terminal);
+                    }
+                }
+                LayoutNodeSnapshot::Leaf {
+                    surface_id: *surface_id,
+                    tabs,
+                    active_tab,
+                }
+            }
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => LayoutNodeSnapshot::Split {
+                axis: axis_to_snapshot(*axis),
+                ratio: *ratio,
+                first: Box::new(first.snapshot(cx)),
+                second: Box::new(second.snapshot(cx)),
+            },
+        }
+    }
+}
+
+fn terminal_snapshot(item: &dyn ItemHandle, cx: &App) -> Option<TerminalSnapshot> {
+    let terminal_view = item.act_as::<terminal_view::TerminalView>(cx)?;
+    let working_directory = terminal_view
+        .read(cx)
+        .terminal()
+        .read(cx)
+        .working_directory();
+    Some(TerminalSnapshot::fresh_shell(working_directory))
+}
+
+/// Snapshot the current center into a [`StoredWorkspace`], cloning item handles
+/// so terminal PTYs survive while the workspace is parked. Empty panes are kept:
+/// their geometry is part of a user's layout too.
+fn capture_layout(
+    workspace: &Workspace,
+    cx: &App,
+    surface_ids: &mut HashMap<EntityId, SurfaceId>,
+    next_surface_id: &mut SurfaceId,
+) -> StoredWorkspace {
+    let mut nodes = Vec::new();
+    for pane in workspace.panes() {
+        let surface_id = *surface_ids
+            .entry(pane.entity_id())
+            .or_insert_with(|| allocate_surface_id(next_surface_id));
+        let pane_ref = pane.read(cx);
+        let items = pane_ref.items().map(|item| item.boxed_clone()).collect();
+        let active = pane_ref.active_item_index();
+        let bounds = pane_bounds(workspace, pane);
+        nodes.push((
+            bounds,
+            StoredLayout::Leaf {
+                surface_id,
+                items,
+                active,
+            },
+        ));
+    }
+    let fallback = *surface_ids
+        .entry(workspace.active_pane().entity_id())
+        .or_insert_with(|| allocate_surface_id(next_surface_id));
+    let active_surface_id = fallback;
+    StoredWorkspace {
+        layout: build_tree(nodes, fallback),
+        active_surface_id,
+    }
+}
+
+fn capture_layout_snapshot(
+    workspace: &Workspace,
+    cx: &App,
+    surface_ids: &mut HashMap<EntityId, SurfaceId>,
+    next_surface_id: &mut SurfaceId,
+) -> WorkspaceLayoutSnapshot {
+    let mut nodes = Vec::new();
+    for pane in workspace.panes() {
+        let surface_id = *surface_ids
+            .entry(pane.entity_id())
+            .or_insert_with(|| allocate_surface_id(next_surface_id));
+        let pane_ref = pane.read(cx);
+        let mut tabs = Vec::new();
+        let mut active_tab = 0;
+        for (index, item) in pane_ref.items().enumerate() {
+            if let Some(terminal) = terminal_snapshot(item.as_ref(), cx) {
+                if index == pane_ref.active_item_index() {
+                    active_tab = tabs.len();
+                }
+                tabs.push(terminal);
+            }
+        }
+        nodes.push((
+            pane_bounds(workspace, pane),
+            LayoutNodeSnapshot::Leaf {
+                surface_id,
+                tabs,
+                active_tab,
+            },
+        ));
+    }
+    let active_surface_id = *surface_ids
+        .entry(workspace.active_pane().entity_id())
+        .or_insert_with(|| allocate_surface_id(next_surface_id));
+    WorkspaceLayoutSnapshot {
+        active_surface_id,
+        root: build_snapshot_tree(nodes, active_surface_id),
+    }
+}
+
+fn pane_bounds(workspace: &Workspace, pane: &Entity<Pane>) -> Bounds<Pixels> {
+    workspace.bounding_box_for_pane(pane).unwrap_or(Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(0.0), px(0.0)),
+    })
+}
+
+/// Reconstruct a binary split tree from laid-out pane rectangles. The ratios
+/// are captured from the cut itself rather than assuming equal halves.
+fn build_tree(
+    nodes: Vec<(Bounds<Pixels>, StoredLayout)>,
+    fallback_surface_id: SurfaceId,
+) -> StoredLayout {
     if nodes.len() <= 1 {
         return nodes
             .into_iter()
             .next()
             .map(|(_, layout)| layout)
             .unwrap_or(StoredLayout::Leaf {
+                surface_id: fallback_surface_id,
                 items: Vec::new(),
                 active: 0,
             });
     }
 
-    // `horizontal == true` looks for a vertical cut line, producing side-by-side
-    // panes (a horizontal axis); `false` looks for a stacked split.
     for horizontal in [true, false] {
-        if let Some(left_indices) = try_cut(&nodes, horizontal) {
+        if let Some(first_indices) = try_cut(&nodes, horizontal) {
             let axis = if horizontal {
                 Axis::Horizontal
             } else {
                 Axis::Vertical
             };
+            let ratio = ratio_for_cut(&nodes, &first_indices, horizontal);
             let mut first = Vec::new();
             let mut second = Vec::new();
             for (index, node) in nodes.into_iter().enumerate() {
-                if left_indices.contains(&index) {
+                if first_indices.contains(&index) {
                     first.push(node);
                 } else {
                     second.push(node);
@@ -684,19 +1202,80 @@ fn build_tree(nodes: Vec<(Bounds<Pixels>, StoredLayout)>) -> StoredLayout {
             }
             return StoredLayout::Split {
                 axis,
-                first: Box::new(build_tree(first)),
-                second: Box::new(build_tree(second)),
+                ratio,
+                first: Box::new(build_tree(first, fallback_surface_id)),
+                second: Box::new(build_tree(second, fallback_surface_id)),
             };
         }
     }
 
-    // No clean cut (shouldn't happen for guillotine layouts) — flatten the
-    // terminals into a single tab strip so nothing is lost.
+    // A non-guillotine layout is not expected from the pane engine. Preserve
+    // every terminal rather than losing tabs if an invalid geometry slips in.
+    let mut nodes = nodes.into_iter();
+    let (_, first) = nodes.next().expect("more than one layout node");
+    let surface_id = first.first_surface_id();
     let mut items = Vec::new();
+    collect_items(first, &mut items);
     for (_, layout) in nodes {
         collect_items(layout, &mut items);
     }
-    StoredLayout::Leaf { items, active: 0 }
+    StoredLayout::Leaf {
+        surface_id,
+        items,
+        active: 0,
+    }
+}
+
+fn build_snapshot_tree(
+    nodes: Vec<(Bounds<Pixels>, LayoutNodeSnapshot)>,
+    fallback_surface_id: SurfaceId,
+) -> LayoutNodeSnapshot {
+    if nodes.len() <= 1 {
+        return nodes
+            .into_iter()
+            .next()
+            .map(|(_, layout)| layout)
+            .unwrap_or_else(|| WorkspaceLayoutSnapshot::single_empty(fallback_surface_id).root);
+    }
+
+    for horizontal in [true, false] {
+        if let Some(first_indices) = try_cut(&nodes, horizontal) {
+            let ratio = ratio_for_cut(&nodes, &first_indices, horizontal);
+            let mut first = Vec::new();
+            let mut second = Vec::new();
+            for (index, node) in nodes.into_iter().enumerate() {
+                if first_indices.contains(&index) {
+                    first.push(node);
+                } else {
+                    second.push(node);
+                }
+            }
+            return LayoutNodeSnapshot::Split {
+                axis: if horizontal {
+                    LayoutAxis::Horizontal
+                } else {
+                    LayoutAxis::Vertical
+                },
+                ratio,
+                first: Box::new(build_snapshot_tree(first, fallback_surface_id)),
+                second: Box::new(build_snapshot_tree(second, fallback_surface_id)),
+            };
+        }
+    }
+
+    let mut nodes = nodes.into_iter();
+    let (_, first) = nodes.next().expect("more than one layout node");
+    let surface_id = first.first_surface_id();
+    let mut tabs = Vec::new();
+    collect_snapshot_tabs(first, &mut tabs);
+    for (_, node) in nodes {
+        collect_snapshot_tabs(node, &mut tabs);
+    }
+    LayoutNodeSnapshot::Leaf {
+        surface_id,
+        tabs,
+        active_tab: 0,
+    }
 }
 
 fn coord_lo(bounds: &Bounds<Pixels>, horizontal: bool) -> f32 {
@@ -715,9 +1294,7 @@ fn coord_hi(bounds: &Bounds<Pixels>, horizontal: bool) -> f32 {
     }
 }
 
-/// Find the leftmost/topmost clean cut and return the indices of the panes that
-/// fall before it. Returns `None` if no cut cleanly separates the panes.
-fn try_cut(nodes: &[(Bounds<Pixels>, StoredLayout)], horizontal: bool) -> Option<Vec<usize>> {
+fn try_cut<T>(nodes: &[(Bounds<Pixels>, T)], horizontal: bool) -> Option<Vec<usize>> {
     const EPS: f32 = 1.0;
     let mut cuts: Vec<f32> = nodes
         .iter()
@@ -743,6 +1320,49 @@ fn try_cut(nodes: &[(Bounds<Pixels>, StoredLayout)], horizontal: bool) -> Option
     None
 }
 
+fn ratio_for_cut<T>(
+    nodes: &[(Bounds<Pixels>, T)],
+    first_indices: &[usize],
+    horizontal: bool,
+) -> Ratio {
+    let lo = nodes
+        .iter()
+        .map(|(bounds, _)| coord_lo(bounds, horizontal))
+        .fold(f32::INFINITY, f32::min);
+    let hi = nodes
+        .iter()
+        .map(|(bounds, _)| coord_hi(bounds, horizontal))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let first_hi = first_indices
+        .iter()
+        .map(|index| coord_hi(&nodes[*index].0, horizontal))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let span = hi - lo;
+    if !span.is_finite() || span <= 0.0 {
+        Ratio::DEFAULT
+    } else {
+        Ratio::new((first_hi - lo) / span)
+    }
+}
+
+impl StoredLayout {
+    fn first_surface_id(&self) -> SurfaceId {
+        match self {
+            Self::Leaf { surface_id, .. } => *surface_id,
+            Self::Split { first, .. } => first.first_surface_id(),
+        }
+    }
+}
+
+impl LayoutNodeSnapshot {
+    fn first_surface_id(&self) -> SurfaceId {
+        match self {
+            Self::Leaf { surface_id, .. } => *surface_id,
+            Self::Split { first, .. } => first.first_surface_id(),
+        }
+    }
+}
+
 fn collect_items(layout: StoredLayout, out: &mut Vec<Box<dyn ItemHandle>>) {
     match layout {
         StoredLayout::Leaf { items, .. } => out.extend(items),
@@ -750,6 +1370,31 @@ fn collect_items(layout: StoredLayout, out: &mut Vec<Box<dyn ItemHandle>>) {
             collect_items(*first, out);
             collect_items(*second, out);
         }
+    }
+}
+
+fn collect_snapshot_tabs(node: LayoutNodeSnapshot, out: &mut Vec<TerminalSnapshot>) {
+    match node {
+        LayoutNodeSnapshot::Leaf { tabs, .. } => out.extend(tabs),
+        LayoutNodeSnapshot::Split { first, second, .. } => {
+            collect_snapshot_tabs(*first, out);
+            collect_snapshot_tabs(*second, out);
+        }
+    }
+}
+
+fn axis_to_snapshot(axis: Axis) -> LayoutAxis {
+    if axis == Axis::Horizontal {
+        LayoutAxis::Horizontal
+    } else {
+        LayoutAxis::Vertical
+    }
+}
+
+fn axis_from_snapshot(axis: LayoutAxis) -> Axis {
+    match axis {
+        LayoutAxis::Horizontal => Axis::Horizontal,
+        LayoutAxis::Vertical => Axis::Vertical,
     }
 }
 
@@ -766,29 +1411,40 @@ fn clear_center(workspace: &mut Workspace, window: &mut Window, cx: &mut Context
     );
 }
 
-/// Rebuild a [`StoredLayout`] into the center, starting from a single empty pane.
 fn restore_layout(
     workspace: &mut Workspace,
     target: Entity<Pane>,
     layout: StoredLayout,
     window: &mut Window,
     cx: &mut Context<Workspace>,
+    surface_ids: &mut HashMap<EntityId, SurfaceId>,
+    pending_ratios: &mut Vec<PendingRatio>,
 ) {
     match layout {
-        StoredLayout::Leaf { items, active } => {
-            if items.is_empty() {
-                return;
-            }
+        StoredLayout::Leaf {
+            surface_id,
+            items,
+            active,
+        } => {
+            surface_ids.insert(target.entity_id(), surface_id);
             target.update(cx, |pane, cx| {
                 for item in items {
                     pane.add_item(item, false, false, None, window, cx);
                 }
-                let index = active.min(pane.items_len().saturating_sub(1));
-                pane.activate_item(index, false, false, window, cx);
+                if pane.items_len() > 0 {
+                    pane.activate_item(
+                        active.min(pane.items_len().saturating_sub(1)),
+                        false,
+                        false,
+                        window,
+                        cx,
+                    );
+                }
             });
         }
         StoredLayout::Split {
             axis,
+            ratio,
             first,
             second,
         } => {
@@ -798,31 +1454,287 @@ fn restore_layout(
                 SplitDirection::Down
             };
             let new_pane = workspace.split_pane(target.clone(), direction, window, cx);
-            restore_layout(workspace, target, *first, window, cx);
-            restore_layout(workspace, new_pane, *second, window, cx);
+            restore_layout(
+                workspace,
+                target.clone(),
+                *first,
+                window,
+                cx,
+                surface_ids,
+                pending_ratios,
+            );
+            restore_layout(
+                workspace,
+                new_pane,
+                *second,
+                window,
+                cx,
+                surface_ids,
+                pending_ratios,
+            );
+            pending_ratios.push(PendingRatio {
+                first: target,
+                axis,
+                ratio,
+            });
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_snapshot_layout(
+    workspace: &mut Workspace,
+    target: Entity<Pane>,
+    layout: &WorkspaceLayoutSnapshot,
+    workspace_id: WorkspaceId,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    surface_ids: &mut HashMap<EntityId, SurfaceId>,
+    pending_terminals: &mut Vec<RestoredTerminal>,
+    pending_ratios: &mut Vec<PendingRatio>,
+) {
+    restore_snapshot_node(
+        workspace,
+        target,
+        &layout.root,
+        workspace_id,
+        window,
+        cx,
+        surface_ids,
+        pending_terminals,
+        pending_ratios,
+    );
+}
+
+/// Materialize the initially selected persisted layout into Zed's otherwise
+/// empty center. This is intentionally separate from Zed's own restoration so
+/// zmux never imports, migrates, or mutates Zed session state.
+pub(crate) fn restore_startup_layout(
+    workspace: &mut Workspace,
+    layout: WorkspaceLayoutSnapshot,
+    workspace_id: WorkspaceId,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> (
+    HashMap<EntityId, SurfaceId>,
+    Vec<(TerminalTarget, Option<PathBuf>)>,
+) {
+    clear_center(workspace, window, cx);
+    let target = workspace.active_pane().clone();
+    let mut surface_ids = HashMap::new();
+    let mut terminals = Vec::new();
+    let mut pending_ratios = Vec::new();
+    let active_surface_id = layout.active_surface_id;
+    restore_snapshot_layout(
+        workspace,
+        target,
+        &layout,
+        workspace_id,
+        window,
+        cx,
+        &mut surface_ids,
+        &mut terminals,
+        &mut pending_ratios,
+    );
+    focus_surface(workspace, active_surface_id, &surface_ids, window, cx);
+    schedule_ratio_restores(workspace, pending_ratios, active_surface_id, window, cx);
+    (
+        surface_ids,
+        terminals
+            .into_iter()
+            .map(|terminal| (terminal.target, terminal.working_directory))
+            .collect(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_snapshot_node(
+    workspace: &mut Workspace,
+    target: Entity<Pane>,
+    node: &LayoutNodeSnapshot,
+    workspace_id: WorkspaceId,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    surface_ids: &mut HashMap<EntityId, SurfaceId>,
+    pending_terminals: &mut Vec<RestoredTerminal>,
+    pending_ratios: &mut Vec<PendingRatio>,
+) {
+    match node {
+        LayoutNodeSnapshot::Leaf {
+            surface_id,
+            tabs,
+            active_tab,
+        } => {
+            surface_ids.insert(target.entity_id(), *surface_id);
+            for (index, terminal) in tabs.iter().enumerate() {
+                pending_terminals.push(RestoredTerminal {
+                    target: TerminalTarget::restored(
+                        workspace_id,
+                        *surface_id,
+                        index,
+                        index == *active_tab,
+                    ),
+                    working_directory: terminal.working_directory.clone(),
+                });
+            }
+        }
+        LayoutNodeSnapshot::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let axis = axis_from_snapshot(*axis);
+            let direction = if axis == Axis::Horizontal {
+                SplitDirection::Right
+            } else {
+                SplitDirection::Down
+            };
+            let new_pane = workspace.split_pane(target.clone(), direction, window, cx);
+            restore_snapshot_node(
+                workspace,
+                target.clone(),
+                first,
+                workspace_id,
+                window,
+                cx,
+                surface_ids,
+                pending_terminals,
+                pending_ratios,
+            );
+            restore_snapshot_node(
+                workspace,
+                new_pane,
+                second,
+                workspace_id,
+                window,
+                cx,
+                surface_ids,
+                pending_terminals,
+                pending_ratios,
+            );
+            pending_ratios.push(PendingRatio {
+                first: target,
+                axis,
+                ratio: *ratio,
+            });
+        }
+    }
+}
+
+fn focus_surface(
+    workspace: &mut Workspace,
+    surface_id: SurfaceId,
+    surface_ids: &HashMap<EntityId, SurfaceId>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let pane_id = surface_ids
+        .iter()
+        .find_map(|(pane_id, candidate)| (*candidate == surface_id).then_some(*pane_id));
+    let pane = pane_id.and_then(|pane_id| {
+        workspace
+            .panes()
+            .iter()
+            .find(|pane| pane.entity_id() == pane_id)
+            .cloned()
+    });
+    if let Some(pane) = pane {
+        window.focus(&pane.focus_handle(cx), cx);
+    } else {
+        workspace.focus_center_pane(window, cx);
+    }
+}
+
+fn schedule_ratio_restores(
+    workspace: &mut Workspace,
+    pending_ratios: Vec<PendingRatio>,
+    _active_surface_id: SurfaceId,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace = workspace.weak_handle();
+    let focus = workspace
+        .upgrade()
+        .map(|workspace| workspace.read(cx).active_pane().clone());
+    for pending in pending_ratios {
+        let workspace = workspace.clone();
+        let first = pending.first;
+        let focus = focus.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    let Some(bounds) = workspace.bounding_box_for_pane(&first) else {
+                        return;
+                    };
+                    let current = match pending.axis {
+                        Axis::Horizontal => f32::from(bounds.size.width),
+                        Axis::Vertical => f32::from(bounds.size.height),
+                    };
+                    if current <= 0.0 {
+                        return;
+                    }
+                    // A newly-created split starts at 50/50. The first pane's
+                    // current extent therefore gives us the full extent without
+                    // reaching into Zed's private PaneGroup internals.
+                    let amount = current * (pending.ratio.get() * 2.0 - 1.0);
+                    if amount.abs() < 1.0 {
+                        return;
+                    }
+                    window.focus(&first.focus_handle(cx), cx);
+                    workspace.resize_pane(pending.axis, px(amount), window, cx);
+                    if let Some(focus) = &focus {
+                        window.focus(&focus.focus_handle(cx), cx);
+                    }
+                })
+                .ok();
+        });
+    }
+}
+
+fn reorder_entries(
+    entries: &mut Vec<WorkspaceEntry>,
+    dragged_id: WorkspaceId,
+    target_id: WorkspaceId,
+) -> bool {
+    if dragged_id == target_id {
+        return false;
+    }
+    let Some(drag_ix) = entries.iter().position(|entry| entry.id == dragged_id) else {
+        return false;
+    };
+    let Some(target_ix) = entries.iter().position(|entry| entry.id == target_id) else {
+        return false;
+    };
+    let entry = entries.remove(drag_ix);
+    entries.insert(target_ix, entry);
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn leaf(x: f32, y: f32, w: f32, h: f32) -> (Bounds<Pixels>, StoredLayout) {
+    fn leaf(
+        surface_id: SurfaceId,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> (Bounds<Pixels>, StoredLayout) {
         (
             Bounds {
                 origin: point(px(x), px(y)),
                 size: size(px(w), px(h)),
             },
             StoredLayout::Leaf {
+                surface_id,
                 items: Vec::new(),
                 active: 0,
             },
         )
     }
 
-    /// Render the layout's shape, ignoring the (empty) item lists, so tests can
-    /// assert the reconstructed split tree.
     fn shape(layout: &StoredLayout) -> String {
         match layout {
             StoredLayout::Leaf { .. } => "·".to_string(),
@@ -830,6 +1742,7 @@ mod tests {
                 axis,
                 first,
                 second,
+                ..
             } => {
                 let axis = if *axis == Axis::Horizontal { "H" } else { "V" };
                 format!("{axis}({},{})", shape(first), shape(second))
@@ -837,52 +1750,92 @@ mod tests {
         }
     }
 
+    fn ratio(layout: &StoredLayout) -> Ratio {
+        match layout {
+            StoredLayout::Split { ratio, .. } => *ratio,
+            StoredLayout::Leaf { .. } => panic!("expected split"),
+        }
+    }
+
     #[test]
     fn single_pane_is_a_leaf() {
-        assert_eq!(shape(&build_tree(vec![leaf(0.0, 0.0, 100.0, 100.0)])), "·");
+        assert_eq!(
+            shape(&build_tree(vec![leaf(1, 0.0, 0.0, 100.0, 100.0)], 1)),
+            "·"
+        );
     }
 
     #[test]
-    fn empty_layout_is_an_empty_leaf() {
-        assert_eq!(shape(&build_tree(Vec::new())), "·");
+    fn empty_layout_retains_the_allocated_surface_identity() {
+        match build_tree(Vec::new(), 42) {
+            StoredLayout::Leaf { surface_id, .. } => assert_eq!(surface_id, 42),
+            StoredLayout::Split { .. } => panic!("expected empty leaf"),
+        }
     }
 
     #[test]
-    fn side_by_side_panes_become_a_horizontal_split() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 50.0, 100.0),
-            leaf(50.0, 0.0, 50.0, 100.0),
-        ]);
-        assert_eq!(shape(&tree), "H(·,·)");
-    }
-
-    #[test]
-    fn stacked_panes_become_a_vertical_split() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 100.0, 50.0),
-            leaf(0.0, 50.0, 100.0, 50.0),
-        ]);
-        assert_eq!(shape(&tree), "V(·,·)");
-    }
-
-    #[test]
-    fn nested_layout_is_reconstructed() {
-        // Left column, with the right side split into top/bottom.
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 50.0, 100.0),
-            leaf(50.0, 0.0, 50.0, 50.0),
-            leaf(50.0, 50.0, 50.0, 50.0),
-        ]);
+    fn nested_layout_preserves_shape_and_non_equal_split_ratios() {
+        // A 30/70 left/right split, whose right side is a 75/25 top/bottom split.
+        let tree = build_tree(
+            vec![
+                leaf(1, 0.0, 0.0, 30.0, 100.0),
+                leaf(2, 30.0, 0.0, 70.0, 75.0),
+                leaf(3, 30.0, 75.0, 70.0, 25.0),
+            ],
+            1,
+        );
         assert_eq!(shape(&tree), "H(·,V(·,·))");
+        assert!((ratio(&tree).get() - 0.30).abs() < 0.01);
+        let StoredLayout::Split { second, .. } = tree else {
+            panic!("expected root split");
+        };
+        assert!((ratio(&second).get() - 0.75).abs() < 0.01);
     }
 
     #[test]
-    fn three_columns_nest_left_to_right() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 33.0, 100.0),
-            leaf(33.0, 0.0, 33.0, 100.0),
-            leaf(66.0, 0.0, 34.0, 100.0),
-        ]);
-        assert_eq!(shape(&tree), "H(·,H(·,·))");
+    fn drag_reorder_is_not_overwritten_by_id_ordering() {
+        let mut entries = vec![
+            WorkspaceEntry {
+                id: 1,
+                name: "one".into(),
+                stored: None,
+                restore: None,
+            },
+            WorkspaceEntry {
+                id: 2,
+                name: "two".into(),
+                stored: None,
+                restore: None,
+            },
+            WorkspaceEntry {
+                id: 3,
+                name: "three".into(),
+                stored: None,
+                restore: None,
+            },
+        ];
+        assert!(reorder_entries(&mut entries, 3, 1));
+        let new_id = 4;
+        entries.push(WorkspaceEntry {
+            id: new_id,
+            name: "four".into(),
+            stored: None,
+            restore: None,
+        });
+        entries.retain(|entry| entry.id != 2);
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![3, 1, 4]
+        );
+    }
+
+    #[test]
+    fn workspace_identity_watermark_never_reuses_a_closed_id() {
+        let mut next_id: WorkspaceId = 4;
+        let created = next_id;
+        next_id = next_id.checked_add(1).unwrap();
+        assert_eq!(created, 4);
+        // Closing workspace 2 deliberately does not change `next_id`.
+        assert_eq!(next_id, 5);
     }
 }

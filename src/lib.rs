@@ -8,6 +8,7 @@ mod ipc;
 mod keymap;
 mod notifications;
 mod osc;
+mod session;
 mod theme;
 mod welcome;
 mod workspaces;

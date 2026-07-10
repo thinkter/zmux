@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
@@ -11,7 +11,7 @@ use gpui_platform::application;
 use http_client::{BlockedHttpClient, HttpClientWithUrl};
 use project::Project;
 use settings::Settings;
-use terminal_view::{default_working_directory, terminal_panel::TerminalPanel};
+use terminal_view::default_working_directory;
 use workspace::{AppState, MultiWorkspace, OpenMode, OpenResult, Workspace, WorkspaceStore};
 
 use crate::cli_server::CliServer;
@@ -21,8 +21,8 @@ use crate::notifications::{NotificationSource, NotificationStore};
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{
-    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel,
-    WorkspacesPanel,
+    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, TerminalTarget,
+    ToggleWorkspacesPanel, WorkspacesPanel, restore_startup_layout,
 };
 
 actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
@@ -129,12 +129,6 @@ pub fn open_zmux_workspace(
             notification_endpoint.as_deref(),
         )),
         Some(Box::new(move |workspace, window, cx| {
-            let welcome = cx.new(ZmuxWelcome::new);
-            let center_pane = workspace.active_pane().clone();
-            center_pane.update(cx, |pane, cx| {
-                pane.set_should_display_welcome_page(false);
-                pane.add_item(Box::new(welcome), true, true, None, window, cx);
-            });
             workspace
                 .bottom_dock()
                 .update(cx, |dock, cx| dock.set_open(false, window, cx));
@@ -147,8 +141,63 @@ pub fn open_zmux_workspace(
                 cx.set_global(cli_server);
             }
 
+            let active_workspace_id = panel.read(cx).active_workspace_id();
+            let startup_restore = panel.update(cx, |panel, _| panel.take_initial_restore());
+            if let Some(layout) = startup_restore {
+                panel.update(cx, |panel, _| panel.begin_session_restore());
+                let (surface_ids, terminals) =
+                    restore_startup_layout(workspace, layout, active_workspace_id, window, cx);
+                panel.update(cx, |panel, cx| {
+                    panel.install_restored_surfaces(surface_ids);
+                    panel.finish_session_restore(cx);
+                });
+                for (target, working_directory) in terminals {
+                    create_center_terminal(
+                        workspace,
+                        panel.downgrade(),
+                        target,
+                        working_directory,
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                }
+            } else {
+                let welcome = cx.new(ZmuxWelcome::new);
+                let center_pane = workspace.active_pane().clone();
+                center_pane.update(cx, |pane, cx| {
+                    pane.set_should_display_welcome_page(false);
+                    pane.add_item(Box::new(welcome), true, true, None, window, cx);
+                });
+                let target = panel.update(cx, |panel, _| {
+                    panel.register_initial_surface(center_pane.entity_id())
+                });
+                create_center_terminal(
+                    workspace,
+                    panel.downgrade(),
+                    target,
+                    default_working_directory(workspace, cx),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+            }
+
             workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
-                create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+                let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                    return;
+                };
+                let pane_id = workspace.active_pane().entity_id();
+                let target = panel.update(cx, |panel, _| panel.active_terminal_target(pane_id));
+                create_center_terminal(
+                    workspace,
+                    panel.downgrade(),
+                    target,
+                    default_working_directory(workspace, cx),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
             });
             workspace.register_action(|workspace, _: &NewWorkspace, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
@@ -252,7 +301,6 @@ pub fn open_zmux_workspace(
                 NotificationStore::global_mut(cx).mark_pane_read(notification.item_id);
                 panel.update(cx, |_, cx| cx.notify());
             });
-            create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
         })),
         OpenMode::NewWindow,
         cx,
@@ -261,12 +309,37 @@ pub fn open_zmux_workspace(
 
 pub(crate) fn create_center_terminal(
     workspace: &mut Workspace,
+    panel: WeakEntity<WorkspacesPanel>,
+    target: TerminalTarget,
+    working_directory: Option<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
-    let working_directory = default_working_directory(workspace, cx);
-    TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
-        project.create_terminal_shell(working_directory, cx)
+    let project = workspace.project().downgrade();
+    let workspace_handle = workspace.weak_handle();
+    cx.spawn_in(window, async move |_workspace, cx| {
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_shell(working_directory, cx)
+            })?
+            .await?;
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            let terminal_view = cx.new(|cx| {
+                terminal_view::TerminalView::new(
+                    terminal.clone(),
+                    workspace.weak_handle(),
+                    workspace.database_id(),
+                    workspace.project().downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            panel.update(cx, |panel, cx| {
+                panel.attach_terminal(target, Box::new(terminal_view), window, cx);
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })??;
+        Ok(terminal.downgrade())
     })
 }
 
