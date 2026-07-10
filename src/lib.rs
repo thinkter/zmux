@@ -1,3 +1,4 @@
+mod agent_hooks;
 mod app;
 mod assets;
 mod cli_server;
@@ -12,6 +13,15 @@ mod theme;
 mod welcome;
 mod workspaces;
 
+pub use agent_hooks::{
+    AGENT_HOOK_OSC_PREFIX, AGENT_HOOK_PROTOCOL_VERSION, AdapterError, AdapterHookEvent,
+    AdapterPlan, AdapterSettings, AgentAdapter, AgentHookEvent, AgentHookKind, AgentHookRouter,
+    AgentRole, DEFAULT_AGENT_HOOK_AUDIT_CAPACITY, HookAuditRecord, HookDelivery, HookFilter,
+    HookOrigin, HookParseError, HookParseErrorCode, MAX_AGENT_HOOK_BODY_BYTES,
+    MAX_AGENT_HOOK_FRAME_BYTES, MAX_AGENT_HOOK_TITLE_BYTES, MAX_AGENT_NAME_BYTES,
+    MAX_PUBLIC_SESSION_ID_BYTES, NativeResumeCommand, ResumeError, RoutedHookEvent,
+    TrustedResumeRecord, encode_osc_hook_payload, parse_hook_rpc_frame, parse_osc_hook_payload,
+};
 pub use app::{JumpToLatestNotification, NotifyCurrentPane, init_zmux, open_zmux_workspace, run};
 pub use cli_server::{CliNotification, CliServer, NOTIFICATION_ENDPOINT_ENV, NotificationEndpoint};
 pub use control::{
