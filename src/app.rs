@@ -15,7 +15,7 @@ use terminal_view::{default_working_directory, terminal_panel::TerminalPanel};
 use workspace::{AppState, MultiWorkspace, OpenMode, OpenResult, Workspace, WorkspaceStore};
 
 use crate::cli_server::CliServer;
-use crate::env::terminal_env;
+use crate::env::terminal_env_with_notification_endpoint;
 use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
 use crate::notifications::{NotificationSource, NotificationStore};
 use crate::theme::configure_terminal_fonts;
@@ -96,6 +96,27 @@ pub fn open_zmux_workspace(
 ) -> Task<anyhow::Result<OpenResult>> {
     let app_state = AppState::global(cx);
 
+    // The first workspace owns a per-process notification endpoint. Later
+    // windows reuse that endpoint so all terminal children route to the same
+    // running zmux instance instead of replacing or unlinking one another.
+    let (cli_server, notification_endpoint) = if cx.has_global::<CliServer>() {
+        (
+            None,
+            Some(cx.global::<CliServer>().endpoint().as_str().to_owned()),
+        )
+    } else {
+        match CliServer::prepare() {
+            Ok(server) => {
+                let endpoint = server.endpoint().as_str().to_owned();
+                (Some(server), Some(endpoint))
+            }
+            Err(error) => {
+                eprintln!("failed to start zmux notification endpoint: {error:#}");
+                (None, None)
+            }
+        }
+    };
+
     let initial_dir = crate::env::current_working_directory()
         .map(|p| vec![p])
         .unwrap_or_default();
@@ -104,8 +125,10 @@ pub fn open_zmux_workspace(
         initial_dir,
         app_state,
         requesting_window,
-        Some(terminal_env()),
-        Some(Box::new(|workspace, window, cx| {
+        Some(terminal_env_with_notification_endpoint(
+            notification_endpoint.as_deref(),
+        )),
+        Some(Box::new(move |workspace, window, cx| {
             let welcome = cx.new(ZmuxWelcome::new);
             let center_pane = workspace.active_pane().clone();
             center_pane.update(cx, |pane, cx| {
@@ -119,8 +142,10 @@ pub fn open_zmux_workspace(
             let panel = cx.new(|cx| WorkspacesPanel::new(workspace.weak_handle(), window, cx));
             workspace.add_panel(panel.clone(), window, cx);
             workspace.open_panel::<WorkspacesPanel>(window, cx);
-            let cli_server = CliServer::start(workspace.weak_handle(), panel.downgrade(), cx);
-            cx.set_global(cli_server);
+            if let Some(cli_server) = cli_server {
+                let cli_server = cli_server.start(workspace.weak_handle(), panel.downgrade(), cx);
+                cx.set_global(cli_server);
+            }
 
             workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
                 create_center_terminal(workspace, window, cx).detach_and_log_err(cx);

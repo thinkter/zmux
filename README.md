@@ -18,7 +18,7 @@ Shortcuts:
 - New workspace: `Ctrl-Shift-E`. Toggle the workspaces sidebar: `Ctrl-Shift-B`.
 - Notify the current terminal pane (manual test trigger): `Ctrl-Shift-M`.
 - Jump to the latest unread notification: `Ctrl-Shift-U`.
-- CLI: `zmux notify "Title" "Body"` or `zmux notify --title "Title" --body "Body"`.
+- CLI: `zmux notify "Title" "Body"` or `zmux notify --title "Title" --body "Body"`. Terminals spawned by zmux inherit a private per-instance notification endpoint, so the command always reaches the zmux instance that launched that terminal.
 - Zoom terminal font: `Ctrl-=`/`Ctrl-+`, `Ctrl--`, `Ctrl-0`; macOS-style `Cmd` variants are also bound.
 - Plain `Ctrl-C` is intentionally left for the shell interrupt signal.
 
