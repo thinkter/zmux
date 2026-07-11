@@ -8,7 +8,7 @@
 
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,10 +17,14 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(test)]
+use std::io::Read;
+
 use anyhow::Context as _;
-use async_channel::{Receiver, Sender, unbounded};
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use gpui::{App, AsyncApp, Global, Task, WeakEntity};
 use serde::{Deserialize, Serialize};
+use smol::io::AsyncReadExt as _;
 use tempfile::TempDir;
 
 use crate::{
@@ -146,6 +150,7 @@ pub struct CliServer {
     endpoint_lease: EndpointLease,
     receiver: Option<Receiver<CliNotification>>,
     running: Arc<AtomicBool>,
+    shutdown: Option<Sender<()>>,
     accept_thread: Option<JoinHandle<()>>,
     _task: Option<Task<()>>,
 }
@@ -161,7 +166,7 @@ impl CliServer {
     pub fn prepare() -> anyhow::Result<Self> {
         let endpoint_lease = EndpointLease::create()?;
         let endpoint = endpoint_lease.endpoint.clone();
-        let listener = PlatformLocalIpc::bind(endpoint.path()).with_context(|| {
+        let listener = net::async_net::UnixListener::bind(endpoint.path()).with_context(|| {
             format!(
                 "binding zmux notification endpoint at {}",
                 endpoint.path().display()
@@ -175,17 +180,26 @@ impl CliServer {
         })?;
 
         let (sender, receiver) = unbounded::<CliNotification>();
+        let (shutdown, shutdown_receiver) = bounded(1);
         let running = Arc::new(AtomicBool::new(true));
         let accept_running = running.clone();
         let accept_thread = thread::Builder::new()
             .name("zmux-cli-notify".to_owned())
-            .spawn(move || Self::accept_loop(listener, sender, accept_running))
+            .spawn(move || {
+                smol::block_on(Self::accept_loop(
+                    listener,
+                    sender,
+                    accept_running,
+                    shutdown_receiver,
+                ));
+            })
             .context("starting zmux notification listener thread")?;
 
         Ok(Self {
             endpoint_lease,
             receiver: Some(receiver),
             running,
+            shutdown: Some(shutdown),
             accept_thread: Some(accept_thread),
             _task: None,
         })
@@ -239,28 +253,42 @@ impl CliServer {
         Ok(())
     }
 
-    fn accept_loop(
-        listener: <PlatformLocalIpc as LocalIpcTransport>::Listener,
+    async fn accept_loop(
+        listener: net::async_net::UnixListener,
         sender: Sender<CliNotification>,
         running: Arc<AtomicBool>,
+        shutdown: Receiver<()>,
     ) {
         while running.load(Ordering::Acquire) {
-            match PlatformLocalIpc::accept(&listener) {
-                Ok(stream) => {
+            // The shutdown future is deliberately raced first. Dropping the
+            // sender wakes it even when no process ever connects, and dropping
+            // the pending `accept` future releases the listener on every
+            // platform supported by Zed's async socket wrapper.
+            let next_connection = async { Some(listener.accept().await) };
+            let cancelled = async {
+                let _ = shutdown.recv().await;
+                None
+            };
+
+            match smol::future::or(cancelled, next_connection).await {
+                None => break,
+                Some(Ok((stream, _))) => {
                     if !running.load(Ordering::Acquire) {
                         break;
                     }
 
                     let client_sender = sender.clone();
                     let client_running = running.clone();
-                    if let Err(error) = thread::Builder::new()
-                        .name("zmux-cli-notify-client".to_owned())
-                        .spawn(move || Self::read_client(stream, client_sender, client_running))
-                    {
-                        eprintln!("failed to start zmux notification client handler: {error}");
-                    }
+                    let client_shutdown = shutdown.clone();
+                    smol::spawn(Self::read_client(
+                        stream,
+                        client_sender,
+                        client_running,
+                        client_shutdown,
+                    ))
+                    .detach();
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     if running.load(Ordering::Acquire) {
                         eprintln!("zmux notification listener stopped: {error}");
                     }
@@ -270,19 +298,30 @@ impl CliServer {
         }
     }
 
-    fn read_client(
-        mut stream: <PlatformLocalIpc as LocalIpcTransport>::Stream,
+    async fn read_client(
+        mut stream: net::async_net::UnixStream,
         sender: Sender<CliNotification>,
         running: Arc<AtomicBool>,
+        shutdown: Receiver<()>,
     ) {
-        match read_notification(&mut stream) {
-            Ok(notification) if running.load(Ordering::Acquire) => {
-                if sender.try_send(notification).is_err() {
-                    eprintln!("zmux notification receiver is no longer available");
+        let notification = async { Some(read_notification_async(&mut stream).await) };
+        let cancelled = async {
+            let _ = shutdown.recv().await;
+            None
+        };
+
+        match smol::future::or(cancelled, notification).await {
+            None => {}
+            Some(Ok(notification)) if running.load(Ordering::Acquire) => {
+                match sender.try_send(notification) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        eprintln!("zmux notification receiver is no longer available");
+                    }
                 }
             }
-            Ok(_) => {}
-            Err(error) => eprintln!("discarding invalid zmux notification: {error:#}"),
+            Some(Ok(_)) => {}
+            Some(Err(error)) => eprintln!("discarding invalid zmux notification: {error:#}"),
         }
     }
 
@@ -330,10 +369,11 @@ impl Drop for CliServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
 
-        // Wake a blocking accept so the listener can drop before its private
-        // directory is removed. This only ever targets this instance's unique
-        // endpoint, so it cannot affect another running zmux instance.
-        let _ = PlatformLocalIpc::connect(self.endpoint().path());
+        // Explicitly cancel the pending async accept before joining its thread.
+        // This does not depend on a client connection succeeding, so shutdown
+        // remains bounded even if the endpoint pathname has already vanished.
+        // Closing this channel also cancels pending client reads.
+        drop(self.shutdown.take());
         if let Some(accept_thread) = self.accept_thread.take()
             && accept_thread.join().is_err()
         {
@@ -371,6 +411,7 @@ fn write_notification<W: Write>(
 }
 
 /// Read one framed JSON notification from a local IPC stream.
+#[cfg(test)]
 fn read_notification<R: Read>(stream: &mut R) -> anyhow::Result<CliNotification> {
     let mut length = [0_u8; std::mem::size_of::<u32>()];
     stream
@@ -385,6 +426,28 @@ fn read_notification<R: Read>(stream: &mut R) -> anyhow::Result<CliNotification>
     let mut payload = vec![0; payload_len];
     stream
         .read_exact(&mut payload)
+        .context("reading zmux notification payload")?;
+    serde_json::from_slice(&payload).context("decoding zmux notification JSON")
+}
+
+async fn read_notification_async(
+    stream: &mut net::async_net::UnixStream,
+) -> anyhow::Result<CliNotification> {
+    let mut length = [0_u8; std::mem::size_of::<u32>()];
+    stream
+        .read_exact(&mut length)
+        .await
+        .context("reading zmux notification length")?;
+    let payload_len = u32::from_be_bytes(length) as usize;
+    anyhow::ensure!(
+        payload_len <= MAX_NOTIFICATION_BYTES,
+        "notification payload exceeds {MAX_NOTIFICATION_BYTES} bytes"
+    );
+
+    let mut payload = vec![0; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .await
         .context("reading zmux notification payload")?;
     serde_json::from_slice(&payload).context("decoding zmux notification JSON")
 }
@@ -483,5 +546,26 @@ mod tests {
                 Err(error) => panic!("notification was not delivered: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn drop_cancels_accept_without_connecting_to_the_endpoint() {
+        let server = CliServer::prepare().unwrap();
+        let endpoint = server.endpoint().path().to_owned();
+
+        // Simulate cleanup outside the server. The old connect-to-wake strategy
+        // could not unblock `accept` once this name was gone.
+        fs::remove_file(&endpoint).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let drop_thread = thread::spawn(move || {
+            drop(server);
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping the IPC server should cancel its pending accept");
+        drop_thread.join().unwrap();
     }
 }
