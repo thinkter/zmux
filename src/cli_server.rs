@@ -152,6 +152,8 @@ pub struct CliServer {
     running: Arc<AtomicBool>,
     shutdown: Option<Sender<()>>,
     accept_thread: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    accept_ready: std::sync::mpsc::Receiver<()>,
     _task: Option<Task<()>>,
 }
 
@@ -181,6 +183,8 @@ impl CliServer {
 
         let (sender, receiver) = unbounded::<CliNotification>();
         let (shutdown, shutdown_receiver) = bounded(1);
+        #[cfg(test)]
+        let (accept_ready_sender, accept_ready) = std::sync::mpsc::sync_channel(1);
         let running = Arc::new(AtomicBool::new(true));
         let accept_running = running.clone();
         let accept_thread = thread::Builder::new()
@@ -191,6 +195,8 @@ impl CliServer {
                     sender,
                     accept_running,
                     shutdown_receiver,
+                    #[cfg(test)]
+                    Some(accept_ready_sender),
                 ));
             })
             .context("starting zmux notification listener thread")?;
@@ -201,6 +207,8 @@ impl CliServer {
             running,
             shutdown: Some(shutdown),
             accept_thread: Some(accept_thread),
+            #[cfg(test)]
+            accept_ready,
             _task: None,
         })
     }
@@ -258,13 +266,24 @@ impl CliServer {
         sender: Sender<CliNotification>,
         running: Arc<AtomicBool>,
         shutdown: Receiver<()>,
+        #[cfg(test)] accept_ready: Option<std::sync::mpsc::SyncSender<()>>,
     ) {
+        #[cfg(test)]
+        let mut accept_ready = accept_ready;
+
         while running.load(Ordering::Acquire) {
             // The shutdown future is deliberately raced first. Dropping the
             // sender wakes it even when no process ever connects, and dropping
             // the pending `accept` future releases the listener on every
             // platform supported by Zed's async socket wrapper.
-            let next_connection = async { Some(listener.accept().await) };
+            let next_connection = async {
+                #[cfg(test)]
+                let accepted = accept_with_test_readiness(&listener, &mut accept_ready).await;
+                #[cfg(not(test))]
+                let accepted = listener.accept().await.map(|(stream, _)| stream);
+
+                Some(accepted)
+            };
             let cancelled = async {
                 let _ = shutdown.recv().await;
                 None
@@ -272,7 +291,7 @@ impl CliServer {
 
             match smol::future::or(cancelled, next_connection).await {
                 None => break,
-                Some(Ok((stream, _))) => {
+                Some(Ok(stream)) => {
                     if !running.load(Ordering::Acquire) {
                         break;
                     }
@@ -296,6 +315,13 @@ impl CliServer {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn wait_until_accept_is_pending(&self) -> bool {
+        self.accept_ready
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok()
     }
 
     async fn read_client(
@@ -372,7 +398,8 @@ impl Drop for CliServer {
         // Explicitly cancel the pending async accept before joining its thread.
         // This does not depend on a client connection succeeding, so shutdown
         // remains bounded even if the endpoint pathname has already vanished.
-        // Closing this channel also cancels pending client reads.
+        // Detached client tasks observe the closure and exit asynchronously;
+        // only the listener owner thread is joined below.
         drop(self.shutdown.take());
         if let Some(accept_thread) = self.accept_thread.take()
             && accept_thread.join().is_err()
@@ -386,6 +413,25 @@ impl Drop for CliServer {
             eprintln!("failed to remove zmux notification endpoint: {error}");
         }
     }
+}
+
+#[cfg(test)]
+async fn accept_with_test_readiness(
+    listener: &net::async_net::UnixListener,
+    accept_ready: &mut Option<std::sync::mpsc::SyncSender<()>>,
+) -> io::Result<net::async_net::UnixStream> {
+    let mut accept = std::pin::pin!(listener.accept());
+    std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(accept.as_mut(), cx);
+        if result.is_pending()
+            && let Some(accept_ready) = accept_ready.take()
+        {
+            let _ = accept_ready.send(());
+        }
+        result
+    })
+    .await
+    .map(|(stream, _)| stream)
 }
 
 /// Write a single framed JSON notification to a local IPC stream.
@@ -551,6 +597,10 @@ mod tests {
     #[test]
     fn drop_cancels_accept_without_connecting_to_the_endpoint() {
         let server = CliServer::prepare().unwrap();
+        assert!(
+            server.wait_until_accept_is_pending(),
+            "the notification listener did not begin accepting"
+        );
         let endpoint = server.endpoint().path().to_owned();
 
         // Simulate cleanup outside the server. The old connect-to-wake strategy
