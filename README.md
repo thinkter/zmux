@@ -29,11 +29,12 @@ Zed-owned settings or keymap path. Its platform-default location is:
 
 - Linux and other XDG systems: `$XDG_CONFIG_HOME/zmux/config.json`, falling
   back to `$HOME/.config/zmux/config.json`.
-- macOS: `$HOME/Library/Application Support/zmux/config.json`.
-- Windows: `%APPDATA%\zmux\config.json` (with a `%USERPROFILE%` fallback).
+- macOS: `$HOME/.config/zmux/config.json`.
+- Windows: `%APPDATA%\Zmux\config.json`.
 
-Embedders/tests can inject a `ConfigPathProvider`; this is how the config layer
-will plug into Zmux's shared path provider without coupling it to Zed paths.
+Normal startup and `ConfigPaths::platform_default` use the same Zmux-owned
+path resolver. Embedders/tests can inject a `ConfigPathProvider` to use an
+isolated file without coupling themselves to that resolver.
 The effective configuration is deterministic: built-in defaults are loaded
 first, then the one Zmux config file is validated and applied. There is no
 project-local config precedence and `allow_trusted_project_commands` remains
@@ -103,11 +104,15 @@ progress values, and retained logs. UI rendering does not run shell commands.
 
 Background refreshes are short, cancellable, generation-checked jobs. A rapid
 workspace switch or close cancels the old request; any late result is ignored.
-Git status is collected portably with a bounded `git status` invocation. Linux
-uses `ss` for a best-effort local listener list; unsupported platforms expose
-an explicit unavailable state instead of failing the sidebar. Status/progress/
-log primitives are addressed by immutable workspace IDs through
-`WorkspaceMetadataStore::apply_update`, ready for the versioned control API.
+Git status is collected portably with a bounded `git status` invocation.
+Workspace-owned listener discovery is explicitly unavailable until zmux can
+prove process attribution; it intentionally does not present host-wide `ss`
+results as belonging to every workspace. Status/progress/log primitives are
+addressed by immutable workspace IDs through `WorkspaceMetadataStore::apply_update`.
+The versioned protocol also defines `workspace_metadata_update`, with validated
+bounded values and typed request errors. This build does not yet install a
+running transport or UI-side control handler for that command, so a handler may
+return `not_supported` until that follow-on lands.
 All sidebar state also has textual labels/summaries rather than icon-only data.
 
 ## Workspaces

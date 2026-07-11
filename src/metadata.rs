@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{App, Global};
+use serde::{Deserialize, Serialize};
 
 use crate::notifications::WorkspaceId;
 
@@ -24,6 +25,7 @@ pub const MAX_STATUS_PILLS: usize = 16;
 pub const MAX_PROGRESS_ENTRIES: usize = 16;
 pub const MAX_STATUS_TEXT_BYTES: usize = 256;
 pub const MAX_LOG_TEXT_BYTES: usize = 4 * 1024;
+const MAX_METADATA_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// A value that can be unavailable on a platform without making a workspace
 /// unusable. The states are suitable for a text-only renderer as well as a
@@ -97,7 +99,8 @@ impl ListeningPort {
 
 /// Scriptable coarse agent state. Vendor-specific adapters can map their own
 /// lifecycle events to this without the terminal core knowing a vendor.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentActivity {
     #[default]
     Unknown,
@@ -119,7 +122,8 @@ impl AgentActivity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StatusTone {
     #[default]
     Neutral,
@@ -129,7 +133,7 @@ pub enum StatusTone {
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusPill {
     pub label: String,
     pub detail: Option<String>,
@@ -145,7 +149,7 @@ impl StatusPill {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressValue {
     pub label: String,
     pub completed: u64,
@@ -168,7 +172,8 @@ impl ProgressValue {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     #[default]
     Info,
@@ -620,7 +625,8 @@ impl WorkspaceMetadataStore {
 
 /// The transport-independent update vocabulary intended for the future control
 /// API. It carries immutable workspace IDs and contains no UI references.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum MetadataUpdate {
     SetAgentActivity(AgentActivity),
     SetStatusPill {
@@ -643,12 +649,39 @@ pub enum MetadataUpdate {
     },
 }
 
+impl MetadataUpdate {
+    /// Validate the fields that are meaningful independently of a particular
+    /// store. Store-specific limits (such as the number of active pills) are
+    /// still returned by the target store as typed failures.
+    pub fn validate(&self) -> Result<(), MetadataError> {
+        match self {
+            Self::SetAgentActivity(_) | Self::AppendLog { .. } => Ok(()),
+            Self::SetStatusPill { key, .. }
+            | Self::ClearStatusPill { key }
+            | Self::ClearProgress { key } => {
+                validate_key(key.clone())?;
+                Ok(())
+            }
+            Self::SetProgress { key, progress } => {
+                validate_key(key.clone())?;
+                if progress.total == 0 || progress.completed > progress.total {
+                    return Err(MetadataError::new(
+                        "progress total must be non-zero and completed cannot exceed total",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl WorkspaceMetadataStore {
     pub fn apply_update(
         &mut self,
         workspace_id: WorkspaceId,
         update: MetadataUpdate,
     ) -> Result<(), MetadataError> {
+        update.validate()?;
         match update {
             MetadataUpdate::SetAgentActivity(activity) => {
                 self.set_agent_activity(workspace_id, activity)
@@ -724,47 +757,20 @@ fn collect_git_metadata(
 }
 
 fn collect_listening_ports(
-    working_directory: &Path,
+    _working_directory: &Path,
     cancellation: &RefreshCancellation,
 ) -> MetadataState<Vec<ListeningPort>> {
-    #[cfg(target_os = "linux")]
-    {
-        match run_bounded_command(
-            "ss",
-            &["-H", "-ltn"],
-            working_directory,
-            cancellation,
-            Duration::from_millis(500),
-        ) {
-            Ok(output) => MetadataState::Ready(parse_linux_ss_listeners(&output)),
-            Err(CommandFailure::Cancelled) => {
-                MetadataState::Unavailable("refresh cancelled".to_string())
-            }
-            Err(CommandFailure::TimedOut) => {
-                MetadataState::Error("listening-port discovery timed out".to_string())
-            }
-            Err(CommandFailure::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                MetadataState::Unavailable("the ss command is not available".to_string())
-            }
-            Err(CommandFailure::Spawn(error)) => {
-                MetadataState::Error(format!("could not start port discovery: {error}"))
-            }
-            Err(CommandFailure::Exit(status)) => {
-                MetadataState::Error(format!("port discovery exited with {status}"))
-            }
-            Err(CommandFailure::Read(error)) => {
-                MetadataState::Error(format!("could not read port discovery: {error}"))
-            }
-        }
+    if cancellation.is_cancelled() {
+        return MetadataState::Unavailable("refresh cancelled".to_string());
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (working_directory, cancellation);
-        MetadataState::Unavailable(
-            "portable port discovery is not available on this platform yet".to_string(),
-        )
-    }
+    // `ss -ltn` describes the entire host, not the terminal process tree for
+    // this workspace. Reporting those listeners in every row would falsely
+    // attribute unrelated services to a workspace. Keep the capability
+    // explicit-but-unavailable until a collector can prove ownership.
+    MetadataState::Unavailable(
+        "workspace-owned listener discovery requires process attribution".to_string(),
+    )
 }
 
 #[derive(Debug)]
@@ -791,33 +797,86 @@ fn run_bounded_command(
         .stderr(Stdio::null())
         .spawn()
         .map_err(CommandFailure::Spawn)?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout is piped immediately before spawning the reader");
+    let stdout_reader = thread::spawn(move || drain_bounded_stdout(stdout));
     let started_at = Instant::now();
 
     loop {
         if cancellation.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
             return Err(CommandFailure::Cancelled);
         }
         if started_at.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
             return Err(CommandFailure::TimedOut);
         }
-        match child.try_wait().map_err(CommandFailure::Read)? {
-            Some(status) if status.success() => {
-                let mut stdout = String::new();
-                if let Some(pipe) = child.stdout.take() {
-                    pipe.take(64 * 1024)
-                        .read_to_string(&mut stdout)
-                        .map_err(CommandFailure::Read)?;
-                }
-                return Ok(stdout);
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                return Err(CommandFailure::Read(error));
             }
-            Some(status) => return Err(CommandFailure::Exit(status)),
+        };
+        match status {
+            Some(status) if status.success() => {
+                return stdout_reader
+                    .join()
+                    .map_err(|_| {
+                        CommandFailure::Read(std::io::Error::other(
+                            "metadata stdout reader panicked",
+                        ))
+                    })?
+                    .map_err(CommandFailure::Read);
+            }
+            Some(status) => {
+                let _ = stdout_reader.join();
+                return Err(CommandFailure::Exit(status));
+            }
             None => thread::sleep(Duration::from_millis(10)),
         }
     }
+}
+
+/// Drain child stdout concurrently with process polling. Keeping only a
+/// bounded result while continuing to read avoids a child blocking forever on
+/// a full OS pipe in a large repository or on a busy host.
+fn drain_bounded_stdout(mut pipe: impl Read) -> Result<String, std::io::Error> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8 * 1024];
+    let mut exceeded_limit = false;
+
+    loop {
+        let read = pipe.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let retained = read.min(MAX_METADATA_COMMAND_OUTPUT_BYTES.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        exceeded_limit |= retained < read;
+    }
+
+    if exceeded_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("metadata command output exceeded {MAX_METADATA_COMMAND_OUTPUT_BYTES} bytes"),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("metadata command output was not UTF-8: {error}"),
+        )
+    })
 }
 
 fn parse_git_porcelain(output: &str) -> Result<GitMetadata, String> {
@@ -845,33 +904,6 @@ fn parse_git_porcelain(output: &str) -> Result<GitMetadata, String> {
         }
     }
     Ok(metadata)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_ss_listeners(output: &str) -> Vec<ListeningPort> {
-    output
-        .lines()
-        .filter_map(|line| {
-            // `ss -H -ltn` prints: STATE RECV-Q SEND-Q LOCAL:PORT PEER:PORT
-            let local = line.split_whitespace().nth(3)?;
-            let (address, port) = split_address_port(local)?;
-            Some(ListeningPort {
-                protocol: "tcp".to_string(),
-                address: address.to_string(),
-                port,
-            })
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn split_address_port(address: &str) -> Option<(&str, u16)> {
-    let (host, port) = address.rsplit_once(':')?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    Some((host, port.parse().ok()?))
 }
 
 fn validate_key(key: String) -> Result<String, MetadataError> {
@@ -994,6 +1026,31 @@ mod tests {
         assert_eq!(parsed.ahead, 2);
         assert_eq!(parsed.behind, 1);
         assert_eq!(parsed.dirty_files, 2);
+    }
+
+    #[test]
+    fn listener_discovery_does_not_misattribute_host_ports_to_a_workspace() {
+        let state = collect_listening_ports(Path::new("/tmp/project"), &RefreshCancellation::new());
+        assert!(matches!(
+            state,
+            MetadataState::Unavailable(reason) if reason.contains("process attribution")
+        ));
+    }
+
+    #[test]
+    fn command_stdout_is_drained_while_retention_stays_bounded() {
+        assert_eq!(
+            drain_bounded_stdout(std::io::Cursor::new(b"ok".to_vec())).unwrap(),
+            "ok"
+        );
+
+        let error = drain_bounded_stdout(std::io::Cursor::new(vec![
+            b'x';
+            MAX_METADATA_COMMAND_OUTPUT_BYTES
+                + 1
+        ]))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

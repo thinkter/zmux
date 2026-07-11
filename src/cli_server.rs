@@ -368,11 +368,8 @@ impl CliServer {
             };
 
             cx.update(|cx| {
-                if !ConfigStore::global(cx)
-                    .config()
-                    .automation
-                    .allow_cli_notifications
-                {
+                let config = ConfigStore::global(cx).config();
+                if !config.notifications.enabled || !config.automation.allow_cli_notifications {
                     return;
                 }
                 workspace.update(cx, |workspace, cx| {

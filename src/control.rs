@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::notifications::{NotificationLevel, NotificationSource, WorkspaceId};
+use crate::{
+    metadata::MetadataUpdate,
+    notifications::{NotificationLevel, NotificationSource, WorkspaceId},
+};
 
 /// The only protocol version this build understands.
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
@@ -69,6 +72,13 @@ pub enum ControlCommand {
     },
     WorkspaceClose {
         workspace_id: WorkspaceId,
+    },
+    /// A bounded, workspace-addressed status/progress/log update. The protocol
+    /// defines the request shape; a UI-side [`ControlHandler`] decides whether
+    /// the local runtime currently supports applying it.
+    WorkspaceMetadataUpdate {
+        workspace_id: WorkspaceId,
+        update: MetadataUpdate,
     },
     SurfaceList {
         workspace_id: WorkspaceId,
@@ -133,6 +143,20 @@ pub enum ControlCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_id: Option<WorkspaceId>,
     },
+}
+
+impl ControlCommand {
+    fn validate(&self) -> Result<(), ControlError> {
+        if let Self::WorkspaceMetadataUpdate { update, .. } = self {
+            update.validate().map_err(|error| {
+                ControlError::new(
+                    ControlErrorCode::InvalidRequest,
+                    format!("invalid workspace metadata update: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 fn default_screen_text_limit() -> usize {
@@ -347,6 +371,8 @@ pub fn decode_request(frame: &[u8]) -> Result<ControlRequest, ControlError> {
         ));
     }
 
+    request.command.validate()?;
+
     Ok(request)
 }
 
@@ -383,6 +409,7 @@ pub fn dispatch_frame(handler: &mut impl ControlHandler, frame: &[u8]) -> Contro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::{LogLevel, ProgressValue};
 
     struct DiscoverOnly;
 
@@ -479,5 +506,54 @@ mod tests {
             command: ControlCommand::Discover,
         };
         assert_eq!(request.timeout(), MAX_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn metadata_updates_are_workspace_addressed_and_round_trip() {
+        let request = ControlRequest {
+            version: CONTROL_PROTOCOL_VERSION,
+            id: 13,
+            timeout_ms: None,
+            command: ControlCommand::WorkspaceMetadataUpdate {
+                workspace_id: 7,
+                update: MetadataUpdate::AppendLog {
+                    level: LogLevel::Info,
+                    message: "build started".to_string(),
+                },
+            },
+        };
+
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+        assert!(
+            String::from_utf8(encoded)
+                .unwrap()
+                .contains("workspace_metadata_update")
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_updates_fail_before_a_handler_receives_them() {
+        let request = ControlRequest {
+            version: CONTROL_PROTOCOL_VERSION,
+            id: 14,
+            timeout_ms: None,
+            command: ControlCommand::WorkspaceMetadataUpdate {
+                workspace_id: 7,
+                update: MetadataUpdate::SetProgress {
+                    key: "build".to_string(),
+                    progress: ProgressValue {
+                        label: "Build".to_string(),
+                        completed: 1,
+                        total: 0,
+                    },
+                },
+            },
+        };
+
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let error = decode_request(&encoded).unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::InvalidRequest);
+        assert!(!error.retryable);
     }
 }

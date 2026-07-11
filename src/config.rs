@@ -53,9 +53,9 @@ pub const CONFIGURABLE_ACTIONS: &[&str] = &[
     "quit",
 ];
 
-/// An explicit config-file location.  Callers that know about a shared Zmux
-/// paths provider should construct this directly instead of relying on the
-/// platform fallback.
+/// An explicit config-file location. Callers that need an isolated location
+/// should construct this directly instead of relying on the shared Zmux
+/// runtime path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigPaths {
     config_file: PathBuf,
@@ -63,11 +63,9 @@ pub struct ConfigPaths {
 
 /// Supplies the location of the Zmux configuration file.
 ///
-/// This deliberately has a tiny surface so a future shared Zmux paths crate
-/// can implement it without this module learning about that crate (or about
-/// any Zed path conventions).  Production startup currently injects
-/// [`ConfigPaths::platform_default`]; tests and embedders can inject an
-/// isolated path instead.
+/// This deliberately has a tiny surface so tests and embedders can inject an
+/// isolated file without coupling their callers to Zmux's runtime path
+/// implementation. Production startup uses the Zmux-owned `paths` crate.
 pub trait ConfigPathProvider {
     fn zmux_config_file(&self) -> PathBuf;
 }
@@ -83,10 +81,9 @@ impl ConfigPaths {
         &self.config_file
     }
 
-    /// The platform fallback used until the shared paths provider is present.
-    /// It is intentionally Zmux-owned on every platform.
+    /// The same Zmux-owned platform path used by normal application startup.
     pub fn platform_default() -> Self {
-        Self::new(platform_config_dir().join("zmux").join("config.json"))
+        Self::new(paths::config_dir().join("config.json"))
     }
 
     pub fn from_provider(provider: &impl ConfigPathProvider) -> Self {
@@ -103,43 +100,6 @@ impl ConfigPathProvider for ConfigPaths {
 impl Default for ConfigPaths {
     fn default() -> Self {
         Self::platform_default()
-    }
-}
-
-fn platform_config_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(path) = std::env::var_os("APPDATA") {
-            return PathBuf::from(path);
-        }
-        if let Some(home) = std::env::var_os("USERPROFILE") {
-            return PathBuf::from(home).join("AppData").join("Roaming");
-        }
-        return std::env::temp_dir();
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support");
-        }
-        return std::env::temp_dir();
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-            let path = PathBuf::from(path);
-            if path.is_absolute() {
-                return path;
-            }
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(".config");
-        }
-        std::env::temp_dir()
     }
 }
 
@@ -859,6 +819,14 @@ mod tests {
         assert_eq!(
             ConfigPaths::from_provider(&provider).config_file(),
             Path::new("/isolated/zmux/config.json")
+        );
+    }
+
+    #[test]
+    fn platform_default_matches_the_runtime_zmux_path_resolver() {
+        assert_eq!(
+            ConfigPaths::platform_default().config_file(),
+            paths::config_dir().join("config.json")
         );
     }
 }

@@ -55,15 +55,11 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
-    init_zmux_with_config_paths(
-        ConfigPaths::new(paths::config_dir().join("config.json")),
-        cx,
-    )
+    init_zmux_with_config_paths(ConfigPaths::platform_default(), cx)
 }
 
-/// Initialize using a caller-owned location. A future shared `ZmuxPaths`
-/// implementation can satisfy [`ConfigPathProvider`] without this module
-/// knowing about Zed's path layer.
+/// Initialize using a caller-owned location. Tests and embedders can satisfy
+/// [`ConfigPathProvider`] without sharing the normal runtime config file.
 pub fn init_zmux_with_config_path_provider(
     provider: &impl ConfigPathProvider,
     cx: &mut App,

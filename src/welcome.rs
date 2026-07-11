@@ -105,45 +105,6 @@ impl RenderOnce for ActionButton {
     }
 }
 
-#[derive(IntoElement)]
-struct InertButton {
-    id: &'static str,
-    label: &'static str,
-    icon: IconName,
-    tab_index: isize,
-}
-
-impl InertButton {
-    fn new(id: &'static str, label: &'static str, icon: IconName, tab_index: isize) -> Self {
-        Self {
-            id,
-            label,
-            icon,
-            tab_index,
-        }
-    }
-}
-
-impl RenderOnce for InertButton {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        ButtonLike::new(self.id)
-            .tab_index(self.tab_index)
-            .full_width()
-            .size(ButtonSize::Medium)
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        Icon::new(self.icon)
-                            .color(Color::Muted)
-                            .size(IconSize::Small),
-                    )
-                    .child(Label::new(self.label)),
-            )
-    }
-}
-
 impl Render for ZmuxWelcome {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
@@ -218,12 +179,6 @@ impl Render for ZmuxWelcome {
                                 &OpenKeymaps,
                                 3,
                                 self.focus_handle.clone(),
-                            ))
-                            .child(InertButton::new(
-                                "explore-extensions",
-                                "Explore Extensions",
-                                IconName::Blocks,
-                                4,
                             )),
                     ),
             )
