@@ -612,7 +612,11 @@ mod tests {
 
         // Simulate cleanup outside the server. The old connect-to-wake strategy
         // could not unblock `accept` once this name was gone.
-        fs::remove_file(&endpoint).unwrap();
+        if let Err(error) = fs::remove_file(&endpoint)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            panic!("failed to remove notification endpoint: {error}");
+        }
 
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let drop_thread = thread::spawn(move || {
