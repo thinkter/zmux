@@ -26,6 +26,8 @@ pub const MAX_PANES_PER_WORKSPACE: usize = 128;
 pub const MAX_TERMINALS_PER_WORKSPACE: usize = 256;
 pub const MAX_NAME_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 4_096;
+const WORKSPACE_ID_WATERMARK_VERSION: u32 = 1;
+const MAX_WORKSPACE_ID_WATERMARK_BYTES: u64 = 1_024;
 
 pub type SurfaceId = u64;
 
@@ -270,6 +272,23 @@ pub struct SessionStore {
     path: PathBuf,
 }
 
+/// A small, independent watermark for process-wide workspace identities.
+///
+/// It intentionally lives beside, rather than inside, the layout session. A
+/// later window can advance the watermark without rewriting the first
+/// window's richer layout snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceIdWatermarkStore {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceIdWatermark {
+    version: u32,
+    next_workspace_id: WorkspaceId,
+}
+
 impl SessionStore {
     pub fn from_environment() -> Self {
         Self::at(default_session_path())
@@ -344,8 +363,101 @@ impl SessionStore {
     }
 }
 
+impl WorkspaceIdWatermarkStore {
+    pub(crate) fn from_environment() -> Self {
+        Self::at(default_workspace_id_watermark_path())
+    }
+
+    pub(crate) fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Load the next unallocated workspace ID, if one has been recorded. A
+    /// missing file is expected on the first launch.
+    pub(crate) fn load(&self) -> Result<Option<WorkspaceId>> {
+        let metadata = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("reading zmux workspace ID watermark"),
+        };
+        if metadata.len() > MAX_WORKSPACE_ID_WATERMARK_BYTES {
+            bail!(
+                "zmux workspace ID watermark exceeds {MAX_WORKSPACE_ID_WATERMARK_BYTES}-byte limit"
+            );
+        }
+        let bytes = fs::read(&self.path).context("reading zmux workspace ID watermark")?;
+        let watermark: WorkspaceIdWatermark =
+            serde_json::from_slice(&bytes).context("parsing zmux workspace ID watermark")?;
+        if watermark.version != WORKSPACE_ID_WATERMARK_VERSION {
+            bail!(
+                "unsupported zmux workspace ID watermark version {}; expected {WORKSPACE_ID_WATERMARK_VERSION}",
+                watermark.version
+            );
+        }
+        if watermark.next_workspace_id == 0 {
+            bail!("zmux workspace ID watermark contains zero as the next ID");
+        }
+        Ok(Some(watermark.next_workspace_id))
+    }
+
+    /// Durably move the watermark forward. It never reads or rewrites the
+    /// layout session, so independent windows cannot replace a richer first
+    /// window snapshot merely by allocating an ID.
+    pub(crate) fn advance(&self, next_workspace_id: WorkspaceId) -> Result<()> {
+        if next_workspace_id == 0 {
+            bail!("zmux workspace ID watermark cannot advance to zero");
+        }
+        if self
+            .load()?
+            .is_some_and(|current| current >= next_workspace_id)
+        {
+            return Ok(());
+        }
+
+        let watermark = WorkspaceIdWatermark {
+            version: WORKSPACE_ID_WATERMARK_VERSION,
+            next_workspace_id,
+        };
+        let bytes = serde_json::to_vec_pretty(&watermark)
+            .context("serializing zmux workspace ID watermark")?;
+        let parent = self
+            .path
+            .parent()
+            .context("zmux workspace ID watermark path has no parent directory")?;
+        fs::create_dir_all(parent).context("creating zmux workspace ID watermark directory")?;
+
+        let temporary = self.path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("main")
+        ));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .context("creating temporary zmux workspace ID watermark")?;
+        file.write_all(&bytes)
+            .context("writing temporary zmux workspace ID watermark")?;
+        file.sync_all()
+            .context("syncing temporary zmux workspace ID watermark")?;
+        drop(file);
+
+        #[cfg(windows)]
+        if self.path.exists() {
+            fs::remove_file(&self.path).context("replacing zmux workspace ID watermark")?;
+        }
+        fs::rename(&temporary, &self.path).context("installing zmux workspace ID watermark")?;
+        Ok(())
+    }
+}
+
 fn default_session_path() -> PathBuf {
     paths::state_dir().join("session-v1.json")
+}
+
+fn default_workspace_id_watermark_path() -> PathBuf {
+    paths::state_dir().join("workspace-ids-v1.json")
 }
 
 #[cfg(test)]
@@ -455,5 +567,25 @@ mod tests {
         let mut snapshot = nested_snapshot();
         snapshot.next_workspace_id = 7;
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn workspace_id_watermark_only_moves_forward_without_rewriting_session() {
+        let session_store = test_store("watermark-session");
+        let snapshot = nested_snapshot();
+        session_store.save(&snapshot).unwrap();
+        let watermark_store = WorkspaceIdWatermarkStore::at(
+            session_store
+                .path()
+                .parent()
+                .unwrap()
+                .join("workspace-ids-v1.json"),
+        );
+
+        watermark_store.advance(17).unwrap();
+        watermark_store.advance(11).unwrap();
+
+        assert_eq!(watermark_store.load().unwrap(), Some(17));
+        assert_eq!(session_store.load().unwrap(), Some(snapshot));
     }
 }

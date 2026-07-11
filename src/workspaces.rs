@@ -26,7 +26,7 @@ use crate::app::create_center_terminal;
 use crate::notifications::{NotificationStore, WorkspaceId};
 use crate::session::{
     LayoutAxis, LayoutNodeSnapshot, Ratio, SessionSnapshot, SessionStore, SurfaceId,
-    TerminalSnapshot, WorkspaceLayoutSnapshot, WorkspaceSnapshot,
+    TerminalSnapshot, WorkspaceIdWatermarkStore, WorkspaceLayoutSnapshot, WorkspaceSnapshot,
 };
 use crate::welcome::ZmuxWelcome;
 use terminal_view::default_working_directory;
@@ -191,8 +191,13 @@ impl WorkspaceProcessState {
         }
     }
 
-    fn seed_from_restored_session(&mut self, snapshot: Option<&SessionSnapshot>) {
-        self.next_workspace_id = snapshot.map_or(1, |snapshot| snapshot.next_workspace_id);
+    fn seed_from_persisted_state(
+        &mut self,
+        snapshot: Option<&SessionSnapshot>,
+        watermark: Option<WorkspaceId>,
+    ) {
+        let session_next_workspace_id = snapshot.map_or(1, |snapshot| snapshot.next_workspace_id);
+        self.next_workspace_id = session_next_workspace_id.max(watermark.unwrap_or(1));
     }
 
     fn allocate_workspace_id(&mut self) -> WorkspaceId {
@@ -209,6 +214,23 @@ impl WorkspaceProcessState {
     }
 }
 
+fn allocate_process_workspace_id(
+    watermark_store: &WorkspaceIdWatermarkStore,
+    cx: &mut App,
+) -> WorkspaceId {
+    let (id, next_workspace_id) = {
+        let identities = cx.global_mut::<WorkspaceProcessState>();
+        let id = identities.allocate_workspace_id();
+        (id, identities.next_workspace_id())
+    };
+    if let Err(error) = watermark_store.advance(next_workspace_id) {
+        // Keep the in-process identity unique even if the disk is temporarily
+        // unavailable. A later allocation or session-owner persist retries.
+        eprintln!("failed to persist zmux workspace ID watermark: {error:#}");
+    }
+    id
+}
+
 pub struct WorkspacesPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -219,6 +241,7 @@ pub struct WorkspacesPanel {
     next_surface_id: SurfaceId,
     rename: Option<RenameState>,
     session_store: SessionStore,
+    workspace_id_store: WorkspaceIdWatermarkStore,
     /// Exactly one panel per process owns the durable zmux session. Later
     /// windows start independently and must not overwrite or replay it.
     owns_session_persistence: bool,
@@ -234,14 +257,15 @@ impl WorkspacesPanel {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let session_store = SessionStore::from_environment();
+        let workspace_id_store = WorkspaceIdWatermarkStore::from_environment();
         if !cx.has_global::<WorkspaceProcessState>() {
             cx.set_global(WorkspaceProcessState::default());
         }
         let owns_session_persistence = cx
             .global_mut::<WorkspaceProcessState>()
             .claim_session_restore();
-        let restored = if owns_session_persistence {
-            match session_store.load() {
+        let (restored, persisted_workspace_id) = if owns_session_persistence {
+            let restored = match session_store.load() {
                 Ok(restored) => restored,
                 Err(error) => {
                     // A malformed, stale, or manually edited file must never make
@@ -249,24 +273,30 @@ impl WorkspacesPanel {
                     eprintln!("ignoring invalid zmux session: {error:#}");
                     None
                 }
-            }
+            };
+            let persisted_workspace_id = match workspace_id_store.load() {
+                Ok(watermark) => watermark,
+                Err(error) => {
+                    eprintln!("ignoring invalid zmux workspace ID watermark: {error:#}");
+                    None
+                }
+            };
+            (restored, persisted_workspace_id)
         } else {
             // The process already has a session-owning window. Replaying its
             // layout here would duplicate terminals and collide with the
             // workspace identities held by app-global metadata.
-            None
+            (None, None)
         };
         if owns_session_persistence {
             cx.global_mut::<WorkspaceProcessState>()
-                .seed_from_restored_session(restored.as_ref());
+                .seed_from_persisted_state(restored.as_ref(), persisted_workspace_id);
         }
 
         let (entries, active, next_surface_id) = match restored {
             Some(snapshot) => entries_from_snapshot(snapshot),
             None => {
-                let id = cx
-                    .global_mut::<WorkspaceProcessState>()
-                    .allocate_workspace_id();
+                let id = allocate_process_workspace_id(&workspace_id_store, cx);
                 (
                     vec![WorkspaceEntry {
                         id,
@@ -289,6 +319,7 @@ impl WorkspacesPanel {
             next_surface_id,
             rename: None,
             session_store,
+            workspace_id_store,
             owns_session_persistence,
             persistence_suspended: false,
             _workspace_observer: None,
@@ -409,9 +440,7 @@ impl WorkspacesPanel {
 
     /// Create a fresh, empty workspace and switch to it.
     pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = cx
-            .global_mut::<WorkspaceProcessState>()
-            .allocate_workspace_id();
+        let id = allocate_process_workspace_id(&self.workspace_id_store, cx);
         let name = format!("Workspace {id}");
         self.entries.push(WorkspaceEntry {
             id,
@@ -712,17 +741,20 @@ impl WorkspacesPanel {
                 },
             })
             .collect();
+        let next_workspace_id = cx.global::<WorkspaceProcessState>().next_workspace_id();
         let snapshot = SessionSnapshot {
             version: crate::session::SESSION_VERSION,
             // Persist the process-wide watermark, including IDs allocated by
             // independent later windows, so a future process cannot reuse
             // any identity that overlapped with app-global state.
-            next_workspace_id: cx.global::<WorkspaceProcessState>().next_workspace_id(),
+            next_workspace_id,
             active_workspace_id: self.active,
             workspaces,
         };
         if let Err(error) = self.session_store.save(&snapshot) {
             eprintln!("failed to persist zmux session: {error:#}");
+        } else if let Err(error) = self.workspace_id_store.advance(next_workspace_id) {
+            eprintln!("failed to persist zmux workspace ID watermark: {error:#}");
         }
     }
 
@@ -1909,7 +1941,7 @@ mod tests {
     fn process_workspace_allocator_never_reuses_a_closed_id() {
         let mut identities = WorkspaceProcessState::default();
         assert!(identities.claim_session_restore());
-        identities.seed_from_restored_session(None);
+        identities.seed_from_persisted_state(None, None);
         let first_window_workspace = identities.allocate_workspace_id();
         let closed_workspace = identities.allocate_workspace_id();
 
@@ -1924,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn process_workspace_allocator_reserves_restored_ids_for_later_windows() {
+    fn process_workspace_allocator_uses_the_highest_persisted_watermark() {
         let snapshot = SessionSnapshot {
             version: crate::session::SESSION_VERSION,
             next_workspace_id: 41,
@@ -1937,17 +1969,25 @@ mod tests {
         };
         snapshot.validate().unwrap();
 
+        let mut session_watermark_wins = WorkspaceProcessState::default();
+        assert!(session_watermark_wins.claim_session_restore());
+        session_watermark_wins.seed_from_persisted_state(Some(&snapshot), Some(12));
+        assert_eq!(session_watermark_wins.next_workspace_id(), 41);
+
         let mut identities = WorkspaceProcessState::default();
         assert!(identities.claim_session_restore());
-        identities.seed_from_restored_session(Some(&snapshot));
+        // The independent window advanced the sidecar watermark after the
+        // session owner last wrote its layout. On a later process start, that
+        // watermark wins over the older session watermark.
+        identities.seed_from_persisted_state(Some(&snapshot), Some(61));
         // The restored window owns ID 7. A later process window and a new
         // workspace in the restored window both receive IDs beyond the
         // persisted watermark, so neither can replay/collide with it.
         assert!(!identities.claim_session_restore());
         let later_window_workspace = identities.allocate_workspace_id();
         let restored_window_new_workspace = identities.allocate_workspace_id();
-        assert_eq!(later_window_workspace, 41);
-        assert_eq!(restored_window_new_workspace, 42);
-        assert_eq!(identities.next_workspace_id(), 43);
+        assert_eq!(later_window_workspace, 61);
+        assert_eq!(restored_window_new_workspace, 62);
+        assert_eq!(identities.next_workspace_id(), 63);
     }
 }

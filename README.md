@@ -33,7 +33,9 @@ process keeps going in the background while you work elsewhere.
 The first zmux window in a process restores the saved session. Additional
 windows start with a fresh workspace and distinct workspace identities, so they
 cannot duplicate the first window's live terminals or attach notifications to
-the wrong workspace.
+the wrong workspace. They advance only a separate identity watermark; if the
+session-owning window closes, later windows do not overwrite its richer saved
+layout.
 
 - Click **+** (or press `Ctrl-Shift-E`) to create a workspace.
 - Click a workspace to switch to it.
