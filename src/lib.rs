@@ -8,6 +8,7 @@ mod ipc;
 mod keymap;
 mod notifications;
 mod osc;
+mod remote;
 mod theme;
 mod welcome;
 mod workspaces;
@@ -30,5 +31,20 @@ pub use notifications::{
     NotificationSource, NotificationStore, WorkspaceId,
 };
 pub use osc::{MAX_PENDING_OSC_BYTES, OscNotification, OscNotificationParser, parse_osc_payload};
+pub use remote::{
+    AgentForwarding, AuthenticatedRemoteRelayEvent, HostKeyPolicy, MAX_RECONNECT_ATTEMPTS,
+    MAX_RELAY_FRAME_BYTES, MAX_RELAY_NONCES, MAX_REMOTE_PORT_ROUTES,
+    MAX_REMOTE_WORKSPACE_STATE_BYTES, MAX_REMOTE_WORKSPACES, NativeTmuxLayoutModel,
+    NativeTmuxWindow, REMOTE_RELAY_PROTOCOL_VERSION, REMOTE_WORKSPACE_STATE_VERSION,
+    REMOTE_WORKSPACES_STATE_FILE, ReconnectController, ReconnectPolicy, RemoteCapabilities,
+    RemoteConnectionState, RemoteError, RemotePortRoute, RemotePortRouting, RemoteRelayEnvelope,
+    RemoteRelayEvent, RemoteRelayGrant, RemoteRelayListener, RemoteRelayMode, RemoteRelayTarget,
+    RemoteRelayToken, RemoteRelayVerifier, RemoteTcpHost, RemoteWorkspaceId,
+    RemoteWorkspaceIdentity, RemoteWorkspaceStore, SshConfigSource, SshDestination, SshHost,
+    SshLaunchPlan, SshSessionMode, SshUsername, SshWorkspaceConfig, TmuxBridgeConfig,
+    TmuxControlBridge, TmuxControlEvent, TmuxLayoutNode, TmuxPaneId, TmuxSessionName,
+    TmuxSplitAxis, TmuxWindowId, parse_tmux_layout, remote_workspace_store_path,
+    write_relay_envelope,
+};
 pub use theme::configure_terminal_fonts;
 pub use workspaces::{NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};

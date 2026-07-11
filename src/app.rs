@@ -18,6 +18,7 @@ use crate::cli_server::CliServer;
 use crate::env::terminal_env_with_notification_endpoint;
 use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
 use crate::notifications::{NotificationSource, NotificationStore};
+use crate::remote::SshLaunchPlan;
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{
@@ -267,6 +268,33 @@ pub(crate) fn create_center_terminal(
     let working_directory = default_working_directory(workspace, cx);
     TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
         project.create_terminal_shell(working_directory, cx)
+    })
+}
+
+/// Add an SSH terminal from a prevalidated argv-only launch plan. The remote
+/// subsystem never supplies a shell snippet: Zed's terminal task receives the
+/// `ssh` binary and each option as a separate argument.
+pub(crate) fn create_center_ssh_terminal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    plan: SshLaunchPlan,
+) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
+    TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
+        let task = task::SpawnInTerminal {
+            full_label: plan.label.clone(),
+            label: plan.label,
+            command: Some(plan.program),
+            args: plan.args,
+            // The label is intentionally not reconstructed as a command line;
+            // it is UI text only. `command` + `args` remain the executable
+            // representation passed to the terminal process.
+            command_label: "SSH workspace".to_owned(),
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            ..Default::default()
+        };
+        project.create_terminal_task(task, cx)
     })
 }
 

@@ -22,8 +22,12 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::item::ItemHandle;
 use workspace::{Pane, SplitDirection, Workspace};
 
-use crate::app::create_center_terminal;
+use crate::app::{create_center_ssh_terminal, create_center_terminal};
 use crate::notifications::{NotificationStore, WorkspaceId};
+use crate::remote::{
+    ReconnectController, ReconnectPolicy, RemoteCapabilities, RemoteConnectionState, RemoteError,
+    SshWorkspaceConfig,
+};
 use crate::welcome::ZmuxWelcome;
 
 actions!(
@@ -59,6 +63,16 @@ struct WorkspaceEntry {
     /// `Some` while the workspace is parked in the background, `None` while it is
     /// the active workspace displayed in the center.
     stored: Option<StoredLayout>,
+    /// Present only for an explicitly created SSH workspace. Keeping this
+    /// metadata next to the parked terminal layout lets the sidebar display a
+    /// connection state without changing ordinary local workspaces.
+    remote: Option<RemoteWorkspaceEntry>,
+}
+
+#[derive(Clone)]
+struct RemoteWorkspaceEntry {
+    config: SshWorkspaceConfig,
+    reconnect: ReconnectController,
 }
 
 struct RenameState {
@@ -108,6 +122,7 @@ impl WorkspacesPanel {
             id: 1,
             name: "Workspace 1".to_string(),
             stored: None,
+            remote: None,
         }];
         Self {
             workspace,
@@ -123,19 +138,25 @@ impl WorkspacesPanel {
         self.active
     }
 
-    /// Create a fresh, empty workspace and switch to it.
-    pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn allocate_workspace_id(&mut self) -> WorkspaceId {
         let id = self.next_id;
         if self.next_id <= self.entries.len() as u64 {
             self.next_id = self.entries.len() as u64 + 2;
         } else {
             self.next_id += 1;
         }
+        id
+    }
+
+    /// Create a fresh, empty workspace and switch to it.
+    pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.allocate_workspace_id();
         let name = format!("Workspace {id}");
         self.entries.push(WorkspaceEntry {
             id,
             name,
             stored: None,
+            remote: None,
         });
 
         self.entries.sort_by_key(|entry| entry.id);
@@ -149,6 +170,79 @@ impl WorkspacesPanel {
         // println!("Created workspace {:#?}", ids);
 
         self.activate_workspace(id, window, cx);
+    }
+
+    /// Create an SSH-backed workspace from a prevalidated safe configuration.
+    /// The initial sidebar state is `remote: connecting`; a PTY/SSH lifecycle
+    /// observer calls [`Self::mark_remote_connected`] or
+    /// [`Self::mark_remote_connection_lost`] when it has actual process
+    /// evidence. Local workspaces never enter this code path.
+    pub fn create_ssh_workspace(
+        &mut self,
+        config: SshWorkspaceConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<WorkspaceId, RemoteError> {
+        // Build once up front so unsupported browser/relay requests never add
+        // a half-configured sidebar entry.
+        config.launch_plan(RemoteCapabilities::foundation(), None)?;
+        let reconnect = ReconnectController::new(ReconnectPolicy::default())?;
+        let id = self.allocate_workspace_id();
+        let name = config.display_name.clone();
+        self.entries.push(WorkspaceEntry {
+            id,
+            name,
+            stored: None,
+            remote: Some(RemoteWorkspaceEntry { config, reconnect }),
+        });
+        self.entries.sort_by_key(|entry| entry.id);
+        self.activate_workspace(id, window, cx);
+        Ok(id)
+    }
+
+    /// Update the sidebar only after the process owner has observed a usable
+    /// SSH connection. This avoids treating terminal creation as proof that a
+    /// remote host authenticated successfully.
+    pub fn mark_remote_connected(&mut self, id: WorkspaceId, cx: &mut Context<Self>) -> bool {
+        let Some(remote) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.remote.as_mut())
+        else {
+            return false;
+        };
+        remote.reconnect.connected();
+        cx.notify();
+        true
+    }
+
+    /// Record an observed SSH disconnect. The returned state contains either a
+    /// bounded retry delay or an exhausted state, making it suitable for both a
+    /// lifecycle worker and a visible sidebar status.
+    pub fn mark_remote_connection_lost(
+        &mut self,
+        id: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> Option<RemoteConnectionState> {
+        let state = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.remote.as_mut())
+            .map(|remote| remote.reconnect.connection_lost());
+        if state.is_some() {
+            cx.notify();
+        }
+        state
+    }
+
+    pub fn remote_connection_state(&self, id: WorkspaceId) -> Option<RemoteConnectionState> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.remote.as_ref())
+            .map(|remote| remote.reconnect.state().clone())
     }
 
     /// Switch the center to display the given workspace, parking the currently
@@ -182,6 +276,25 @@ impl WorkspacesPanel {
             .iter_mut()
             .find(|entry| entry.id == id)
             .and_then(|entry| entry.stored.take());
+        let target_remote_plan = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.remote.as_ref())
+            .map(|remote| {
+                remote
+                    .config
+                    .launch_plan(RemoteCapabilities::foundation(), None)
+            });
+        if target_remote_plan.as_ref().is_some_and(Result::is_ok)
+            && let Some(remote) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.remote.as_mut())
+        {
+            remote.reconnect.begin_connect();
+        }
 
         let captured = workspace.update(cx, |workspace, cx| {
             let captured = capture_layout(workspace, cx);
@@ -198,7 +311,18 @@ impl WorkspacesPanel {
                     target_pane.update(cx, |pane, cx| {
                         pane.add_item(Box::new(welcome), true, true, None, window, cx);
                     });
-                    create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+                    match target_remote_plan {
+                        Some(Ok(plan)) => {
+                            create_center_ssh_terminal(workspace, window, cx, plan)
+                                .detach_and_log_err(cx);
+                        }
+                        Some(Err(error)) => {
+                            eprintln!("failed to prepare SSH workspace terminal: {error}");
+                        }
+                        None => {
+                            create_center_terminal(workspace, window, cx).detach_and_log_err(cx)
+                        }
+                    }
                 }
             }
             workspace.focus_center_pane(window, cx);
@@ -346,6 +470,10 @@ impl WorkspacesPanel {
             .map(|rename| rename.editor.clone());
         let group = SharedString::from(format!("ws-row-{id}"));
         let can_close = self.entries.len() > 1;
+        let remote_status = entry
+            .remote
+            .as_ref()
+            .map(|remote| remote.reconnect.state().sidebar_label());
 
         let editor = renaming.clone();
         let is_renaming = renaming.is_some();
@@ -386,6 +514,14 @@ impl WorkspacesPanel {
                         })
                         .single_line(),
                 ),
+            })
+            .when_some(remote_status, |this, status| {
+                this.child(
+                    Label::new(status)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line(),
+                )
             })
             .when(!is_renaming, |this| {
                 this.cursor_pointer().on_click(cx.listener(
@@ -497,6 +633,7 @@ impl Render for WorkspacesPanel {
                 id: entry.id,
                 name: entry.name.clone(),
                 stored: None,
+                remote: entry.remote.clone(),
             })
             .collect();
 

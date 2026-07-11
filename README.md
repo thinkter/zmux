@@ -54,6 +54,14 @@ To reset zmux, quit it and delete only the matching **zmux** directories above.
 Do not delete or copy Zed's directories: zmux starts with a clean, independent
 database and session store by design.
 
+## Experimental SSH workspaces
+
+The SSH workspace foundation is opt-in and uses the user's OpenSSH
+configuration and local agent with explicit host-key, forwarding, relay, and
+tmux policies. Normal SSH terminals remain normal terminals; remote port/
+browser routing and tmux control mode are separate capability-gated features.
+See [the SSH workspace design and safety notes](docs/remote-workspaces.md).
+
 Build notes:
 
 - `zmux` wraps Zed's GPUI terminal view, which pulls in substantial editor/workspace/UI code. The required Zed crates are fetched from `https://github.com/zed-industries/zed` at the pinned revision recorded in `Cargo.toml` and `Cargo.lock`
