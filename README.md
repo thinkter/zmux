@@ -30,6 +30,11 @@ workspace lives in the center pane group, while inactive ones are detached and
 parked with their terminals still running (no PTY restart), so a build or watch
 process keeps going in the background while you work elsewhere.
 
+The first zmux window in a process restores the saved session. Additional
+windows start with a fresh workspace and distinct workspace identities, so they
+cannot duplicate the first window's live terminals or attach notifications to
+the wrong workspace.
+
 - Click **+** (or press `Ctrl-Shift-E`) to create a workspace.
 - Click a workspace to switch to it.
 - Double-click a workspace (or use the pencil button) to rename it inline.

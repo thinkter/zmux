@@ -29,9 +29,9 @@ pub const MAX_PATH_BYTES: usize = 4_096;
 
 pub type SurfaceId = u64;
 
-/// The complete on-disk document.  The `next_workspace_id` watermark is
-/// persisted so deleting a workspace can never cause an identity to be reused
-/// after a restart.
+/// The complete on-disk document. The `next_workspace_id` watermark is
+/// persisted so callers can keep workspace identities monotonic after a
+/// restart instead of reusing a deleted workspace's identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
