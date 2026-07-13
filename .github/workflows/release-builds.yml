@@ -105,7 +105,15 @@ jobs:
         run: cargo clippy --locked --all-targets -j 6 -- -D warnings
 
       - name: Run complete test suite
+        if: runner.os != 'Windows'
         run: cargo test --locked -j 6
+
+      # GPUI workspace tests share process-wide Windows/ConPTY state. Running
+      # them concurrently in one libtest process can crash during teardown
+      # with STATUS_ACCESS_VIOLATION instead of reporting a test failure.
+      - name: Run complete test suite (Windows, serial)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -j 6 -- --test-threads=1
 
       - name: Run vendored terminal bridge tests
         if: runner.os == 'Linux'
