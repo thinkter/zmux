@@ -45,9 +45,11 @@ use notify_rust::Urgency;
 #[cfg(all(unix, not(target_os = "macos")))]
 use notify_rust::{Hint, Notification as NativeNotification};
 
+#[cfg(any(all(unix, not(target_os = "macos")), target_os = "windows", test))]
+use crate::notifications::NotificationLevel;
 use crate::notifications::{
-    Notification, NotificationId, NotificationIdentity, NotificationLevel, NotificationSequence,
-    NotificationTarget, WorkspaceId,
+    Notification, NotificationId, NotificationIdentity, NotificationSequence, NotificationTarget,
+    WorkspaceId,
 };
 
 const DELIVERY_QUEUE_CAPACITY: usize = 64;
@@ -96,6 +98,7 @@ struct DeliveryJob {
     title: String,
     subtitle: String,
     body: String,
+    #[cfg(any(all(unix, not(target_os = "macos")), target_os = "windows", test))]
     level: NotificationLevel,
 }
 
@@ -108,6 +111,7 @@ impl From<&Notification> for DeliveryJob {
             title: notification.title.clone(),
             subtitle: notification.subtitle.clone(),
             body: notification.body.clone(),
+            #[cfg(any(all(unix, not(target_os = "macos")), target_os = "windows", test))]
             level: notification.level,
         }
     }
@@ -2033,15 +2037,9 @@ fn retract_windows_notification(identity: &WindowsToastIdentity) -> Result<(), S
         .map_err(|error| format!("removing Windows toast from history: {error}"))
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn native_body(body: &str) -> String {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        escape_xdg_body_markup(body)
-    }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        body.to_owned()
-    }
+    escape_xdg_body_markup(body)
 }
 
 /// XDG notification bodies may interpret a small XML-like markup language.
