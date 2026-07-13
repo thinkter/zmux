@@ -317,28 +317,26 @@ pub(crate) fn create_center_terminal(
 ) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
     let project = workspace.project().downgrade();
     let workspace_handle = workspace.weak_handle();
+    let workspace_id = workspace.database_id();
     cx.spawn_in(window, async move |_workspace, cx| {
         let terminal = project
             .update(cx, |project, cx| {
                 project.create_terminal_shell(working_directory, cx)
             })?
             .await?;
-        workspace_handle.update_in(cx, |workspace, window, cx| {
+        panel.update_in(cx, |panel, window, cx| {
             let terminal_view = cx.new(|cx| {
                 terminal_view::TerminalView::new(
                     terminal.clone(),
-                    workspace.weak_handle(),
-                    workspace.database_id(),
-                    workspace.project().downgrade(),
+                    workspace_handle,
+                    workspace_id,
+                    project,
                     window,
                     cx,
                 )
             });
-            panel.update(cx, |panel, cx| {
-                panel.attach_terminal(target, Box::new(terminal_view), window, cx);
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })??;
+            panel.attach_terminal(target, Box::new(terminal_view), window, cx);
+        })?;
         Ok(terminal.downgrade())
     })
 }

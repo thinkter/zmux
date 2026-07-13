@@ -326,7 +326,7 @@ impl WorkspacesPanel {
         };
         if let Some(workspace) = panel.workspace.upgrade() {
             panel._workspace_observer = Some(cx.observe(&workspace, |this, _, cx| {
-                this.persist_session(cx);
+                this.schedule_persist(cx);
             }));
         }
         panel

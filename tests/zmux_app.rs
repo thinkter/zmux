@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use gpui::prelude::*;
 use gpui::{Action, Bounds, Keystroke, TestAppContext, point, px, size};
@@ -308,6 +312,18 @@ async fn zmux_new_terminal_action_adds_center_tab_not_bottom_panel(cx: &mut Test
 
     assert_eq!(opened.workspace.read_with(cx, center_terminal_count), 2);
     assert_eq!(opened.workspace.read_with(cx, bottom_terminal_count), 0);
+
+    let session_path = paths::state_dir().join("session-v1.json");
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if persisted_terminal_count(&session_path) == Some(2) {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    assert_eq!(persisted_terminal_count(&session_path), Some(2));
 }
 
 #[gpui::test]
@@ -392,6 +408,30 @@ fn bottom_terminal_count(workspace: &workspace::Workspace, cx: &gpui::App) -> us
         .and_then(|panel| panel.read(cx).pane())
         .map(|pane| pane.read(cx).items_len())
         .unwrap_or(0)
+}
+
+fn persisted_terminal_count(session_path: &Path) -> Option<usize> {
+    let session: serde_json::Value = serde_json::from_slice(&fs::read(session_path).ok()?).ok()?;
+    let active_workspace_id = session.get("active_workspace_id")?.as_u64()?;
+    let active_workspace = session
+        .get("workspaces")?
+        .as_array()?
+        .iter()
+        .find(|workspace| {
+            workspace.get("id").and_then(serde_json::Value::as_u64) == Some(active_workspace_id)
+        })?;
+    count_persisted_terminals(active_workspace.get("layout")?.get("root")?)
+}
+
+fn count_persisted_terminals(node: &serde_json::Value) -> Option<usize> {
+    match node.get("kind")?.as_str()? {
+        "leaf" => Some(node.get("tabs")?.as_array()?.len()),
+        "split" => Some(
+            count_persisted_terminals(node.get("first")?)?
+                + count_persisted_terminals(node.get("second")?)?,
+        ),
+        _ => None,
+    }
 }
 
 fn zed_state_fixture() -> PathBuf {
