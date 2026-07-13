@@ -716,11 +716,30 @@ mod tests {
     use super::*;
 
     fn test_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "zmux-config-test-{}-{}-{name}",
-            std::process::id(),
-            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ))
+        std::env::temp_dir()
+            .join(format!(
+                "zmux-config-test-{}-{}",
+                std::process::id(),
+                TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join(name)
+    }
+
+    fn cleanup_test_path(path: &Path) {
+        let temp_root = std::env::temp_dir();
+        let owned_directory = path.parent().expect("test path has an owned directory");
+        assert_ne!(
+            owned_directory, temp_root,
+            "config test cleanup must never target the temporary root"
+        );
+        assert_eq!(
+            owned_directory.parent(),
+            Some(temp_root.as_path()),
+            "config test path must be directly inside its owned temporary directory"
+        );
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(owned_directory).unwrap();
     }
 
     #[test]
@@ -769,7 +788,7 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
         assert!(!path.with_extension("json.tmp").exists());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup_test_path(&path);
     }
 
     #[test]
@@ -803,7 +822,7 @@ mod tests {
         assert_eq!(store.config().terminal.font_size, 18.0);
         // The unchanged bad document is not repeatedly reparsed by a watcher.
         assert_eq!(store.reload_if_changed().unwrap(), None);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup_test_path(&path);
     }
 
     #[test]
