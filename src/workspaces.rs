@@ -8,7 +8,7 @@
 //! detach/reattach of live entities — no PTY restart, no serialization — so it
 //! stays snappy regardless of how many terminals are open.
 
-use std::{cmp::Ordering, collections::HashMap, mem, path::PathBuf};
+use std::{cmp::Ordering, collections::HashMap, mem, path::PathBuf, time::Duration};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -84,15 +84,17 @@ struct WorkspaceEntry {
 pub(crate) struct TerminalTarget {
     workspace_id: WorkspaceId,
     surface_id: SurfaceId,
+    destination_pane: WeakEntity<Pane>,
     destination_index: Option<usize>,
     activate_tab: bool,
 }
 
 impl TerminalTarget {
-    fn new(workspace_id: WorkspaceId, surface_id: SurfaceId) -> Self {
+    fn new(workspace_id: WorkspaceId, surface_id: SurfaceId, pane: &Entity<Pane>) -> Self {
         Self {
             workspace_id,
             surface_id,
+            destination_pane: pane.downgrade(),
             destination_index: None,
             activate_tab: true,
         }
@@ -103,10 +105,12 @@ impl TerminalTarget {
         surface_id: SurfaceId,
         destination_index: usize,
         activate_tab: bool,
+        pane: &Entity<Pane>,
     ) -> Self {
         Self {
             workspace_id,
             surface_id,
+            destination_pane: pane.downgrade(),
             destination_index: Some(destination_index),
             activate_tab,
         }
@@ -238,6 +242,10 @@ pub struct WorkspacesPanel {
     active: WorkspaceId,
     /// Stable identities for the panes in the currently displayed workspace.
     surface_ids: HashMap<EntityId, SurfaceId>,
+    /// Live pane routes for the currently displayed surface identities. Weak
+    /// handles let closed panes disappear instead of keeping them alive until
+    /// an asynchronous shell finishes.
+    surface_panes: HashMap<SurfaceId, WeakEntity<Pane>>,
     next_surface_id: SurfaceId,
     rename: Option<RenameState>,
     session_store: SessionStore,
@@ -246,6 +254,7 @@ pub struct WorkspacesPanel {
     /// windows start independently and must not overwrite or replay it.
     owns_session_persistence: bool,
     persistence_suspended: bool,
+    persistence_scheduled: bool,
     _workspace_observer: Option<Subscription>,
 }
 
@@ -322,6 +331,8 @@ impl WorkspacesPanel {
             workspace_id_store,
             owns_session_persistence,
             persistence_suspended: false,
+            persistence_scheduled: false,
+            surface_panes: HashMap::new(),
             _workspace_observer: None,
         };
         if let Some(workspace) = panel.workspace.upgrade() {
@@ -346,13 +357,19 @@ impl WorkspacesPanel {
             .and_then(|entry| entry.restore.take())
     }
 
-    pub(crate) fn register_initial_surface(&mut self, pane_id: EntityId) -> TerminalTarget {
-        let surface_id = self.surface_for_pane(pane_id);
-        TerminalTarget::new(self.active, surface_id)
+    pub(crate) fn register_initial_surface(&mut self, pane: Entity<Pane>) -> TerminalTarget {
+        let surface_id = self.surface_for_pane(pane.entity_id());
+        self.surface_panes.insert(surface_id, pane.downgrade());
+        TerminalTarget::new(self.active, surface_id, &pane)
     }
 
-    pub(crate) fn install_restored_surfaces(&mut self, surface_ids: HashMap<EntityId, SurfaceId>) {
+    pub(crate) fn install_restored_surfaces(
+        &mut self,
+        surface_ids: HashMap<EntityId, SurfaceId>,
+        panes: Vec<Entity<Pane>>,
+    ) {
         self.surface_ids = surface_ids;
+        self.refresh_surface_panes(panes);
     }
 
     pub(crate) fn begin_session_restore(&mut self) {
@@ -364,8 +381,10 @@ impl WorkspacesPanel {
         self.schedule_persist(cx);
     }
 
-    pub(crate) fn active_terminal_target(&mut self, pane_id: EntityId) -> TerminalTarget {
-        TerminalTarget::new(self.active, self.surface_for_pane(pane_id))
+    pub(crate) fn active_terminal_target(&mut self, pane: Entity<Pane>) -> TerminalTarget {
+        let surface_id = self.surface_for_pane(pane.entity_id());
+        self.surface_panes.insert(surface_id, pane.downgrade());
+        TerminalTarget::new(self.active, surface_id, &pane)
     }
 
     /// Attach a completed asynchronous terminal to the logical destination
@@ -378,32 +397,8 @@ impl WorkspacesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A shell can become ready while its caller is still updating the
-        // Workspace (notably during Workspace::new_local). Wait until the
-        // current effect stack has unwound before resolving the target pane.
-        cx.defer_in(window, move |this, window, cx| {
-            this.attach_terminal_after_update(target, item, window, cx);
-        });
-    }
-
-    fn attach_terminal_after_update(
-        &mut self,
-        target: TerminalTarget,
-        item: Box<dyn ItemHandle>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         if target.workspace_id == self.active {
-            if let Some(pane_id) = self.surface_ids.iter().find_map(|(pane_id, surface_id)| {
-                (*surface_id == target.surface_id).then_some(*pane_id)
-            }) && let Some(workspace) = self.workspace.upgrade()
-                && let Some(pane) = workspace
-                    .read(cx)
-                    .panes()
-                    .iter()
-                    .find(|pane| pane.entity_id() == pane_id)
-                    .cloned()
-            {
+            if let Some(pane) = self.pane_for_target(&target) {
                 pane.update(cx, |pane, cx| {
                     if target.activate_tab {
                         pane.add_item(item, false, false, target.destination_index, window, cx);
@@ -503,7 +498,7 @@ impl WorkspacesPanel {
         let mut surface_ids = mem::take(&mut self.surface_ids);
         let mut pending_terminals = Vec::new();
 
-        let captured = workspace.update(cx, |workspace, cx| {
+        let (captured, panes) = workspace.update(cx, |workspace, cx| {
             let captured =
                 capture_layout(workspace, cx, &mut surface_ids, &mut self.next_surface_id);
             clear_center(workspace, window, cx);
@@ -565,20 +560,21 @@ impl WorkspacesPanel {
                         pane.add_item(Box::new(welcome), true, true, None, window, cx);
                     });
                     pending_terminals.push(RestoredTerminal {
-                        target: TerminalTarget::new(id, surface_id),
+                        target: TerminalTarget::new(id, surface_id, &target_pane),
                         working_directory: default_working_directory(workspace, cx),
                     });
                     surface_id
                 }
             };
             focus_surface(workspace, active_surface_id, &surface_ids, window, cx);
-            captured
+            (captured, workspace.panes().to_vec())
         });
 
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == previous) {
             entry.stored = Some(captured);
         }
         self.surface_ids = surface_ids;
+        self.refresh_surface_panes(panes);
         self.active = id;
         self.persistence_suspended = false;
         for terminal in pending_terminals {
@@ -724,6 +720,33 @@ impl WorkspacesPanel {
             .or_insert_with(|| allocate_surface_id(&mut self.next_surface_id))
     }
 
+    fn refresh_surface_panes(&mut self, panes: Vec<Entity<Pane>>) {
+        self.surface_panes = panes
+            .into_iter()
+            .filter_map(|pane| {
+                self.surface_ids
+                    .get(&pane.entity_id())
+                    .copied()
+                    .map(|surface_id| (surface_id, pane.downgrade()))
+            })
+            .collect();
+    }
+
+    fn pane_for_target(&self, target: &TerminalTarget) -> Option<Entity<Pane>> {
+        target
+            .destination_pane
+            .upgrade()
+            .filter(|pane| self.surface_ids.get(&pane.entity_id()) == Some(&target.surface_id))
+            .or_else(|| {
+                self.surface_panes
+                    .get(&target.surface_id)
+                    .and_then(WeakEntity::upgrade)
+                    .filter(|pane| {
+                        self.surface_ids.get(&pane.entity_id()) == Some(&target.surface_id)
+                    })
+            })
+    }
+
     fn persist_session(&mut self, cx: &mut Context<Self>) {
         if !self.owns_session_persistence || self.persistence_suspended {
             return;
@@ -731,12 +754,15 @@ impl WorkspacesPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        let workspace = workspace.read(cx);
+        let panes = workspace.panes().to_vec();
         let active_layout = capture_layout_snapshot(
-            workspace.read(cx),
+            workspace,
             cx,
             &mut self.surface_ids,
             &mut self.next_surface_id,
         );
+        self.refresh_surface_panes(panes);
         let workspaces = self
             .entries
             .iter()
@@ -774,10 +800,21 @@ impl WorkspacesPanel {
     }
 
     fn schedule_persist(&mut self, cx: &mut Context<Self>) {
-        let panel = cx.weak_entity();
-        cx.defer(move |cx| {
-            panel.update(cx, |panel, cx| panel.persist_session(cx)).ok();
-        });
+        if self.persistence_scheduled {
+            return;
+        }
+        self.persistence_scheduled = true;
+        let timer = cx.background_executor().timer(Duration::from_millis(1));
+        cx.spawn(async move |panel, cx| {
+            timer.await;
+            panel
+                .update(cx, |panel, cx| {
+                    panel.persistence_scheduled = false;
+                    panel.persist_session(cx);
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn render_entry(
@@ -1696,6 +1733,7 @@ fn restore_snapshot_node(
                         *surface_id,
                         index,
                         index == *active_tab,
+                        &target,
                     ),
                     working_directory: terminal.working_directory.clone(),
                 });

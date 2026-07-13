@@ -147,8 +147,9 @@ pub fn open_zmux_workspace(
                 panel.update(cx, |panel, _| panel.begin_session_restore());
                 let (surface_ids, terminals) =
                     restore_startup_layout(workspace, layout, active_workspace_id, window, cx);
+                let panes = workspace.panes().to_vec();
                 panel.update(cx, |panel, cx| {
-                    panel.install_restored_surfaces(surface_ids);
+                    panel.install_restored_surfaces(surface_ids, panes);
                     panel.finish_session_restore(cx);
                 });
                 for (target, working_directory) in terminals {
@@ -169,9 +170,8 @@ pub fn open_zmux_workspace(
                     pane.set_should_display_welcome_page(false);
                     pane.add_item(Box::new(welcome), true, true, None, window, cx);
                 });
-                let target = panel.update(cx, |panel, _| {
-                    panel.register_initial_surface(center_pane.entity_id())
-                });
+                let target =
+                    panel.update(cx, |panel, _| panel.register_initial_surface(center_pane));
                 create_center_terminal(
                     workspace,
                     panel.downgrade(),
@@ -187,8 +187,8 @@ pub fn open_zmux_workspace(
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
                 };
-                let pane_id = workspace.active_pane().entity_id();
-                let target = panel.update(cx, |panel, _| panel.active_terminal_target(pane_id));
+                let pane = workspace.active_pane().clone();
+                let target = panel.update(cx, |panel, _| panel.active_terminal_target(pane));
                 create_center_terminal(
                     workspace,
                     panel.downgrade(),
