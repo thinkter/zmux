@@ -1,0 +1,13 @@
+Source: zmux
+Section: utils
+Priority: optional
+Maintainer: thinkter <noreply@github.com>
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: zmux
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libvulkan1
+Description: terminal workspace multiplexer with native notifications
+ zmux is a GPU-accelerated terminal workspace multiplexer with exact-pane
+ notification routing and an in-app notification history.

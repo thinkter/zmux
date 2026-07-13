@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+/vendor/*/target/
+/vendor/*/Cargo.lock
 
 # Local environment and tooling
 .env

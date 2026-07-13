@@ -2,15 +2,26 @@ use gpui::{App, KeyBinding, actions};
 use terminal::{Copy, Paste, ScrollPageDown, ScrollPageUp, ScrollToBottom};
 use workspace::pane::{
     ActivateNextItem, ActivatePreviousItem, CloseActiveItem, CloseAllItems, CloseOtherItems,
-    SplitDown, SplitRight,
 };
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 use crate::app::{JumpToLatestNotification, NotifyCurrentPane};
-use crate::workspaces::{ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel};
+use crate::workspaces::{
+    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleNotificationCenter,
+    ToggleWorkspacesPanel,
+};
 
-actions!(zmux, [NewTerminal, OpenSettings, Quit]);
+actions!(
+    zmux,
+    [
+        NewTerminal,
+        SplitTerminalRight,
+        SplitTerminalDown,
+        OpenSettings,
+        Quit
+    ]
+);
 
 #[cfg(target_os = "macos")]
 const DEFAULT_KEYMAP: &str = "keymaps/default-macos.json";
@@ -22,7 +33,8 @@ const DEFAULT_KEYMAP: &str = "keymaps/default-windows.json";
 const DEFAULT_KEYMAP: &str = "keymaps/default-linux.json";
 
 pub fn configure_keybindings(cx: &mut App) {
-    if let Ok(bindings) = settings::KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP, cx) {
+    if let Ok(bindings) = settings::KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP, cx)
+    {
         cx.bind_keys(bindings);
     }
 
@@ -48,6 +60,9 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-left", ActivatePreviousWorkspace, None),
         KeyBinding::new("ctrl-shift-m", NotifyCurrentPane, None),
         KeyBinding::new("ctrl-shift-u", JumpToLatestNotification, None),
+        KeyBinding::new("cmd-shift-u", JumpToLatestNotification, None),
+        KeyBinding::new("cmd-i", ToggleNotificationCenter, None),
+        KeyBinding::new("ctrl-shift-i", ToggleNotificationCenter, None),
         KeyBinding::new("ctrl-tab", ActivateNextItem::default(), None),
         KeyBinding::new("ctrl-shift-tab", ActivatePreviousItem::default(), None),
         KeyBinding::new("ctrl-shift-w", CloseActiveItem::default(), None),
@@ -55,8 +70,11 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-o", CloseOtherItems::default(), None),
         KeyBinding::new("alt-right", ActivateNextPane, None),
         KeyBinding::new("alt-left", ActivatePreviousPane, None),
-        KeyBinding::new("ctrl-shift-d", SplitRight::default(), None),
-        KeyBinding::new("ctrl-shift-alt-d", SplitDown::default(), None),
+        // These actions allocate a fresh CLI route before spawning the split.
+        // Built-in pane-menu clone actions are captured at the workspace root
+        // and routed through the same provisioned spawn path.
+        KeyBinding::new("ctrl-shift-d", SplitTerminalRight, None),
+        KeyBinding::new("ctrl-shift-alt-d", SplitTerminalDown, None),
         KeyBinding::new("ctrl-=", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl-+", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl--", DecreaseBufferFontSize { persist: false }, None),

@@ -12,18 +12,20 @@ use std::cmp::Ordering;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Axis, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Pixels, Render, SharedString, Subscription, TaskExt, WeakEntity, Window, actions,
-    div, point, px, size,
+    App, Axis, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, TaskExt, WeakEntity,
+    Window, actions, div, point, px, size,
 };
+use terminal_view::TerminalView;
 use ui::prelude::*;
 use ui::{IconButtonShape, Indicator, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::item::ItemHandle;
 use workspace::{Pane, SplitDirection, Workspace};
 
-use crate::app::create_center_terminal;
-use crate::notifications::{NotificationStore, WorkspaceId};
+use crate::app::create_center_terminal_for_workspace;
+use crate::notification_runtime::NotificationRuntime;
+use crate::notifications::{Notification, NotificationStore, WorkspaceId};
 use crate::welcome::ZmuxWelcome;
 
 actions!(
@@ -31,6 +33,7 @@ actions!(
     [
         NewWorkspace,
         ToggleWorkspacesPanel,
+        ToggleNotificationCenter,
         ActivateNextWorkspace,
         ActivatePreviousWorkspace
     ]
@@ -89,12 +92,16 @@ impl Render for DraggedWorkspace {
 }
 
 pub struct WorkspacesPanel {
+    scope_id: EntityId,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     entries: Vec<WorkspaceEntry>,
     active: WorkspaceId,
+    activation_generation: u64,
     next_id: WorkspaceId,
     rename: Option<RenameState>,
+    notifications_expanded: bool,
+    _notification_subscription: Subscription,
 }
 
 impl WorkspacesPanel {
@@ -109,13 +116,19 @@ impl WorkspacesPanel {
             name: "Workspace 1".to_string(),
             stored: None,
         }];
+        let notification_store = NotificationStore::global(cx);
+        let notification_subscription = cx.observe(&notification_store, |_, _, cx| cx.notify());
         Self {
+            scope_id: cx.entity_id(),
             workspace,
             focus_handle,
             entries,
             active: 1,
+            activation_generation: 0,
             next_id: 2,
             rename: None,
+            notifications_expanded: false,
+            _notification_subscription: notification_subscription,
         }
     }
 
@@ -123,30 +136,38 @@ impl WorkspacesPanel {
         self.active
     }
 
+    pub(crate) fn active_workspace_generation(&self) -> u64 {
+        self.activation_generation
+    }
+
+    /// Resolve an item's logical workspace even if an `ItemAdded` callback is
+    /// deferred until after the user switches away from it.
+    pub(crate) fn workspace_id_for_item(&self, item_id: EntityId) -> WorkspaceId {
+        self.entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .stored
+                    .as_ref()
+                    .is_some_and(|layout| stored_layout_contains_item(layout, item_id))
+                    .then_some(entry.id)
+            })
+            .unwrap_or(self.active)
+    }
+
     /// Create a fresh, empty workspace and switch to it.
     pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_id;
-        if self.next_id <= self.entries.len() as u64 {
-            self.next_id = self.entries.len() as u64 + 2;
-        } else {
-            self.next_id += 1;
-        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("workspace ID space exhausted");
         let name = format!("Workspace {id}");
         self.entries.push(WorkspaceEntry {
             id,
             name,
             stored: None,
         });
-
-        self.entries.sort_by_key(|entry| entry.id);
-
-        // debug purposes
-        // let ids = self
-        //     .entries
-        //     .iter()
-        //     .map(|entry| entry.id)
-        //     .collect::<Vec<_>>();
-        // println!("Created workspace {:#?}", ids);
 
         self.activate_workspace(id, window, cx);
     }
@@ -175,6 +196,11 @@ impl WorkspacesPanel {
 
         self.cancel_rename(cx);
         let previous = self.active;
+        self.activation_generation = self
+            .activation_generation
+            .checked_add(1)
+            .expect("workspace activation generation exhausted");
+        let target_generation = self.activation_generation;
         // Take the target's parked layout out before we borrow the workspace so we
         // don't have to touch `self` inside the update closure.
         let target_layout = self
@@ -189,7 +215,25 @@ impl WorkspacesPanel {
 
             let target_pane = workspace.active_pane().clone();
             match target_layout {
-                Some(layout) => restore_layout(workspace, target_pane, layout, window, cx),
+                Some(layout) => {
+                    restore_layout(workspace, target_pane, layout, window, cx);
+                    // A new workspace can be parked while its asynchronous
+                    // first shell is still spawning. That stale completion is
+                    // correctly rejected by the explicit workspace/pane
+                    // guard, but the parked snapshot then contains only the
+                    // Welcome item. Retry when that snapshot is activated so
+                    // `Some(layout)` cannot become permanently terminal-less.
+                    if !center_has_provisioned_terminal(workspace, cx) {
+                        create_center_terminal_for_workspace(
+                            workspace,
+                            id,
+                            target_generation,
+                            window,
+                            cx,
+                        )
+                        .detach_and_log_err(cx);
+                    }
+                }
                 None => {
                     //spawning a new terminal sometimes fails...
                     // this a good workarround for now. gotta add some sorta retry logic
@@ -198,7 +242,14 @@ impl WorkspacesPanel {
                     target_pane.update(cx, |pane, cx| {
                         pane.add_item(Box::new(welcome), true, true, None, window, cx);
                     });
-                    create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+                    create_center_terminal_for_workspace(
+                        workspace,
+                        id,
+                        target_generation,
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
                 }
             }
             workspace.focus_center_pane(window, cx);
@@ -256,11 +307,9 @@ impl WorkspacesPanel {
             }
         }
 
-        self.next_id = id;
-
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
-        self.entries.sort_by_key(|entry| entry.id);
+        NotificationRuntime::clear_workspace(cx.entity_id(), id, cx);
         cx.notify();
     }
 
@@ -338,7 +387,9 @@ impl WorkspacesPanel {
     ) -> impl IntoElement + use<> {
         let id = entry.id;
         let is_active = id == self.active;
-        let has_unread = NotificationStore::global(cx).workspace_has_unread(id);
+        let has_unread = NotificationStore::global(cx)
+            .read(cx)
+            .workspace_has_unread(cx.entity_id(), id);
         let renaming = self
             .rename
             .as_ref()
@@ -476,6 +527,107 @@ impl WorkspacesPanel {
                     }),
             )
     }
+
+    fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        self.notifications_expanded = !self.notifications_expanded;
+        cx.notify();
+    }
+
+    pub fn toggle_notification_center(&mut self, cx: &mut Context<Self>) {
+        self.toggle_notifications(cx);
+    }
+
+    fn dismiss_notification(&mut self, id: u64, cx: &mut Context<Self>) {
+        NotificationRuntime::dismiss_notification(id, cx);
+    }
+
+    fn mark_scope_read(&mut self, cx: &mut Context<Self>) {
+        let scope_id = cx.entity_id();
+        NotificationRuntime::mark_scope_read(scope_id, cx);
+    }
+
+    fn clear_scope_notifications(&mut self, cx: &mut Context<Self>) {
+        let scope_id = cx.entity_id();
+        NotificationRuntime::clear_scope_notifications(scope_id, cx);
+    }
+
+    fn render_notification(
+        &self,
+        notification: &Notification,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let id = notification.id;
+        let is_unread = !notification.read;
+        let title = if notification.title.is_empty() {
+            "Terminal notification".to_owned()
+        } else {
+            notification.title.clone()
+        };
+        let subtitle = notification.subtitle.clone();
+        let body = notification.body.clone();
+        let source = notification.source.label();
+
+        v_flex()
+            .id(("notification", id as usize))
+            .w_full()
+            .p_2()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .cursor_pointer()
+            .on_click(cx.listener(move |_, _, _window, cx| {
+                NotificationRuntime::open_notification(id, cx);
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(Indicator::dot().color(if is_unread {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    }))
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .single_line()
+                            .flex_1(),
+                    )
+                    .child(
+                        IconButton::new(("notification-dismiss", id as usize), IconName::Close)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Dismiss"))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_notification(id, cx);
+                            })),
+                    ),
+            )
+            .when(!subtitle.is_empty(), |this| {
+                this.child(
+                    Label::new(subtitle)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line(),
+                )
+            })
+            .when(!body.is_empty(), |this| {
+                this.child(
+                    Label::new(body)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .line_clamp(3),
+                )
+            })
+            .child(
+                Label::new(source)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+    }
 }
 
 impl Focusable for WorkspacesPanel {
@@ -500,8 +652,22 @@ impl Render for WorkspacesPanel {
             })
             .collect();
 
-        let latest = NotificationStore::global(cx).latest_unread().cloned();
-        let unread_count = NotificationStore::global(cx).unread_count();
+        let scope_id = cx.entity_id();
+        let (latest, unread_count, notifications) = {
+            let store = NotificationStore::global(cx);
+            let store = store.read(cx);
+            let latest = store
+                .notifications()
+                .find(|notification| notification.target.scope_id == scope_id && !notification.read)
+                .cloned();
+            let unread_count = store.scope_unread_count(scope_id);
+            let notifications = store
+                .notifications()
+                .filter(|notification| notification.target.scope_id == scope_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            (latest, unread_count, notifications)
+        };
 
         v_flex()
             .key_context("WorkspacesPanel")
@@ -521,13 +687,26 @@ impl Render for WorkspacesPanel {
                             .color(Color::Muted),
                     )
                     .child(
-                        IconButton::new("new-workspace", IconName::Plus)
-                            .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("New Workspace"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.create_workspace(window, cx);
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                IconButton::new("notifications", IconName::Info)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Notifications (Cmd+I)"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.toggle_notifications(cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("new-workspace", IconName::Plus)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("New Workspace"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_workspace(window, cx);
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -539,36 +718,104 @@ impl Render for WorkspacesPanel {
                     .flex_1()
                     .children(rows.iter().map(|entry| self.render_entry(entry, cx))),
             )
-            .when_some(latest, |this, notification| {
+            .when(self.notifications_expanded, |this| {
                 this.child(
                     v_flex()
-                        .p_2()
-                        .gap_1()
+                        .max_h(px(280.0))
                         .border_t_1()
                         .border_color(cx.theme().colors().border)
                         .child(
                             h_flex()
-                                .gap_1()
-                                .child(Indicator::dot().color(Color::Accent))
+                                .px_2()
+                                .py_1()
+                                .justify_between()
                                 .child(
-                                    Label::new(format!("{} unread", unread_count))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    Label::new(format!("Notifications · {unread_count} unread"))
+                                        .size(LabelSize::Small),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            IconButton::new("notifications-read", IconName::Check)
+                                                .shape(IconButtonShape::Square)
+                                                .icon_size(IconSize::XSmall)
+                                                .tooltip(Tooltip::text("Mark all read"))
+                                                .on_click(cx.listener(|this, _, _window, cx| {
+                                                    this.mark_scope_read(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            IconButton::new("notifications-clear", IconName::Trash)
+                                                .shape(IconButtonShape::Square)
+                                                .icon_size(IconSize::XSmall)
+                                                .tooltip(Tooltip::text("Clear notifications"))
+                                                .on_click(cx.listener(|this, _, _window, cx| {
+                                                    this.clear_scope_notifications(cx)
+                                                })),
+                                        ),
                                 ),
                         )
                         .child(
-                            Label::new(notification.title.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Default)
-                                .single_line(),
-                        )
-                        .child(
-                            Label::new(notification.body.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .line_clamp(2),
+                            v_flex()
+                                .id("notifications-list")
+                                .p_1()
+                                .gap_1()
+                                .overflow_y_scroll()
+                                .children(
+                                    notifications.iter().map(|notification| {
+                                        self.render_notification(notification, cx)
+                                    }),
+                                )
+                                .when(notifications.is_empty(), |this| {
+                                    this.child(
+                                        Label::new("No notifications")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                }),
                         ),
                 )
+            })
+            .when(!self.notifications_expanded, |this| {
+                this.when_some(latest, |this, notification| {
+                    let id = notification.id;
+                    this.child(
+                        v_flex()
+                            .id("latest-notification")
+                            .p_2()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border)
+                            .cursor_pointer()
+                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                            .on_click(cx.listener(move |_, _, _window, cx| {
+                                NotificationRuntime::open_notification(id, cx);
+                            }))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Indicator::dot().color(Color::Accent))
+                                    .child(
+                                        Label::new(format!("{} unread", unread_count))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .child(
+                                Label::new(notification.title.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default)
+                                    .single_line(),
+                            )
+                            .child(
+                                Label::new(notification.body.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .line_clamp(2),
+                            ),
+                    )
+                })
             })
     }
 }
@@ -607,7 +854,9 @@ impl Panel for WorkspacesPanel {
     }
 
     fn icon_label(&self, _window: &Window, cx: &App) -> Option<String> {
-        let count = NotificationStore::global(cx).unread_count();
+        let count = NotificationStore::global(cx)
+            .read(cx)
+            .scope_unread_count(self.scope_id);
         (count > 0).then(|| count.to_string())
     }
 
@@ -647,6 +896,24 @@ fn capture_layout(workspace: &Workspace, cx: &App) -> StoredLayout {
         nodes.push((bounds, StoredLayout::Leaf { items, active }));
     }
     build_tree(nodes)
+}
+
+fn stored_layout_contains_item(layout: &StoredLayout, item_id: EntityId) -> bool {
+    match layout {
+        StoredLayout::Leaf { items, .. } => items.iter().any(|item| item.item_id() == item_id),
+        StoredLayout::Split { first, second, .. } => {
+            stored_layout_contains_item(first, item_id)
+                || stored_layout_contains_item(second, item_id)
+        }
+    }
+}
+
+fn center_has_provisioned_terminal(workspace: &Workspace, cx: &App) -> bool {
+    workspace.panes().iter().any(|pane| {
+        pane.read(cx)
+            .items()
+            .any(|item| item.act_as::<TerminalView>(cx).is_some())
+    })
 }
 
 /// Reconstruct a binary split tree from the laid-out pane rectangles using a

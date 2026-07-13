@@ -2,7 +2,10 @@ name: Release builds
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -18,26 +21,32 @@ jobs:
       matrix:
         include:
           - label: Linux x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: zmux-linux-x86_64
-            archive: zmux-linux-x86_64.tar.gz
-            upload_path: dist/zmux-linux-x86_64.tar.gz
+            upload_path: dist/zmux-linux-x86_64.deb
+            macos_deployment_target: ''
+            rustflags: ''
           - label: macOS aarch64
-            os: macos-14
+            os: macos-15
             artifact: zmux-macos-aarch64
-            archive: zmux-macos-aarch64.tar.gz
-            upload_path: dist/zmux-macos-aarch64.tar.gz
+            upload_path: dist/zmux-macos-aarch64*.zip
+            macos_deployment_target: '12.0'
+            rustflags: ''
           - label: Windows x86_64
-            os: windows-latest
+            os: windows-2025
             artifact: zmux-windows-x86_64
-            upload_path: dist/zmux.exe
+            upload_path: dist/zmux-windows-x86_64*.msi
+            macos_deployment_target: ''
+            rustflags: '-C target-feature=+crt-static'
 
     env:
       CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -48,12 +57,15 @@ jobs:
             clang \
             cmake \
             curl \
+            dbus-x11 \
+            desktop-file-utils \
             elfutils \
             g++ \
             gcc \
             gettext-base \
             git \
             jq \
+            libgtk-3-bin \
             libasound2-dev \
             libfontconfig-dev \
             libgit2-dev \
@@ -72,30 +84,356 @@ jobs:
             musl-dev \
             musl-tools \
             pipewire \
-            xdg-desktop-portal
+            xdg-desktop-portal \
+            xvfb
 
       - name: Install pinned Rust toolchain
         run: rustup show
 
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      - name: Package Unix artifact
-        if: runner.os != 'Windows'
+      - name: Verify release tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         run: |
-          mkdir -p dist
-          tar -czf "dist/${{ matrix.archive }}" -C target/release zmux
+          set -euo pipefail
+          package_version="$(awk '/^\[package\]/{in_package=1; next} in_package && /^version = / {sub(/^[^\"]*\"/, ""); sub(/\".*$/, ""); print; exit}' Cargo.toml)"
+          test "$GITHUB_REF_NAME" = "v$package_version" || {
+            echo "Tag $GITHUB_REF_NAME does not match Cargo package version $package_version" >&2
+            exit 1
+          }
 
-      - name: Package Windows artifact
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -j 6 -- -D warnings
+
+      - name: Run complete test suite
+        run: cargo test --locked -j 6
+
+      - name: Run vendored terminal bridge tests
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -j 6 --manifest-path vendor/vte/Cargo.toml
+          cargo test -j 6 --manifest-path vendor/alacritty_terminal/Cargo.toml
+
+      - name: Build release binary
+        run: cargo build --release --locked -j 6
+
+      - name: Package and install-test Linux artifact
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          desktop-file-validate packaging/linux/io.github.thinkter.zmux.desktop
+          package_root="dist/deb-root"
+          zmux_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zmux") | .version')"
+          mkdir -p \
+            "$package_root/DEBIAN" \
+            "$package_root/usr/bin" \
+            "$package_root/usr/share/applications" \
+            "$package_root/usr/share/doc/zmux"
+          install -m 755 target/release/zmux "$package_root/usr/bin/zmux"
+          install -m 644 \
+            packaging/linux/io.github.thinkter.zmux.desktop \
+            "$package_root/usr/share/applications/io.github.thinkter.zmux.desktop"
+          install -m 755 packaging/linux/postinst "$package_root/DEBIAN/postinst"
+          install -m 755 packaging/linux/postrm "$package_root/DEBIAN/postrm"
+          install -m 644 LICENSE "$package_root/usr/share/doc/zmux/copyright"
+
+          mkdir -p debian
+          install -m 644 packaging/linux/control debian/control
+          install -m 644 packaging/linux/changelog debian/changelog
+          dpkg-shlibdeps \
+            -Tdist/zmux.substvars \
+            -e"$package_root/usr/bin/zmux"
+          dpkg-gencontrol \
+            -cpackaging/linux/control \
+            -Tdist/zmux.substvars \
+            -pzmux \
+            -v"$zmux_version" \
+            -P"$package_root"
+          dpkg-deb --root-owner-group --build \
+            "$package_root" \
+            dist/zmux-linux-x86_64.deb
+
+          dpkg-deb --info dist/zmux-linux-x86_64.deb
+          sudo dpkg --install dist/zmux-linux-x86_64.deb
+          test "$(command -v zmux)" = /usr/bin/zmux
+          desktop-file-validate /usr/share/applications/io.github.thinkter.zmux.desktop
+          test "$(grep '^Exec=' /usr/share/applications/io.github.thinkter.zmux.desktop)" = 'Exec=zmux'
+          dbus-run-session -- xvfb-run -a sh -eu -c '
+            gtk-launch io.github.thinkter.zmux >"$RUNNER_TEMP/zmux-linux-smoke.log" 2>&1 &
+            launcher=$!
+            trap '\''pkill -x zmux >/dev/null 2>&1 || true; kill "$launcher" >/dev/null 2>&1 || true'\'' EXIT
+            attempt=0
+            while [ "$attempt" -lt 40 ]; do
+              if pgrep -x zmux >/dev/null; then
+                sleep 1
+                pgrep -x zmux >/dev/null && exit 0
+                cat "$RUNNER_TEMP/zmux-linux-smoke.log" >&2
+                echo "Packaged Linux application exited during launch smoke test" >&2
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 0.25
+            done
+            cat "$RUNNER_TEMP/zmux-linux-smoke.log" >&2
+            echo "Packaged Linux application did not stay running" >&2
+            exit 1
+          '
+
+      - name: Package macOS app bundle
+        if: runner.os == 'macOS'
+        env:
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          app_bundle="dist/zmux.app"
+          bundle_id="io.github.thinkter.zmux"
+          zmux_version="$(awk '/^\[package\]/{in_package=1; next} in_package && /^version = / {sub(/^[^\"]*\"/, ""); sub(/\".*$/, ""); print; exit}' Cargo.toml)"
+
+          mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"
+          install -m 755 target/release/zmux "$app_bundle/Contents/MacOS/zmux"
+          install -m 644 LICENSE "$app_bundle/Contents/Resources/LICENSE"
+          cp packaging/macos/Info.plist "$app_bundle/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $zmux_version" "$app_bundle/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $zmux_version" "$app_bundle/Contents/Info.plist"
+
+          plutil -lint "$app_bundle/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_bundle/Contents/Info.plist")" = "$bundle_id"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            for value in \
+              APPLE_APP_PASSWORD \
+              APPLE_CERTIFICATE_BASE64 \
+              APPLE_CERTIFICATE_PASSWORD \
+              APPLE_ID \
+              APPLE_SIGNING_IDENTITY \
+              APPLE_TEAM_ID; do
+              test -n "${!value}" || { echo "Missing required release secret: $value" >&2; exit 1; }
+            done
+
+            keychain="$RUNNER_TEMP/zmux-signing.keychain-db"
+            certificate="$RUNNER_TEMP/zmux-signing.p12"
+            keychain_password="$(openssl rand -hex 24)"
+            printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+            security create-keychain -p "$keychain_password" "$keychain"
+            security set-keychain-settings -lut 21600 "$keychain"
+            security unlock-keychain -p "$keychain_password" "$keychain"
+            security import "$certificate" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" \
+              -A \
+              -t cert \
+              -f pkcs12 \
+              -k "$keychain"
+            security set-key-partition-list \
+              -S apple-tool:,apple: \
+              -s \
+              -k "$keychain_password" \
+              "$keychain"
+            security list-keychains -d user -s "$keychain"
+
+            codesign \
+              --force \
+              --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" \
+              --identifier "$bundle_id" \
+              --timestamp \
+              "$app_bundle"
+            codesign --verify --deep --strict --verbose=2 "$app_bundle"
+
+            notarization_upload="$RUNNER_TEMP/zmux-notarization.zip"
+            ditto -c -k --keepParent "$app_bundle" "$notarization_upload"
+            xcrun notarytool submit "$notarization_upload" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+            xcrun stapler staple "$app_bundle"
+            xcrun stapler validate "$app_bundle"
+            spctl --assess --type execute --verbose=4 "$app_bundle"
+            archive="dist/zmux-macos-aarch64.zip"
+          else
+            # CI/PR artifacts are intentionally ad-hoc signed for bundle API
+            # smoke tests and explicitly labeled as non-distributable.
+            codesign --force --sign - --identifier "$bundle_id" --timestamp=none "$app_bundle"
+            codesign --verify --deep --strict "$app_bundle"
+            archive="dist/zmux-macos-aarch64-unsigned.zip"
+          fi
+
+          launch_log="$RUNNER_TEMP/zmux-macos-smoke.log"
+          "$app_bundle/Contents/MacOS/zmux" >"$launch_log" 2>&1 &
+          app_pid=$!
+          sleep 5
+          if ! kill -0 "$app_pid" >/dev/null 2>&1; then
+            wait "$app_pid" || true
+            cat "$launch_log" >&2
+            echo "Packaged macOS application did not stay running" >&2
+            exit 1
+          fi
+          kill "$app_pid"
+          wait "$app_pid" || true
+
+          # `ditto` preserves the bundle metadata and stapled notarization
+          # ticket expected by Gatekeeper when users unpack the release.
+          ditto -c -k --keepParent "$app_bundle" "$archive"
+
+      - name: Install pinned WiX toolset
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix --version
+
+      - name: Build Windows MSI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          $versionMatch = [regex]::Match(
+            $manifest,
+            '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"'
+          )
+          if (-not $versionMatch.Success) {
+            throw 'Could not read the zmux package version from Cargo.toml'
+          }
+          $zmuxVersion = $versionMatch.Groups[1].Value
+
+          $isTagRelease = $env:GITHUB_REF -like 'refs/tags/v*'
+          $signTool = Get-ChildItem `
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName |
+            Select-Object -Last 1
+          if (-not $signTool) {
+            throw 'Could not find signtool.exe in the Windows SDK'
+          }
+          if ($isTagRelease) {
+            if (-not $env:WINDOWS_CERTIFICATE_BASE64) {
+              throw 'Missing required release secret: WINDOWS_CERTIFICATE_BASE64'
+            }
+            if (-not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+              throw 'Missing required release secret: WINDOWS_CERTIFICATE_PASSWORD'
+            }
+            $certificate = Join-Path $env:RUNNER_TEMP 'zmux-signing.pfx'
+            [IO.File]::WriteAllBytes(
+              $certificate,
+              [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
+            )
+            & $signTool.FullName sign `
+              /fd SHA256 `
+              /f $certificate `
+              /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              target/release/zmux.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Signing zmux.exe failed' }
+            & $signTool.FullName verify /pa /v target/release/zmux.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Verifying zmux.exe failed' }
+            $msiName = 'zmux-windows-x86_64.msi'
+          } else {
+            # CI/PR installers exercise WiX and identity wiring but are
+            # explicitly labeled unsigned and are not release artifacts.
+            $msiName = 'zmux-windows-x86_64-unsigned.msi'
+          }
+
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item -Path target/release/zmux.exe -Destination dist/zmux.exe
+          wix build packaging/windows/zmux.wxs `
+            -arch x64 `
+            -d "ProductVersion=$zmuxVersion" `
+            -d "ProjectDir=$PWD" `
+            -d "SourceDir=$PWD\target\release" `
+            -o "dist/$msiName"
+
+          $msi = Get-Item "dist/$msiName"
+          if ($msi.Length -eq 0) {
+            throw 'WiX produced an empty MSI'
+          }
+          if ($isTagRelease) {
+            & $signTool.FullName sign `
+              /fd SHA256 `
+              /f $certificate `
+              /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              $msi.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Signing the MSI failed' }
+            & $signTool.FullName verify /pa /v $msi.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Verifying the MSI failed' }
+          }
+
+          $dumpbinCommand = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          $dumpbinPath = if ($dumpbinCommand) { $dumpbinCommand.Source } else { $null }
+          if (-not $dumpbinPath) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+              'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $vswhere) {
+              $dumpbinPath = & $vswhere `
+                -latest `
+                -products '*' `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' |
+                Select-Object -Last 1
+            }
+          }
+          if (-not $dumpbinPath) {
+            $dumpbinPath = Get-ChildItem `
+              "${env:ProgramFiles}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" `
+              -ErrorAction SilentlyContinue |
+              Sort-Object FullName |
+              Select-Object -Last 1 |
+              ForEach-Object FullName
+          }
+          if (-not $dumpbinPath) { throw 'Could not find dumpbin.exe' }
+          $dependencies = (& $dumpbinPath /DEPENDENTS target/release/zmux.exe | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw 'Inspecting zmux.exe dependencies failed' }
+          if ($dependencies -match '(?im)\b(?:vcruntime14|msvcp14|concrt14)[^\s]*\.dll\b') {
+            throw "The MSI executable still requires an unbundled VC++ runtime:`n$dependencies"
+          }
+
+          $decompiled = Join-Path $env:RUNNER_TEMP 'zmux-decompiled.wxs'
+          wix msi decompile $msi.FullName -o $decompiled
+          if (-not (Select-String -Path $decompiled -SimpleMatch 'io.github.thinkter.zmux')) {
+            throw 'The MSI does not contain zmux AppUserModelID metadata'
+          }
+
+          $install = Start-Process msiexec.exe `
+            -ArgumentList @('/i', $msi.FullName, '/qn', '/norestart') `
+            -Wait `
+            -PassThru
+          if ($install.ExitCode -ne 0) { throw "MSI install failed with $($install.ExitCode)" }
+          $installedExecutable = Join-Path $env:LOCALAPPDATA 'Programs\zmux\zmux.exe'
+          $installedLicense = Join-Path $env:LOCALAPPDATA 'Programs\zmux\LICENSE'
+          $installedShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\zmux.lnk'
+          foreach ($path in @($installedExecutable, $installedLicense, $installedShortcut)) {
+            if (-not (Test-Path $path)) { throw "MSI did not install expected path: $path" }
+          }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($installedShortcut)
+          if ($shortcut.TargetPath -ne $installedExecutable) {
+            throw "Start Menu shortcut targets $($shortcut.TargetPath), expected $installedExecutable"
+          }
+          $stdout = Join-Path $env:RUNNER_TEMP 'zmux-windows-smoke.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'zmux-windows-smoke.stderr.log'
+          $application = Start-Process $installedExecutable `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+          Start-Sleep -Seconds 5
+          if ($application.HasExited) {
+            Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+            throw "Packaged Windows application exited during launch smoke test with $($application.ExitCode)"
+          }
+          Stop-Process -Id $application.Id -Force
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}${{ (runner.os == 'macOS' || runner.os == 'Windows') && !startsWith(github.ref, 'refs/tags/v') && '-unsigned' || '' }}
           path: ${{ matrix.upload_path }}
           if-no-files-found: error

@@ -175,10 +175,11 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
-source = "git+https://github.com/zed-industries/alacritty?rev=fcf32feacb367b75ec84dd40f041e4fd411d3cc1#fcf32feacb367b75ec84dd40f041e4fd411d3cc1"
 dependencies = [
  "base64",
  "bitflags 2.13.0",
+ "getrandom 0.3.4",
+ "hmac",
  "home",
  "libc",
  "log",
@@ -190,6 +191,7 @@ dependencies = [
  "rustix 1.1.4",
  "rustix-openpty",
  "serde",
+ "sha2",
  "signal-hook",
  "unicode-width",
  "vte",
@@ -3354,6 +3356,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+
+[[package]]
 name = "futures-util"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3508,6 +3516,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "parking_lot",
+ "rand 0.9.4",
  "regex",
  "rope",
  "schemars",
@@ -5372,6 +5381,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
+name = "mac-notification-sys"
+version = "0.6.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd604973958ddcc11b561193c0fb96ba146506ef2f231ef2e7c35fd2cbc9beca"
+dependencies = [
+ "cc",
+ "log",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "mac-usernotifications"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08adbb1b9e11709f9ce628dd7471208e5dd3ad35a245dbc81e59a36dce3f3780"
+dependencies = [
+ "block2 0.6.2",
+ "futures-channel",
+ "futures-lite 2.6.1",
+ "futures-timer",
+ "log",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5954,6 +5995,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify-rust"
+version = "4.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5b4c1b4f2aa9f25f63a7a49d3dd0ed567b3670da15330a66b29434be899b891"
+dependencies = [
+ "futures-lite 2.6.1",
+ "log",
+ "mac-notification-sys",
+ "serde",
+ "tauri-winrt-notification",
+ "zbus",
+]
+
+[[package]]
 name = "notify-types"
 version = "2.1.0"
 source = "git+https://github.com/zed-industries/notify?rev=faecbc33db4f59313e5225ef766bfd9e54a54cfd#faecbc33db4f59313e5225ef766bfd9e54a54cfd"
@@ -6258,7 +6313,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.0",
+ "block2 0.6.2",
  "dispatch2",
+ "libc",
  "objc2 0.6.4",
 ]
 
@@ -6272,6 +6329,16 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
  "objc2-metal 0.2.2",
+]
+
+[[package]]
+name = "objc2-core-location"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca347214e24bc973fc025fd0d36ebb179ff30536ed1f80252706db19ee452009"
+dependencies = [
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -6309,6 +6376,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.0",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
 ]
@@ -6371,6 +6440,19 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-core-location",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -9362,6 +9444,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-winrt-notification"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed071c670382e85fc2f48ae706492d8c338f4f89bf72520d32f8abfe880aade"
+dependencies = [
+ "thiserror 2.0.18",
+ "windows 0.61.3",
+ "windows-version",
+]
+
+[[package]]
 name = "telemetry"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
@@ -9463,7 +9556,6 @@ dependencies = [
 [[package]]
 name = "terminal_view"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -10284,6 +10376,7 @@ dependencies = [
  "mach2 0.5.0",
  "nix 0.29.0",
  "percent-encoding",
+ "rand 0.9.4",
  "regex",
  "rust-embed",
  "schemars",
@@ -10297,6 +10390,7 @@ dependencies = [
  "tendril",
  "unicase",
  "url",
+ "util_macros",
  "walkdir",
  "which 6.0.3",
 ]
@@ -10421,8 +10515,6 @@ dependencies = [
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",
@@ -11700,6 +11792,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-version"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4060a1da109b9d0326b7262c8e12c84df67cc0dbc9e33cf49e01ccc2eb63631"
+dependencies = [
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "windows_aarch64_gnullvm"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12599,6 +12700,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 name = "zmux"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "async-channel 2.5.0",
  "client",
@@ -12607,17 +12709,23 @@ dependencies = [
  "db",
  "editor",
  "fs",
+ "futures-util",
+ "getrandom 0.3.4",
  "gpui",
  "gpui_platform",
+ "hmac",
  "http_client",
  "language",
+ "mac-usernotifications",
  "node_runtime",
+ "notify-rust",
  "project",
  "rust-embed",
  "serde",
  "serde_json",
  "session",
  "settings",
+ "sha2",
  "task",
  "terminal",
  "terminal_view",
@@ -12626,7 +12734,9 @@ dependencies = [
  "ui",
  "util",
  "uuid",
+ "windows 0.61.3",
  "workspace",
+ "zbus",
  "zed_actions",
 ]
 

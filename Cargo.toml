@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/alacritty_terminal", "vendor/terminal_view", "vendor/vte"]
 
 [workspace.dependencies]
 collections = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -33,7 +34,14 @@ async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd
 calloop = { git = "https://github.com/zed-industries/calloop", rev = "eb6b4fd17b9af5ecc226546bdd04185391b3e265" }
 notify = { git = "https://github.com/zed-industries/notify", rev = "faecbc33db4f59313e5225ef766bfd9e54a54cfd" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "faecbc33db4f59313e5225ef766bfd9e54a54cfd" }
+vte = { path = "vendor/vte" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+
+[patch."https://github.com/zed-industries/alacritty"]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+
+[patch."https://github.com/zed-industries/zed"]
+terminal_view = { path = "vendor/terminal_view" }
 
 [package]
 name = "zmux"
@@ -43,12 +51,15 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 anyhow = "1"
 async-channel = "2"
 collections = { workspace = true }
 editor = { workspace = true }
 gpui = { workspace = true }
+hmac = "0.12"
 settings = { workspace = true }
+sha2 = "0.10"
 task = { workspace = true }
 terminal = { workspace = true }
 terminal_view = { workspace = true }
@@ -62,15 +73,20 @@ client = { workspace = true }
 clock = { workspace = true }
 db = { workspace = true }
 fs = { workspace = true }
+getrandom = "0.3"
 http_client = { workspace = true }
 language = { workspace = true }
 node_runtime = { workspace = true }
 session = { workspace = true }
 ui = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = "4.18"
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
@@ -78,10 +94,23 @@ gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 gpui_platform = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+futures-util = "0.3"
+mac-usernotifications = "0.3.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+] }
+
 [dev-dependencies]
 async-channel = "2"
 gpui = { workspace = true, features = ["test-support"] }
-terminal = { workspace = true }
+terminal = { workspace = true, features = ["test-support"] }
 
 [profile.release]
 strip = "symbols"

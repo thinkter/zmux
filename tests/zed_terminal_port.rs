@@ -4,8 +4,11 @@
 //! private internals. These copies keep the same behavioral assertions, but
 //! adapt setup/sync code to use only public APIs available to zmux.
 
+mod support;
+
 use std::{collections::HashMap, process::ExitStatus, time::Duration};
 
+use alacritty_terminal::term::build_zmux_pty_response;
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
@@ -13,6 +16,7 @@ use gpui::{
     size,
 };
 use settings::Settings;
+use support::deterministic_output_shell;
 use task::Shell;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 use terminal::{
@@ -64,7 +68,7 @@ async fn test_basic_terminal(cx: &mut TestAppContext) {
     init_terminal_test_app(cx);
 
     let (terminal, completion_rx) =
-        build_command_terminal(cx, "sh", &["-lc", "printf hello"]).await;
+        build_command_terminal(cx, deterministic_output_shell("hello")).await;
     assert_content_eventually(&terminal, "hello", cx).await;
 
     // Inject additional output directly into the emulator (display-only path)
@@ -168,11 +172,81 @@ async fn test_display_only_write_output_ignores_osc52(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn authenticated_pty_response_preserves_scroll_selection_and_input_state(
+    cx: &mut TestAppContext,
+) {
+    let bounds = TerminalBounds::new(
+        px(18.0),
+        px(9.0),
+        Bounds::new(point(px(0.0), px(0.0)), size(px(720.0), px(180.0))),
+    );
+    let terminal = cx.new(|cx| {
+        TerminalBuilder::new_display_only_with_bounds(
+            CursorShape::default(),
+            AlternateScroll::On,
+            None,
+            0,
+            cx.background_executor(),
+            PathStyle::local(),
+            bounds,
+        )
+        .subscribe(cx)
+    });
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| cx.new(|_| TestView))
+            .unwrap()
+    });
+    let mut transcript = (0..100)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    transcript.push_str("selection sentinel\n");
+    terminal.update(cx, |terminal, cx| {
+        terminal.write_output(transcript.as_bytes(), cx);
+        terminal.scroll_to_top();
+        terminal.select_all();
+        terminal.take_input_log();
+    });
+    window
+        .update(cx, |_, window, cx| {
+            terminal.update(cx, |terminal, cx| terminal.sync(window, cx));
+        })
+        .unwrap();
+    assert!(terminal.read_with(cx, |terminal, _| terminal.scrolled_to_top()));
+
+    let response = build_zmux_pty_response(b"\x1b]99;i=query:p=?;capabilities\x1b\\")
+        .expect("bounded protocol response is valid");
+    terminal.update(cx, |terminal, cx| terminal.write_output(&response, cx));
+    cx.run_until_parked();
+    window
+        .update(cx, |_, window, cx| {
+            terminal.update(cx, |terminal, cx| terminal.sync(window, cx));
+        })
+        .unwrap();
+
+    terminal.update(cx, |terminal, _| {
+        assert!(terminal.take_input_log().is_empty());
+        assert!(terminal.scrolled_to_top());
+        terminal.copy(Some(true));
+    });
+    window
+        .update(cx, |_, window, cx| {
+            terminal.update(cx, |terminal, cx| terminal.sync(window, cx));
+        })
+        .unwrap();
+    let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert!(
+        copied.is_some_and(|text| text.contains("selection sentinel")),
+        "trusted backend responses must preserve the active selection"
+    );
+}
+
+#[gpui::test]
 async fn test_kill_active_task_on_completed_task_is_noop(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     init_terminal_test_app(cx);
 
-    let (terminal, completion_rx) = build_command_terminal(cx, "sh", &["-lc", "printf done"]).await;
+    let (terminal, completion_rx) =
+        build_command_terminal(cx, deterministic_output_shell("done")).await;
 
     let exit_status = completion_rx.recv().await.unwrap();
     assert_eq!(exit_status, Some(ExitStatus::default()));
@@ -248,19 +322,14 @@ fn init_terminal_test_app(cx: &mut TestAppContext) {
 
 async fn build_command_terminal(
     cx: &mut TestAppContext,
-    program: &str,
-    args: &[&str],
+    shell: Shell,
 ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
     let (completion_tx, completion_rx) = async_channel::unbounded();
     let builder_task = cx.update(|cx| {
         TerminalBuilder::new(
             None,
             None,
-            Shell::WithArguments {
-                program: program.to_string(),
-                args: args.iter().map(|arg| arg.to_string()).collect(),
-                title_override: None,
-            },
+            shell,
             HashMap::default(),
             CursorShape::default(),
             AlternateScroll::On,

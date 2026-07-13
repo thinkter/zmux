@@ -2,19 +2,17 @@ use gpui::{App, UpdateGlobal};
 use std::process::Command;
 
 fn find_first_installed_font(preferred: &[&str]) -> Option<String> {
-    if cfg!(target_os = "linux") {
-        if let Ok(output) = Command::new("fc-list")
+    if cfg!(target_os = "linux")
+        && let Ok(output) = Command::new("fc-list")
             .arg("-f")
             .arg("%{family}\n")
             .output()
-        {
-            if output.status.success() {
-                let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
-                for &name in preferred {
-                    if out.contains(&name.to_lowercase()) {
-                        return Some(name.to_string());
-                    }
-                }
+        && output.status.success()
+    {
+        let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        for &name in preferred {
+            if out.contains(&name.to_lowercase()) {
+                return Some(name.to_string());
             }
         }
     }

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="zmux"
+    Manufacturer="thinkter"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="4A3E442E-97F9-4A44-8125-BF9EB4170FED"
+    Scope="perUser">
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of zmux is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="zmux">
+          <Component Id="MainExecutable" Guid="500E1C04-CA58-4D10-885C-F6965DD98457">
+            <File Id="ZMuxExecutable" Source="$(var.SourceDir)\zmux.exe">
+              <Shortcut
+                Id="StartMenuShortcut"
+                Directory="ProgramMenuFolder"
+                Name="zmux"
+                Description="zmux terminal workspace"
+                WorkingDirectory="INSTALLFOLDER"
+                Advertise="no">
+                <ShortcutProperty
+                  Key="System.AppUserModel.ID"
+                  Value="io.github.thinkter.zmux" />
+              </Shortcut>
+            </File>
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\thinkter\zmux"
+              Name="Installed"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+          </Component>
+          <Component Id="License" Guid="A6E663CB-6ED3-49EA-A2FB-DC390D39B14C">
+            <File Id="LicenseFile" Source="$(var.ProjectDir)\LICENSE" Name="LICENSE" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="MainFeature" Title="zmux" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="License" />
+    </Feature>
+  </Package>
+</Wix>

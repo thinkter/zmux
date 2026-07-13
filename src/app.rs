@@ -1,28 +1,42 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
-    App, AppContext, Bounds, Context, Task, TaskExt, WeakEntity, Window, WindowBounds,
-    WindowHandle, WindowOptions, actions, px, size,
+    App, AppContext, Bounds, Context, InteractiveElement, Task, TaskExt, WeakEntity, Window,
+    WindowBounds, WindowHandle, WindowOptions, actions, px, size,
 };
 use gpui_platform::application;
 use http_client::{BlockedHttpClient, HttpClientWithUrl};
 use project::Project;
 use settings::Settings;
-use terminal_view::{default_working_directory, terminal_panel::TerminalPanel};
-use workspace::{AppState, MultiWorkspace, OpenMode, OpenResult, Workspace, WorkspaceStore};
+use terminal_view::{TerminalView, default_working_directory};
+use workspace::pane::{
+    SplitDown as PaneSplitDown, SplitHorizontal as PaneSplitHorizontal, SplitLeft as PaneSplitLeft,
+    SplitMode, SplitRight as PaneSplitRight, SplitUp as PaneSplitUp,
+    SplitVertical as PaneSplitVertical,
+};
+use workspace::pane_group::SplitDirection;
+use workspace::{
+    ActivatePane as WorkspaceActivatePane, AppState, MultiWorkspace,
+    NewCenterTerminal as WorkspaceNewCenterTerminal, NewTerminal as WorkspaceNewTerminal, OpenMode,
+    OpenResult, Workspace, WorkspaceStore,
+};
 
 use crate::cli_server::CliServer;
-use crate::env::terminal_env;
-use crate::keymap::{NewTerminal, Quit, configure_keybindings, configure_zoom_actions};
-use crate::notifications::{NotificationSource, NotificationStore};
+use crate::env::{terminal_env, terminal_env_with_notification_endpoint};
+use crate::keymap::{
+    NewTerminal, Quit, SplitTerminalDown, SplitTerminalRight, configure_keybindings,
+    configure_zoom_actions,
+};
+use crate::notification_runtime::NotificationRuntime;
+use crate::notifications::{NotificationTarget, WorkspaceId};
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{
-    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleWorkspacesPanel,
-    WorkspacesPanel,
+    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleNotificationCenter,
+    ToggleWorkspacesPanel, WorkspacesPanel,
 };
 
 actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
@@ -53,10 +67,6 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
         cx.set_global(db::AppDatabase::new());
     }
 
-    if !cx.has_global::<NotificationStore>() {
-        cx.set_global(NotificationStore::new());
-    }
-
     settings::init(cx);
     theme_settings::init(theme::LoadThemes::JustBase, cx);
     editor::init(cx);
@@ -68,6 +78,53 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
     terminal_view::init(cx);
+    terminal_view::set_terminal_creation_handler(
+        Arc::new(|project, working_directory, cx| {
+            project
+                .update(cx, |project, cx| {
+                    create_terminal_with_cli_route(project, working_directory, cx)
+                })
+                .unwrap_or_else(|error| Task::ready(Err(error)))
+        }),
+        cx,
+    );
+    NotificationRuntime::init(cx);
+
+    if !cx.has_global::<CliServer>() {
+        match CliServer::start() {
+            Ok(server) => {
+                let receiver = server.receiver();
+                cx.set_global(server);
+                cx.spawn(async move |cx| {
+                    while let Ok(received) = receiver.recv().await {
+                        let crate::cli_server::ReceivedCliNotification {
+                            route_id,
+                            notification,
+                            completion,
+                            ..
+                        } = received;
+                        if !completion.begin_recording() {
+                            // The server deadline won while this event waited
+                            // on GPUI. A timed-out CLI request must never be
+                            // published later and turn a retry into a duplicate.
+                            continue;
+                        }
+                        if cx.update(|cx| {
+                            NotificationRuntime::publish_cli(route_id, notification, cx).is_some()
+                        }) {
+                            completion.recorded();
+                        } else {
+                            completion.reject("unknown or stale terminal route");
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(error) => {
+                eprintln!("failed to start the zmux notification endpoint: {error:#}");
+            }
+        }
+    }
 
     configure_keybindings(cx);
     configure_zoom_actions(cx);
@@ -81,16 +138,37 @@ pub fn open_zmux_workspace(
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
+    let initial_dir = crate::env::current_working_directory()
+        .map(|path| vec![path])
+        .unwrap_or_default();
+    open_zmux_workspace_for_paths(requesting_window, initial_dir, cx)
+}
+
+/// Open a zmux window rooted at an explicit directory.
+///
+/// Besides being useful for embedders, this keeps tests independent from a
+/// persisted Zed workspace for the repository that happens to run them.
+pub fn open_zmux_workspace_at(
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    initial_dir: PathBuf,
+    cx: &mut App,
+) -> Task<anyhow::Result<OpenResult>> {
+    open_zmux_workspace_for_paths(requesting_window, vec![initial_dir], cx)
+}
+
+fn open_zmux_workspace_for_paths(
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    initial_dirs: Vec<PathBuf>,
+    cx: &mut App,
+) -> Task<anyhow::Result<OpenResult>> {
     let app_state = AppState::global(cx);
 
-    let initial_dir = crate::env::current_working_directory()
-        .map(|p| vec![p])
-        .unwrap_or_default();
-
     Workspace::new_local(
-        initial_dir,
+        initial_dirs,
         app_state,
         requesting_window,
+        // Route capabilities are per terminal and must never enter the
+        // project-wide environment inherited by every shell.
         Some(terminal_env()),
         Some(Box::new(|workspace, window, cx| {
             let welcome = cx.new(ZmuxWelcome::new);
@@ -106,11 +184,99 @@ pub fn open_zmux_workspace(
             let panel = cx.new(|cx| WorkspacesPanel::new(workspace.weak_handle(), window, cx));
             workspace.add_panel(panel.clone(), window, cx);
             workspace.open_panel::<WorkspacesPanel>(window, cx);
-            let cli_server = CliServer::start(workspace.weak_handle(), panel.downgrade(), cx);
-            cx.set_global(cli_server);
+            NotificationRuntime::attach_workspace(cx.entity(), panel.clone(), window, cx);
 
             workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
                 create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+            });
+            workspace.register_action(|workspace, _: &SplitTerminalRight, window, cx| {
+                create_split_terminal(workspace, SplitDirection::Right, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            workspace.register_action(|workspace, _: &SplitTerminalDown, window, cx| {
+                create_split_terminal(workspace, SplitDirection::Down, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            // Zed's built-in pane menus and user keymaps dispatch the generic
+            // pane split actions. Capture clone splits before Pane handles
+            // them so every newly spawned terminal receives a fresh route
+            // capability; empty/move splits keep their ordinary semantics.
+            let split_workspace = workspace.weak_handle();
+            workspace.register_action_renderer(move |div, _, _, _| {
+                let new_terminal = split_workspace.clone();
+                let new_center_terminal = split_workspace.clone();
+                let activate_pane = split_workspace.clone();
+                let split_right = split_workspace.clone();
+                let split_left = split_workspace.clone();
+                let split_up = split_workspace.clone();
+                let split_down = split_workspace.clone();
+                let split_horizontal = split_workspace.clone();
+                let split_vertical = split_workspace.clone();
+                div.capture_action(move |_: &WorkspaceNewTerminal, window, cx| {
+                    capture_workspace_terminal_creation(&new_terminal, true, window, cx);
+                })
+                .capture_action(move |_: &WorkspaceNewCenterTerminal, window, cx| {
+                    capture_workspace_terminal_creation(&new_center_terminal, false, window, cx);
+                })
+                .capture_action(move |action: &WorkspaceActivatePane, window, cx| {
+                    capture_missing_terminal_pane_activation(&activate_pane, action.0, window, cx);
+                })
+                .capture_action(move |action: &PaneSplitRight, window, cx| {
+                    capture_terminal_clone_split(
+                        &split_right,
+                        action.mode,
+                        SplitDirection::Right,
+                        window,
+                        cx,
+                    );
+                })
+                .capture_action(move |action: &PaneSplitLeft, window, cx| {
+                    capture_terminal_clone_split(
+                        &split_left,
+                        action.mode,
+                        SplitDirection::Left,
+                        window,
+                        cx,
+                    );
+                })
+                .capture_action(move |action: &PaneSplitUp, window, cx| {
+                    capture_terminal_clone_split(
+                        &split_up,
+                        action.mode,
+                        SplitDirection::Up,
+                        window,
+                        cx,
+                    );
+                })
+                .capture_action(move |action: &PaneSplitDown, window, cx| {
+                    capture_terminal_clone_split(
+                        &split_down,
+                        action.mode,
+                        SplitDirection::Down,
+                        window,
+                        cx,
+                    );
+                })
+                .capture_action(move |action: &PaneSplitHorizontal, window, cx| {
+                    let direction = SplitDirection::horizontal(cx);
+                    capture_terminal_clone_split(
+                        &split_horizontal,
+                        action.mode,
+                        direction,
+                        window,
+                        cx,
+                    );
+                })
+                .capture_action(move |action: &PaneSplitVertical, window, cx| {
+                    let direction = SplitDirection::vertical(cx);
+                    capture_terminal_clone_split(
+                        &split_vertical,
+                        action.mode,
+                        direction,
+                        window,
+                        cx,
+                    );
+                })
             });
             workspace.register_action(|workspace, _: &NewWorkspace, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
@@ -130,6 +296,12 @@ pub fn open_zmux_workspace(
             });
             workspace.register_action(|workspace, _: &ToggleWorkspacesPanel, window, cx| {
                 workspace.toggle_panel_focus::<WorkspacesPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &ToggleNotificationCenter, window, cx| {
+                workspace.open_panel::<WorkspacesPanel>(window, cx);
+                if let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.toggle_notification_center(cx));
+                }
             });
             workspace.register_action(|workspace, _: &ActivateNextWorkspace, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
@@ -159,7 +331,7 @@ pub fn open_zmux_workspace(
                         .ok();
                 });
             });
-            workspace.register_action(|workspace, _: &NotifyCurrentPane, _window, cx| {
+            workspace.register_action(|workspace, _: &NotifyCurrentPane, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
                 };
@@ -172,47 +344,23 @@ pub fn open_zmux_workspace(
                     return;
                 }
                 let item_id = item.item_id();
-                NotificationStore::global_mut(cx).add(
-                    item_id,
-                    Some(workspace_id),
-                    NotificationSource::Manual,
-                    "Manual notification".to_string(),
-                    "Test notification from current pane".to_string(),
+                NotificationRuntime::publish_manual_for_target(
+                    NotificationTarget {
+                        scope_id: panel.entity_id(),
+                        workspace_id,
+                        item_id,
+                    },
+                    "Manual notification",
+                    "Test notification from current pane",
+                    window,
+                    cx,
                 );
-                panel.update(cx, |_, cx| cx.notify());
             });
-            workspace.register_action(|workspace, _: &JumpToLatestNotification, window, cx| {
-                let Some(notification) = NotificationStore::global(cx).latest_unread().cloned()
-                else {
-                    return;
-                };
+            workspace.register_action(|workspace, _: &JumpToLatestNotification, _window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
                 };
-
-                if let Some(workspace_id) = notification.workspace_id {
-                    let is_active = panel.read(cx).active_workspace_id() == workspace_id;
-                    if !is_active {
-                        panel.update(cx, |panel, cx| {
-                            panel.activate_workspace(workspace_id, window, cx);
-                        });
-                    }
-                }
-
-                if let Some(pane) = workspace.pane_for_item_id(notification.item_id) {
-                    let index = pane
-                        .read(cx)
-                        .items()
-                        .position(|item| item.item_id() == notification.item_id);
-                    if let Some(index) = index {
-                        pane.update(cx, |pane, cx| {
-                            pane.activate_item(index, true, true, window, cx);
-                        });
-                    }
-                }
-
-                NotificationStore::global_mut(cx).mark_pane_read(notification.item_id);
-                panel.update(cx, |_, cx| cx.notify());
+                NotificationRuntime::jump_to_latest_unread(panel.entity_id(), cx);
             });
             create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
         })),
@@ -226,9 +374,303 @@ pub(crate) fn create_center_terminal(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
+    let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "the zmux workspace panel is unavailable"
+        )));
+    };
+    let (owning_workspace_id, activation_generation) = {
+        let panel = panel.read(cx);
+        (
+            panel.active_workspace_id(),
+            panel.active_workspace_generation(),
+        )
+    };
+    create_center_terminal_for_workspace(
+        workspace,
+        owning_workspace_id,
+        activation_generation,
+        window,
+        cx,
+    )
+}
+
+/// Start a center-terminal spawn owned by one logical workspace and its exact
+/// destination pane. `WorkspacesPanel` uses this explicit-ID entry point while
+/// it is changing `active`, when re-reading the panel would be re-entrant.
+pub(crate) fn create_center_terminal_for_workspace(
+    workspace: &mut Workspace,
+    owning_workspace_id: WorkspaceId,
+    activation_generation: u64,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
     let working_directory = default_working_directory(workspace, cx);
-    TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
-        project.create_terminal_shell(working_directory, cx)
+    let destination_pane = workspace.active_pane().clone();
+    let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "the zmux workspace panel is unavailable"
+        )));
+    };
+    let panel = panel.downgrade();
+    let project = workspace.project().downgrade();
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let terminal = project
+            .update(cx, |project, cx| {
+                create_terminal_with_cli_route(project, working_directory, cx)
+            })?
+            .await?;
+        let terminal_weak = terminal.downgrade();
+
+        workspace.update_in(cx, move |workspace, window, cx| {
+            // Shell creation and route staging are asynchronous. If a logical
+            // workspace switch parks/removes this exact pane first, inserting
+            // into `active_pane` would leak the terminal into the new layout.
+            // Refuse that stale completion; dropping the unmounted Terminal
+            // releases its staged route registration immediately.
+            let destination_is_current = panel.upgrade().is_some_and(|panel| {
+                let panel = panel.read(cx);
+                panel.active_workspace_id() == owning_workspace_id
+                    && panel.active_workspace_generation() == activation_generation
+            }) && workspace
+                .panes()
+                .iter()
+                .any(|pane| pane == &destination_pane);
+            if !destination_is_current {
+                return;
+            }
+
+            let terminal_view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal,
+                    workspace.weak_handle(),
+                    workspace.database_id(),
+                    workspace.project().downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item(
+                destination_pane,
+                Box::new(terminal_view),
+                None,
+                false,
+                true,
+                window,
+                cx,
+            );
+        })?;
+        Ok(terminal_weak)
+    })
+}
+
+fn create_split_terminal(
+    workspace: &mut Workspace,
+    direction: SplitDirection,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let working_directory = default_working_directory(workspace, cx);
+    let pane_to_split = workspace.active_pane().clone();
+    let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "the zmux workspace panel is unavailable"
+        )));
+    };
+    let (originating_workspace_id, activation_generation) = {
+        let panel = panel.read(cx);
+        (
+            panel.active_workspace_id(),
+            panel.active_workspace_generation(),
+        )
+    };
+    let panel = panel.downgrade();
+    let project = workspace.project().downgrade();
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let terminal = project
+            .update(cx, |project, cx| {
+                create_terminal_with_cli_route(project, working_directory, cx)
+            })?
+            .await?;
+
+        workspace.update_in(cx, move |workspace, window, cx| {
+            // Shell creation is asynchronous. A fast logical-workspace switch
+            // parks the originating pane; PaneGroup would otherwise fall back
+            // to splitting the first pane in whichever workspace is current.
+            // Cancel that stale completion and let dropping the terminal revoke
+            // its still-pending CLI registration.
+            let destination_is_current =
+                panel.upgrade().is_some_and(|panel| {
+                    let panel = panel.read(cx);
+                    panel.active_workspace_id() == originating_workspace_id
+                        && panel.active_workspace_generation() == activation_generation
+                }) && workspace.panes().iter().any(|pane| pane == &pane_to_split);
+            if !destination_is_current {
+                return;
+            }
+
+            let terminal_view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal,
+                    workspace.weak_handle(),
+                    workspace.database_id(),
+                    workspace.project().downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            let new_pane = workspace.split_pane(pane_to_split, direction, window, cx);
+            workspace.add_item(
+                new_pane,
+                Box::new(terminal_view),
+                None,
+                true,
+                true,
+                window,
+                cx,
+            );
+        })?;
+        Ok(())
+    })
+}
+
+/// Zed's pane-number action creates a clone when the requested index does not
+/// exist. Task-backed terminal cloning falls back to a plain shell and loses
+/// the per-terminal endpoint, so provision that implicit split ourselves.
+fn capture_missing_terminal_pane_activation(
+    workspace: &WeakEntity<Workspace>,
+    requested_index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let intercepted = workspace
+        .update(cx, |workspace, cx| {
+            if requested_index < workspace.panes().len()
+                || workspace
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .is_none_or(|item| item.act_as::<TerminalView>(cx).is_none())
+            {
+                return false;
+            }
+            create_split_terminal(workspace, SplitDirection::Right, window, cx)
+                .detach_and_log_err(cx);
+            true
+        })
+        .unwrap_or(false);
+    if intercepted {
+        cx.stop_propagation();
+    } else {
+        cx.propagate();
+    }
+}
+
+/// Zed registers generic terminal actions before zmux attaches its route
+/// provisioning. Capture the live center-terminal cases at the workspace root
+/// so command-palette and terminal context-menu creation cannot bypass the
+/// per-terminal CLI capability.
+fn capture_workspace_terminal_creation(
+    workspace: &WeakEntity<Workspace>,
+    require_active_terminal: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let intercepted = workspace
+        .update(cx, |workspace, cx| {
+            if require_active_terminal
+                && workspace
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .is_none_or(|item| item.act_as::<TerminalView>(cx).is_none())
+            {
+                return false;
+            }
+            create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+            true
+        })
+        .unwrap_or(false);
+    if intercepted {
+        cx.stop_propagation();
+    } else {
+        cx.propagate();
+    }
+}
+
+fn capture_terminal_clone_split(
+    workspace: &WeakEntity<Workspace>,
+    mode: SplitMode,
+    direction: SplitDirection,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if mode != SplitMode::ClonePane {
+        cx.propagate();
+        return;
+    }
+
+    let intercepted = workspace
+        .update(cx, |workspace, cx| {
+            let active_item_is_terminal = workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .is_some_and(|item| item.act_as::<TerminalView>(cx).is_some());
+            if !active_item_is_terminal {
+                return false;
+            }
+            create_split_terminal(workspace, direction, window, cx).detach_and_log_err(cx);
+            true
+        })
+        .unwrap_or(false);
+    if intercepted {
+        cx.stop_propagation();
+    } else {
+        cx.propagate();
+    }
+}
+
+/// Spawn one shell with one pending route capability. The registration is
+/// staged against the resulting Terminal entity before TerminalView can emit
+/// ItemAdded; NotificationRuntime binds and activates it only after the exact
+/// `(window, logical workspace, item)` target exists.
+fn create_terminal_with_cli_route(
+    project: &mut Project,
+    working_directory: Option<PathBuf>,
+    cx: &mut Context<Project>,
+) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>> {
+    let Some(server) = cx.try_global::<CliServer>() else {
+        return project.create_terminal_shell(working_directory, cx);
+    };
+    let registration = match server.register_route() {
+        Ok(registration) => Arc::new(registration),
+        Err(error) => return Task::ready(Err(error)),
+    };
+    let endpoint = registration.endpoint_env();
+    let route_id = registration.route_id();
+    let spawn = task::SpawnInTerminal {
+        id: task::TaskId(format!("zmux-shell-{route_id}")),
+        full_label: "Terminal".to_owned(),
+        label: "Terminal".to_owned(),
+        command_label: "Terminal".to_owned(),
+        cwd: working_directory,
+        env: terminal_env_with_notification_endpoint(Some(&endpoint)),
+        use_new_terminal: true,
+        allow_concurrent_runs: true,
+        shell: task::Shell::System,
+        ..Default::default()
+    };
+    let terminal_task = project.create_terminal_task(spawn, cx);
+
+    cx.spawn(async move |_project, cx| {
+        let terminal = terminal_task.await?;
+        cx.update(|cx| {
+            NotificationRuntime::stage_cli_route(&terminal, registration, cx);
+        });
+        Ok(terminal)
     })
 }
 
