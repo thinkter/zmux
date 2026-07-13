@@ -378,6 +378,21 @@ impl WorkspacesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A shell can become ready while its caller is still updating the
+        // Workspace (notably during Workspace::new_local). Wait until the
+        // current effect stack has unwound before resolving the target pane.
+        cx.defer_in(window, move |this, window, cx| {
+            this.attach_terminal_after_update(target, item, window, cx);
+        });
+    }
+
+    fn attach_terminal_after_update(
+        &mut self,
+        target: TerminalTarget,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if target.workspace_id == self.active {
             if let Some(pane_id) = self.surface_ids.iter().find_map(|(pane_id, surface_id)| {
                 (*surface_id == target.surface_id).then_some(*pane_id)
