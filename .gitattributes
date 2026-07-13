@@ -1,0 +1,3 @@
+# Keep Rust sources platform-independent. Git for Windows otherwise checks
+# these out with CRLF, which conflicts with the vendored VTE rustfmt policy.
+*.rs text eol=lf
