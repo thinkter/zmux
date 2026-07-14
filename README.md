@@ -89,3 +89,7 @@ Build notes:
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.
 - Release CI pins Ubuntu 24.04, macOS 15 (with a macOS 12 deployment target), and Windows 2025; the Linux `.deb` therefore targets the Ubuntu 24.04/glibc compatibility baseline.
 - After `Cargo.lock` is committed, use `cargo build --locked` and `cargo test --locked` to reproduce the pinned dependency set.
+
+## Roadmap
+
+- [ ] [Open native agent session forks in a new zmux terminal](docs/agent-session-forking.md), starting with stock Codex and Claude Code CLIs.
