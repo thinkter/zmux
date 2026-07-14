@@ -2009,6 +2009,9 @@ async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppCon
         assert_bound(cx, "ctrl-insert", &terminal::Copy);
         assert_bound(cx, "ctrl-shift-v", &terminal::Paste);
         assert_bound(cx, "shift-insert", &terminal::Paste);
+        #[cfg(target_os = "windows")]
+        assert_bound(cx, "ctrl-c", &terminal::Copy);
+        #[cfg(not(target_os = "windows"))]
         assert_not_bound(cx, "ctrl-c", &terminal::Copy);
 
         assert_bound(
