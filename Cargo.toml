@@ -3,8 +3,17 @@ resolver = "2"
 exclude = ["vendor/alacritty_terminal", "vendor/terminal_view", "vendor/vte"]
 
 [workspace.dependencies]
+agent_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+askpass = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+buffer_diff = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+call = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 collections = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+component = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 editor = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+file_icons = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+fuzzy = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+fuzzy_nucleo = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+git = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -24,11 +33,53 @@ db = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5
 fs = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 http_client = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 language = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+language_model = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+markdown = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+menu = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+multi_buffer = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 node_runtime = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+notifications = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+panel = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 paths = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+picker = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+pretty_assertions = { version = "1.3.0", features = ["unstable"] }
+prompt_store = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+proto = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+release_channel = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+remote = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+remote_connection = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+search = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 session = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+ui_input = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 uuid = "1"
+watch = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+windows = "0.61"
+ztracing = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+
+anyhow = "1.0.86"
+async-channel = "2.5.0"
+ctor = "1.0.6"
+futures = "0.3.32"
+futures-lite = "1.13"
+indoc = "2"
+itertools = "0.14.0"
+linkify = "0.10.0"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+rand = "0.9"
+schemars = { version = "1.0", features = ["indexmap2"] }
+serde = { version = "1.0.221", features = ["derive", "rc"] }
+serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+strum = { version = "0.27.2", features = ["derive"] }
+sysinfo = "0.37.0"
+telemetry = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+time = { version = "0.3", features = ["macros", "parsing", "serde", "serde-well-known", "formatting", "local-offset"] }
+time_format = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+tracing = "0.1.40"
+unindent = "0.2.0"
+zeroize = "1.8"
+zlog = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 
 [patch.crates-io]
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
@@ -77,6 +128,8 @@ clock = { workspace = true }
 db = { workspace = true }
 fs = { workspace = true }
 getrandom = "0.3"
+git = { workspace = true }
+git_ui = { path = "vendor/git_ui", features = ["zmux-core"] }
 http_client = { workspace = true }
 language = { workspace = true }
 node_runtime = { workspace = true }

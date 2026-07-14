@@ -59,6 +59,17 @@ impl SessionSnapshot {
             {
                 bail!("workspace name exceeds {MAX_NAME_BYTES} bytes");
             }
+            for path in [
+                workspace.default_directory.as_ref(),
+                workspace.selected_git_root.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if path.as_os_str().len() > MAX_PATH_BYTES {
+                    bail!("workspace path exceeds {MAX_PATH_BYTES} bytes");
+                }
+            }
             workspace.layout.validate()?;
             max_id = max_id.max(workspace.id);
         }
@@ -77,6 +88,10 @@ impl SessionSnapshot {
 pub struct WorkspaceSnapshot {
     pub id: WorkspaceId,
     pub manual_name: Option<String>,
+    #[serde(default)]
+    pub default_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub selected_git_root: Option<PathBuf>,
     pub layout: LayoutSnapshot,
 }
 
@@ -300,6 +315,8 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: 1,
                 manual_name: Some("API".into()),
+                default_directory: Some("/tmp/api".into()),
+                selected_git_root: Some("/tmp/api".into()),
                 layout: LayoutSnapshot {
                     root: LayoutNodeSnapshot::Split {
                         axis: LayoutAxis::Horizontal,

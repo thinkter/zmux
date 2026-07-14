@@ -38,7 +38,8 @@ use crate::welcome::ZmuxWelcome;
 use crate::workspace_switcher::{SwitchDirection, WorkspaceSwitcher};
 use crate::workspaces::{
     ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, RestoredTerminal,
-    ToggleNotificationCenter, ToggleWorkspacesPanel, WorkspacesPanel, restore_startup_layout,
+    ToggleNotificationCenter, ToggleWorkspacesPanel, WorkspacesPanel, install_git_repository_scope,
+    register_git_repository_scope, restore_startup_layout,
 };
 
 actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
@@ -84,6 +85,8 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     Project::init(&app_state.client, cx);
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
+    git_ui::init(cx);
+    install_git_repository_scope(cx);
     tab_switcher::init(cx);
     terminal_view::init(cx);
     terminal_view::set_terminal_creation_handler(
@@ -242,7 +245,17 @@ fn open_zmux_workspace_for_paths(
                 WorkspacesPanel::new(workspace.weak_handle(), session_enabled, window, cx)
             });
             workspace.add_panel(panel.clone(), window, cx);
+            register_git_repository_scope(workspace.project(), &panel, cx);
             workspace.open_panel::<WorkspacesPanel>(window, cx);
+            cx.spawn_in(window, async move |workspace_handle, cx| {
+                let git_panel =
+                    git_ui::git_panel::GitPanel::load(workspace_handle.clone(), cx.clone()).await?;
+                workspace_handle.update_in(cx, |workspace, window, cx| {
+                    workspace.add_panel(git_panel, window, cx);
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
             NotificationRuntime::attach_workspace(cx.entity(), panel.clone(), window, cx);
 
             workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
@@ -362,7 +375,7 @@ fn open_zmux_workspace_for_paths(
                 cx.defer(move |cx| {
                     window_handle
                         .update(cx, |_, window, cx| {
-                            panel.update(cx, |panel, cx| panel.create_workspace(window, cx));
+                            panel.update(cx, |panel, cx| panel.prompt_for_workspace(window, cx));
                         })
                         .ok();
                 });
@@ -463,6 +476,7 @@ pub(crate) fn create_center_terminal(
         workspace,
         owning_workspace_id,
         activation_generation,
+        panel.read(cx).active_default_directory(),
         window,
         cx,
     )
@@ -475,16 +489,19 @@ pub(crate) fn create_center_terminal_for_workspace(
     workspace: &mut Workspace,
     owning_workspace_id: WorkspaceId,
     activation_generation: u64,
+    default_directory: Option<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
-    let working_directory = default_working_directory(workspace, cx);
     let destination_pane = workspace.active_pane().clone();
     let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
         return Task::ready(Err(anyhow::anyhow!(
             "the zmux workspace panel is unavailable"
         )));
     };
+    let working_directory = source_terminal_working_directory(workspace, cx)
+        .or(default_directory)
+        .or_else(|| default_working_directory(workspace, cx));
     let panel = panel.downgrade();
     let project = workspace.project().downgrade();
 
@@ -616,7 +633,6 @@ fn create_split_terminal(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
-    let working_directory = default_working_directory(workspace, cx);
     let pane_to_split = workspace.active_pane().clone();
     let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
         return Task::ready(Err(anyhow::anyhow!(
@@ -630,6 +646,9 @@ fn create_split_terminal(
             panel.active_workspace_generation(),
         )
     };
+    let working_directory = source_terminal_working_directory(workspace, cx)
+        .or_else(|| panel.read(cx).active_default_directory())
+        .or_else(|| default_working_directory(workspace, cx));
     let panel = panel.downgrade();
     let project = workspace.project().downgrade();
 
@@ -679,6 +698,16 @@ fn create_split_terminal(
         })?;
         Ok(())
     })
+}
+
+/// New tabs and splits follow the terminal the user is acting on. This avoids
+/// surprising jumps back to the window's original project root after `cd`.
+fn source_terminal_working_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    let item = workspace.active_pane().read(cx).active_item()?;
+    let terminal_view = item.act_as::<TerminalView>(cx)?;
+    let terminal = terminal_view.read(cx).terminal().clone();
+    let working_directory = terminal.read(cx).working_directory();
+    working_directory
 }
 
 /// Zed's pane-number action creates a clone when the requested index does not

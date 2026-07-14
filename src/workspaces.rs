@@ -9,8 +9,9 @@
 //! stays snappy regardless of how many terminals are open.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
@@ -82,6 +83,8 @@ struct WorkspaceEntry {
     manual_name: Option<String>,
     automatic_name: String,
     context: WorkspaceContext,
+    default_directory: Option<PathBuf>,
+    selected_git_root: Option<PathBuf>,
     git: MetadataState<GitMetadata>,
     metadata_root: Option<PathBuf>,
     metadata_refreshed_at: Option<Instant>,
@@ -120,6 +123,7 @@ impl WorkspaceEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WorkspaceContext {
     working_directories: Vec<PathBuf>,
+    git_roots: Vec<PathBuf>,
     git_root: Option<PathBuf>,
     foreground_processes: Vec<String>,
     shell_count: usize,
@@ -191,6 +195,108 @@ pub struct WorkspacesPanel {
     session_store: SessionStore,
     owns_session: bool,
     last_session_snapshot: Option<SessionSnapshot>,
+    attached_worktrees: HashMap<PathBuf, Entity<project::Worktree>>,
+    pending_worktrees: BTreeSet<PathBuf>,
+}
+
+/// Bridges the vendored Zed Git panel to zmux's logical workspaces.
+#[derive(Default)]
+pub struct ZmuxRepositoryScope {
+    panels: Mutex<HashMap<EntityId, WeakEntity<WorkspacesPanel>>>,
+}
+
+struct ZmuxRepositoryScopeGlobal(Arc<ZmuxRepositoryScope>);
+impl Global for ZmuxRepositoryScopeGlobal {}
+
+pub fn install_git_repository_scope(cx: &mut App) {
+    let scope = Arc::new(ZmuxRepositoryScope::default());
+    git_ui::set_repository_scope(scope.clone(), cx);
+    cx.set_global(ZmuxRepositoryScopeGlobal(scope));
+}
+
+pub fn register_git_repository_scope(
+    project: &Entity<project::Project>,
+    panel: &Entity<WorkspacesPanel>,
+    cx: &App,
+) {
+    cx.global::<ZmuxRepositoryScopeGlobal>()
+        .0
+        .register(project, panel);
+}
+
+impl ZmuxRepositoryScope {
+    pub fn register(&self, project: &Entity<project::Project>, panel: &Entity<WorkspacesPanel>) {
+        self.panels
+            .lock()
+            .expect("repository scope registry poisoned")
+            .insert(project.entity_id(), panel.downgrade());
+    }
+
+    fn panel_for(&self, project: &Entity<project::Project>) -> Option<WeakEntity<WorkspacesPanel>> {
+        self.panels
+            .lock()
+            .expect("repository scope registry poisoned")
+            .get(&project.entity_id())
+            .cloned()
+    }
+}
+
+impl git_ui::RepositoryScope for ZmuxRepositoryScope {
+    fn repositories(
+        &self,
+        project: &Entity<project::Project>,
+        cx: &App,
+    ) -> Vec<Entity<project::git_store::Repository>> {
+        let roots = self
+            .panel_for(project)
+            .and_then(|panel| panel.upgrade())
+            .map(|panel| panel.read(cx).active_git_roots().to_vec())
+            .unwrap_or_default();
+        project
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repositories()
+            .values()
+            .filter(|repo| {
+                roots
+                    .iter()
+                    .any(|root| repo.read(cx).snapshot().work_directory_abs_path.as_ref() == root)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn display_name(
+        &self,
+        repository: &Entity<project::git_store::Repository>,
+        cx: &App,
+    ) -> SharedString {
+        repository
+            .read(cx)
+            .snapshot()
+            .work_directory_abs_path
+            .display()
+            .to_string()
+            .into()
+    }
+
+    fn select(
+        &self,
+        project: &Entity<project::Project>,
+        repository: Entity<project::git_store::Repository>,
+        cx: &mut App,
+    ) {
+        let root = repository
+            .read(cx)
+            .snapshot()
+            .work_directory_abs_path
+            .to_path_buf();
+        if let Some(panel) = self.panel_for(project).and_then(|panel| panel.upgrade()) {
+            panel.update(cx, |panel, cx| panel.select_git_root(root.clone(), cx));
+        }
+        repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+    }
 }
 
 impl WorkspacesPanel {
@@ -230,6 +336,8 @@ impl WorkspacesPanel {
                         manual_name: workspace.manual_name.clone(),
                         automatic_name: "New workspace".to_string(),
                         context: WorkspaceContext::default(),
+                        default_directory: workspace.default_directory.clone(),
+                        selected_git_root: workspace.selected_git_root.clone(),
                         git: MetadataState::NotRequested,
                         metadata_root: None,
                         metadata_refreshed_at: None,
@@ -247,6 +355,8 @@ impl WorkspacesPanel {
                     manual_name: None,
                     automatic_name: "New workspace".to_string(),
                     context: WorkspaceContext::default(),
+                    default_directory: None,
+                    selected_git_root: None,
                     git: MetadataState::NotRequested,
                     metadata_root: None,
                     metadata_refreshed_at: None,
@@ -292,6 +402,8 @@ impl WorkspacesPanel {
             session_store,
             owns_session,
             last_session_snapshot: restored,
+            attached_worktrees: HashMap::new(),
+            pending_worktrees: BTreeSet::new(),
         }
     }
 
@@ -301,6 +413,39 @@ impl WorkspacesPanel {
 
     pub(crate) fn active_workspace_generation(&self) -> u64 {
         self.activation_generation
+    }
+
+    fn active_git_roots(&self) -> &[PathBuf] {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == self.active)
+            .map(|entry| entry.context.git_roots.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn select_git_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == self.active)
+            && entry.context.git_roots.contains(&root)
+        {
+            entry.selected_git_root = Some(root);
+            self.request_metadata_refreshes(cx);
+            self.persist_session(cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn active_default_directory(&self) -> Option<PathBuf> {
+        self.default_directory_for(self.active)
+    }
+
+    pub(crate) fn default_directory_for(&self, id: WorkspaceId) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.default_directory.clone())
     }
 
     pub(crate) fn take_initial_restore(&mut self) -> Option<LayoutSnapshot> {
@@ -357,6 +502,33 @@ impl WorkspacesPanel {
 
     /// Create a fresh, empty workspace and switch to it.
     pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_workspace_at(None, window, cx);
+    }
+
+    pub fn prompt_for_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a folder for the new workspace".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let directory = paths.await.ok().and_then(Result::ok).flatten()?.pop()?;
+            this.update_in(cx, |this, window, cx| {
+                this.create_workspace_at(Some(directory), window, cx);
+            })
+            .ok();
+            Some(())
+        })
+        .detach();
+    }
+
+    fn create_workspace_at(
+        &mut self,
+        default_directory: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -367,6 +539,8 @@ impl WorkspacesPanel {
             manual_name: None,
             automatic_name: "New workspace".to_string(),
             context: WorkspaceContext::default(),
+            default_directory,
+            selected_git_root: None,
             git: MetadataState::NotRequested,
             metadata_root: None,
             metadata_refreshed_at: None,
@@ -418,6 +592,7 @@ impl WorkspacesPanel {
             .iter_mut()
             .find(|entry| entry.id == id)
             .and_then(|entry| entry.restore.take());
+        let target_default_directory = self.default_directory_for(id);
 
         let (captured, restored_terminals) = workspace.update(cx, |workspace, cx| {
             let captured = capture_layout(workspace, cx);
@@ -451,6 +626,7 @@ impl WorkspacesPanel {
                             workspace,
                             id,
                             target_generation,
+                            target_default_directory.clone(),
                             window,
                             cx,
                         )
@@ -485,6 +661,7 @@ impl WorkspacesPanel {
                         workspace,
                         id,
                         target_generation,
+                        target_default_directory.clone(),
                         window,
                         cx,
                     )
@@ -624,13 +801,83 @@ impl WorkspacesPanel {
         if changed {
             cx.notify();
         }
+        self.reconcile_git_context(cx);
+    }
+
+    fn reconcile_git_context(&mut self, cx: &mut Context<Self>) {
+        for entry in &mut self.entries {
+            if entry
+                .selected_git_root
+                .as_ref()
+                .is_none_or(|root| !entry.context.git_roots.contains(root))
+            {
+                entry.selected_git_root = entry.context.git_roots.first().cloned();
+            }
+        }
+
+        let roots = self
+            .entries
+            .iter()
+            .flat_map(|entry| entry.context.git_roots.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        for root in roots {
+            if self.attached_worktrees.contains_key(&root)
+                || !self.pending_worktrees.insert(root.clone())
+            {
+                continue;
+            }
+            let task = project.update(cx, |project, cx| {
+                project.find_or_create_worktree(&root, false, cx)
+            });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    this.pending_worktrees.remove(&root);
+                    if let Ok((worktree, _)) = result {
+                        this.attached_worktrees.insert(root.clone(), worktree);
+                        this.activate_selected_repository(cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        self.activate_selected_repository(cx);
+    }
+
+    fn activate_selected_repository(&self, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.active)
+            .and_then(|entry| entry.selected_git_root.as_ref())
+        else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+        let repository = git_store
+            .read(cx)
+            .repositories()
+            .values()
+            .find(|repo| repo.read(cx).snapshot().work_directory_abs_path.as_ref() == root)
+            .cloned();
+        if let Some(repository) = repository {
+            repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        }
     }
 
     fn request_metadata_refreshes(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let mut requests = Vec::new();
         for entry in &mut self.entries {
-            let root = entry.context.git_root.clone();
+            let root = entry.selected_git_root.clone();
             if entry.metadata_root != root {
                 entry.metadata_root = root.clone();
                 entry.metadata_refreshed_at = None;
@@ -701,6 +948,8 @@ impl WorkspacesPanel {
             workspaces.push(WorkspaceSnapshot {
                 id: entry.id,
                 manual_name: entry.manual_name.clone(),
+                default_directory: entry.default_directory.clone(),
+                selected_git_root: entry.selected_git_root.clone(),
                 layout,
             });
         }
@@ -1251,7 +1500,7 @@ impl Render for WorkspacesPanel {
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("New Workspace"))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_workspace(window, cx);
+                                        this.prompt_for_workspace(window, cx);
                                     })),
                             ),
                     ),
@@ -1486,16 +1735,15 @@ fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext
         .collect::<BTreeSet<_>>();
     context.foreground_processes = processes.into_iter().take(8).collect();
 
-    let git_roots = context
+    context.git_roots = context
         .working_directories
         .iter()
-        .map(|directory| nearest_git_root(directory))
-        .collect::<Option<Vec<_>>>();
-    if let Some(git_roots) = git_roots {
-        let git_roots = git_roots.into_iter().collect::<BTreeSet<_>>();
-        if git_roots.len() == 1 {
-            context.git_root = git_roots.into_iter().next();
-        }
+        .filter_map(|directory| nearest_git_root(directory))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if context.git_roots.len() == 1 {
+        context.git_root = context.git_roots.first().cloned();
     }
     context
 }
@@ -1504,7 +1752,7 @@ fn nearest_git_root(directory: &Path) -> Option<PathBuf> {
     directory
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())
-        .map(Path::to_path_buf)
+        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
 }
 
 fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -2205,6 +2453,7 @@ mod tests {
                 PathBuf::from("/tmp/zmux/src"),
                 PathBuf::from("/tmp/zmux/tests"),
             ],
+            git_roots: vec![PathBuf::from("/tmp/zmux")],
             git_root: Some(PathBuf::from("/tmp/zmux")),
             foreground_processes: vec!["cargo".into()],
             shell_count: 2,
@@ -2243,6 +2492,51 @@ mod tests {
         assert!(is_shell_process("/usr/bin/bash"));
         assert!(is_shell_process("pwsh"));
         assert!(!is_shell_process("cargo"));
+    }
+
+    #[test]
+    fn git_context_keeps_independent_roots_and_ignores_non_repo_terminals() {
+        let base = std::env::temp_dir().join(format!(
+            "zmux-git-context-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let repo_a = base.join("a");
+        let repo_b = base.join("b");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_a.join("src")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        std::fs::create_dir_all(outside.clone()).unwrap();
+
+        let context = finalize_workspace_context(WorkspaceContext {
+            working_directories: vec![repo_a.join("src"), outside, repo_b.clone()],
+            shell_count: 3,
+            ..WorkspaceContext::default()
+        });
+
+        assert_eq!(context.git_roots, vec![repo_a, repo_b]);
+        assert_eq!(context.git_root, None);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn git_context_collapses_multiple_terminals_in_one_repository() {
+        let base =
+            std::env::temp_dir().join(format!("zmux-single-git-context-{}", std::process::id()));
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("api")).unwrap();
+        std::fs::create_dir_all(base.join("web")).unwrap();
+
+        let context = finalize_workspace_context(WorkspaceContext {
+            working_directories: vec![base.join("api"), base.join("web")],
+            shell_count: 2,
+            ..WorkspaceContext::default()
+        });
+
+        assert_eq!(context.git_roots, vec![base.clone()]);
+        assert_eq!(context.git_root, Some(base.clone()));
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     fn leaf(x: f32, y: f32, w: f32, h: f32) -> (Bounds<Pixels>, StoredLayout) {
