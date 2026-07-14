@@ -27,11 +27,12 @@ use workspace::{
 use crate::cli_server::CliServer;
 use crate::env::{terminal_env, terminal_env_with_notification_endpoint};
 use crate::keymap::{
-    NewTerminal, Quit, SplitTerminalDown, SplitTerminalRight, configure_keybindings,
+    NewTerminal, OpenSettings, Quit, SplitTerminalDown, SplitTerminalRight, configure_keybindings,
     configure_zoom_actions,
 };
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{NotificationTarget, WorkspaceId};
+use crate::settings_page::SettingsPage;
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{
@@ -221,6 +222,20 @@ fn open_zmux_workspace_for_paths(
             workspace.open_panel::<WorkspacesPanel>(window, cx);
             NotificationRuntime::attach_workspace(cx.entity(), panel.clone(), window, cx);
 
+            workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
+                let pane = workspace.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    let existing = pane.items_of_type::<SettingsPage>().next();
+                    if let Some(existing) = existing
+                        && let Some(index) = pane.index_for_item(&existing)
+                    {
+                        pane.activate_item(index, true, true, window, cx);
+                        return;
+                    }
+                    let page = cx.new(SettingsPage::new);
+                    pane.add_item(Box::new(page), true, true, None, window, cx);
+                });
+            });
             workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
                 create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
             });

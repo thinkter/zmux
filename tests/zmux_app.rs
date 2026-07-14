@@ -2076,3 +2076,41 @@ async fn ui_font_size_setting_scales_the_ui_rem_size(cx: &mut TestAppContext) {
         assert_eq!(TerminalSettings::get_global(cx).font_size, Some(px(21.0)));
     });
 }
+
+#[gpui::test]
+async fn open_settings_opens_a_single_reused_settings_tab(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
+    });
+
+    let opened = open_task
+        .await
+        .expect("workspace shell should open without panicking");
+    cx.run_until_parked();
+
+    for _ in 0..2 {
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(zmux::OpenSettings.boxed_clone(), cx);
+            })
+            .expect("window should still be open");
+        cx.run_until_parked();
+    }
+
+    let (settings_tab_count, active_is_settings) =
+        opened.workspace.read_with(cx, |workspace, cx| {
+            let pane = workspace.active_pane().read(cx);
+            (
+                pane.items_of_type::<zmux::SettingsPage>().count(),
+                pane.active_item()
+                    .and_then(|item| item.downcast::<zmux::SettingsPage>())
+                    .is_some(),
+            )
+        });
+    assert_eq!(settings_tab_count, 1);
+    assert!(active_is_settings, "settings tab should be the active item");
+}

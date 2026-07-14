@@ -83,6 +83,8 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-+", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("cmd--", DecreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("cmd-0", ResetBufferFontSize { persist: false }, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
 }
