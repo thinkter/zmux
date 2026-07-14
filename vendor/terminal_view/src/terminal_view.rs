@@ -47,7 +47,7 @@ use ui::{
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
-use util::ResultExt;
+use util::{ResultExt, paths::PathExt};
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
@@ -1603,6 +1603,12 @@ impl Item for TerminalView {
         let terminal = self.terminal().read(cx);
         let title = self.tab_title(terminal, true);
         let foreground_process_icon = self.foreground_process_icon(terminal);
+        let is_tab_switcher = params.max_title_len == Some(usize::MAX);
+        let working_directory = is_tab_switcher
+            .then(|| terminal.working_directory())
+            .flatten()
+            .map(|directory| directory.compact().to_string_lossy().into_owned())
+            .filter(|directory| !directory.trim().is_empty());
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task)
@@ -1665,6 +1671,9 @@ impl Item for TerminalView {
         h_flex()
             .gap_1()
             .group("term-tab-icon")
+            .when(is_tab_switcher, |this| {
+                this.w_full().min_w_0().overflow_hidden()
+            })
             .when(!params.selected, |this| {
                 this.track_focus(&self.focus_handle)
             })
@@ -1695,9 +1704,11 @@ impl Item for TerminalView {
             .child(
                 div()
                     .relative()
+                    .when(is_tab_switcher, |this| this.flex_1().min_w_0())
                     .child(
                         Label::new(title)
                             .color(params.text_color())
+                            .when(is_tab_switcher, |this| this.truncate_middle().flex_1())
                             .when(self.is_renaming(), |this| this.alpha(0.)),
                     )
                     .when_some(self.rename_editor.clone(), |this, editor| {
@@ -1727,6 +1738,15 @@ impl Item for TerminalView {
                         )
                     }),
             )
+            .when_some(working_directory, |this, working_directory| {
+                this.child(
+                    Label::new(working_directory)
+                        .size(LabelSize::XSmall)
+                        .truncate_start()
+                        .flex_shrink()
+                        .color(Color::Muted),
+                )
+            })
             .into_any()
     }
 
