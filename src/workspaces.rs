@@ -49,6 +49,7 @@ actions!(
 
 const PANEL_WIDTH_REMS: f32 = 15.0;
 const PANEL_MIN_WIDTH_REMS: f32 = 12.0;
+const WORKSPACES_FONT_FAMILY: &str = "Lilex";
 const NOTIFICATION_DRAWER_HEIGHT_REMS: f32 = 17.5;
 const MAX_WORKSPACE_NAME_CHARS: usize = 64;
 const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -158,6 +159,7 @@ struct DraggedWorkspace {
 impl Render for DraggedWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .font_family(WORKSPACES_FONT_FAMILY)
             .px_2()
             .py_1()
             .gap_2()
@@ -1214,6 +1216,7 @@ impl Render for WorkspacesPanel {
 
         v_flex()
             .key_context("WorkspacesPanel")
+            .font_family(WORKSPACES_FONT_FAMILY)
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().panel_background)

@@ -41,5 +41,7 @@ pub use osc::{
     bridged_osc_payload, parse_osc_payload, try_parse_osc_payload,
 };
 pub use settings_page::SettingsPage;
-pub use theme::{DEFAULT_MONO_FONT, configure_terminal_fonts, default_settings_json};
+pub use theme::{
+    DEFAULT_MONO_FONT, DEFAULT_THEME, configure_terminal_fonts, default_settings_json,
+};
 pub use workspaces::{NewWorkspace, ToggleWorkspacesPanel, WorkspacesPanel};

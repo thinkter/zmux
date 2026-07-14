@@ -9,6 +9,7 @@ use support::deterministic_output_shell;
 use terminal::terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use terminal::{TerminalBounds, TerminalBuilder};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use theme::ActiveTheme;
 use util::paths::PathStyle;
 use workspace::dock::Panel;
 use workspace::item::Item as _;
@@ -2243,6 +2244,16 @@ fn embedded_assets_include_bundled_fonts() {
             .any(|path| path.ends_with("IBMPlexSans-Regular.ttf"))
     );
 
+    let themes = zmux::Assets
+        .list("themes")
+        .expect("embedded themes are listable");
+    assert!(
+        themes
+            .iter()
+            .any(|path| path.ends_with("vercel-theme.json")),
+        "{themes:?}"
+    );
+
     let icons = zmux::Assets
         .list("icons")
         .expect("embedded icons are listable");
@@ -2261,7 +2272,7 @@ fn embedded_assets_include_bundled_fonts() {
 }
 
 #[gpui::test]
-async fn default_settings_use_the_embedded_mono_font(cx: &mut TestAppContext) {
+async fn default_settings_use_the_bundled_theme_and_mono_font(cx: &mut TestAppContext) {
     cx.update(|cx| {
         settings::init(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -2286,6 +2297,9 @@ async fn default_settings_use_the_embedded_mono_font(cx: &mut TestAppContext) {
             zmux::DEFAULT_MONO_FONT
         );
     });
+
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(cx.theme().name.as_ref(), zmux::DEFAULT_THEME));
 }
 
 #[gpui::test]

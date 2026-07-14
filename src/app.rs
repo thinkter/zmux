@@ -33,7 +33,7 @@ use crate::keymap::{
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{NotificationStore, NotificationTarget, WorkspaceId};
 use crate::settings_page::SettingsPage;
-use crate::theme::configure_terminal_fonts;
+use crate::theme::{DEFAULT_THEME, configure_terminal_fonts};
 use crate::welcome::ZmuxWelcome;
 use crate::workspace_switcher::{SwitchDirection, WorkspaceSwitcher};
 use crate::workspaces::{
@@ -172,11 +172,21 @@ pub fn load_user_settings(fs: Arc<dyn Fs>, cx: &mut App) {
     }
 
     settings::SettingsStore::update_global(cx, |store, cx| {
-        store.watch_settings_files(fs, cx, |file, result, _cx| {
+        store.watch_settings_files(fs.clone(), cx, |file, result, _cx| {
             if let settings::ParseStatus::Failed { error } = &result.parse_status {
                 eprintln!("failed to parse {file:?} settings: {error}");
             }
         });
+    });
+
+    // Existing zmux settings predate the bundled theme. Give those installs the
+    // new default too, while preserving any theme the user explicitly selected.
+    settings::update_settings_file(fs, cx, |content, _cx| {
+        if content.theme.theme.is_none() {
+            content.theme.theme = Some(settings::ThemeSelection::Static(settings::ThemeName(
+                DEFAULT_THEME.into(),
+            )));
+        }
     });
 }
 

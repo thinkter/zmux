@@ -1,4 +1,4 @@
-//! Embedded assets (icons, images, and fonts) bundled into the binary so GPUI
+//! Embedded assets (icons, images, fonts, and themes) bundled into the binary so GPUI
 //! can resolve the `icons/*.svg` paths referenced by the `ui` crate and the
 //! `fonts/**` families registered at startup. Without an [`AssetSource`],
 //! every icon renders as nothing.
@@ -12,6 +12,7 @@ use rust_embed::RustEmbed;
 #[include = "fonts/**/*"]
 #[include = "icons/**/*"]
 #[include = "images/**/*"]
+#[include = "themes/**/*"]
 #[exclude = "*.DS_Store"]
 pub struct Assets;
 
