@@ -1067,17 +1067,8 @@ impl WorkspacesPanel {
         let name_row = h_flex()
             .id(("ws-name", id as usize))
             .flex_1()
-            .gap_2()
+            .gap_1()
             .overflow_hidden()
-            .child(
-                Icon::new(IconName::Terminal)
-                    .size(IconSize::Small)
-                    .color(if is_active {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    }),
-            )
             .map(|this| match &editor {
                 Some(editor) => this.child(
                     div()
@@ -1121,12 +1112,12 @@ impl WorkspacesPanel {
             });
 
         let context = entry.context.clone();
-        let shell_label = match context.shell_count {
+        let shell_tooltip = match context.shell_count {
             0 => "No shells".to_string(),
             1 => "1 shell".to_string(),
             count => format!("{count} shells"),
         };
-        let cwd_label = workspace_cwd_label(&context);
+        let cwd_label = workspace_cwd_label(&context).filter(|cwd| cwd != &entry.name);
         let git_label = match &entry.git {
             MetadataState::Ready(git) => Some(git.compact_label()),
             MetadataState::Pending => Some("git refreshing".to_string()),
@@ -1141,74 +1132,131 @@ impl WorkspacesPanel {
             }
             _ => None,
         };
+        let has_git_metadata = git_label.is_some() || diff_stats.is_some();
+        let foreground_processes = context.foreground_processes.clone();
+        let has_foreground_processes = !foreground_processes.is_empty();
+        let metadata = v_flex()
+            .debug_selector(move || format!("WORKSPACE_METADATA-{id}"))
+            .w_full()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .id(("ws-shell-count", id as usize))
+                            .flex_none()
+                            .gap_0p5()
+                            .tooltip(Tooltip::text(shell_tooltip))
+                            .child(
+                                Icon::new(IconName::Terminal)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(context.shell_count.to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .when_some(cwd_label, |this, cwd| {
+                        this.child(
+                            div()
+                                .id(("ws-cwd", id as usize))
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .tooltip(Tooltip::text(format!("Working directory: {cwd}")))
+                                .child(
+                                    Label::new(cwd)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                    }),
+            )
+            .when(has_git_metadata, |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .child(
+                            Icon::new(IconName::GitBranch)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .when_some(git_label, |this, git| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().colors().element_background)
+                                    .child(
+                                        Label::new(git)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .single_line(),
+                                    ),
+                            )
+                        })
+                        .when_some(diff_stats, |this, (added, deleted)| {
+                            this.child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(format!("+{added}"))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Success),
+                                    )
+                                    .child(
+                                        Label::new(format!("-{deleted}"))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Error),
+                                    ),
+                            )
+                        }),
+                )
+            })
+            .when(has_foreground_processes, |this| {
+                this.child(
+                    h_flex()
+                        .gap_0p5()
+                        .flex_wrap()
+                        .child(
+                            Icon::new(IconName::PlayFilled)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .children(foreground_processes.into_iter().map(|process| {
+                            let process_id =
+                                SharedString::from(format!("ws-process-{id}-{process}"));
+                            div()
+                                .id(process_id)
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(cx.theme().colors().element_background)
+                                .tooltip(Tooltip::text(format!("Running: {process}")))
+                                .child(
+                                    Label::new(process)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                )
+                        })),
+                )
+            });
         let name_area = v_flex()
             .id(("ws-name-area", id as usize))
             .flex_1()
             .gap_0p5()
             .overflow_hidden()
             .child(name_row)
-            .child(
-                h_flex()
-                    .debug_selector(move || format!("WORKSPACE_METADATA-{id}"))
-                    .gap_1()
-                    .overflow_hidden()
-                    .child(
-                        Label::new(shell_label)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .single_line(),
-                    )
-                    .when_some(cwd_label, |this, cwd| {
-                        this.child(
-                            Label::new(cwd)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .single_line(),
-                        )
-                    })
-                    .when_some(git_label, |this, git| {
-                        this.child(
-                            div()
-                                .px_1()
-                                .rounded_sm()
-                                .bg(cx.theme().colors().element_background)
-                                .child(
-                                    Label::new(git)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .single_line(),
-                                ),
-                        )
-                    })
-                    .when_some(diff_stats, |this, (added, deleted)| {
-                        this.child(
-                            h_flex()
-                                .gap_0p5()
-                                .child(
-                                    Label::new(format!("+{added}"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Success),
-                                )
-                                .child(
-                                    Label::new(format!("-{deleted}"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Error),
-                                ),
-                        )
-                    })
-                    .children(context.foreground_processes.iter().take(3).map(|process| {
-                        div()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(cx.theme().colors().element_background)
-                            .child(
-                                Label::new(process.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            )
-                    })),
-            )
+            .child(metadata)
             .when_some(entry.latest_unread.clone(), |this, latest| {
                 this.child(
                     Label::new(latest)
