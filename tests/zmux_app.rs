@@ -3,7 +3,7 @@ mod support;
 use std::{path::PathBuf, time::Duration};
 
 use gpui::prelude::*;
-use gpui::{Action, Bounds, Keystroke, TestAppContext, point, px, size};
+use gpui::{Action, Bounds, Keystroke, TestAppContext, VisualTestContext, point, px, size};
 use settings::Settings;
 use support::deterministic_output_shell;
 use terminal::terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
@@ -11,14 +11,15 @@ use terminal::{TerminalBounds, TerminalBuilder};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use util::paths::PathStyle;
 use workspace::dock::Panel;
+use workspace::item::Item as _;
 use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zmux::{
     CliEndpoint, CliNotification, CliServer, JumpToLatestNotification, NOTIFY_ENDPOINT_ENV,
-    NewTerminal as ZmuxNewTerminal, NotificationSource, NotificationStore, OscNotificationEvent,
-    OscNotificationParser, SplitTerminalDown, SplitTerminalRight, WorkspacesPanel,
-    configure_keybindings, configure_terminal_fonts, configure_zoom_actions, init_zmux,
-    open_zmux_workspace_at, terminal_env,
+    NewTerminal as ZmuxNewTerminal, NotificationSource, NotificationStore, NotifyCurrentPane,
+    OscNotificationEvent, OscNotificationParser, SplitTerminalDown, SplitTerminalRight,
+    WorkspacesPanel, configure_keybindings, configure_terminal_fonts, configure_zoom_actions,
+    init_zmux, open_zmux_workspace_at, terminal_env,
 };
 
 #[test]
@@ -198,6 +199,206 @@ async fn kitty_runtime_responses_bypass_terminal_user_input(cx: &mut TestAppCont
             "protocol responses must not force the viewport to the bottom"
         );
     });
+}
+
+#[gpui::test]
+async fn notification_shell_tab_indicator_tracks_unread_state(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
+    });
+    let opened = open_task.await.expect("workspace should open");
+
+    let terminal_view = loop {
+        cx.run_until_parked();
+        let terminal_view = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .find_map(|item| item.act_as::<TerminalView>(cx))
+            })
+        });
+        if let Some(terminal_view) = terminal_view {
+            break terminal_view;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    };
+    assert!(
+        !terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)),
+        "a fresh notification shell must not inherit Zed's running-task dot",
+    );
+
+    opened
+        .window
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(NotifyCurrentPane.boxed_clone(), cx);
+        })
+        .expect("window remains open");
+    cx.run_until_parked();
+
+    let item_id = terminal_view.entity_id();
+    let notification_id = cx.read(|cx| {
+        let store = NotificationStore::global(cx).read(cx);
+        assert!(store.item_has_unread(item_id));
+        store
+            .latest_unread()
+            .expect("manual pane notification should be recorded")
+            .id
+    });
+    assert!(
+        terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)),
+        "an unread terminal notification should show the native tab dot",
+    );
+
+    cx.update(|cx| {
+        NotificationStore::global(cx).update(cx, |store, store_cx| {
+            assert!(store.mark_read(notification_id));
+            store_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)),
+        "reading the notification should remove the tab dot",
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+async fn notification_shell_tab_title_tracks_foreground_process(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
+    });
+    let opened = open_task.await.expect("workspace should open");
+
+    let terminal_view = loop {
+        cx.run_until_parked();
+        let terminal_view = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .find_map(|item| item.act_as::<TerminalView>(cx))
+            })
+        });
+        if let Some(terminal_view) = terminal_view {
+            break terminal_view;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    };
+    let terminal = terminal_view.read_with(cx, |view, _| view.terminal().clone());
+    terminal.read_with(cx, |terminal, _| {
+        let task_id = &terminal
+            .task()
+            .expect("notification shell should be task-backed")
+            .spawned_task
+            .id
+            .0;
+        assert!(
+            task_id.starts_with("zmux-shell-"),
+            "unexpected task id: {task_id}"
+        );
+    });
+    assert!(
+        !terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)),
+        "the internal notification wrapper must not show Zed's blue dirty-task indicator",
+    );
+
+    let mut cx = VisualTestContext::from_window(opened.window.into(), cx);
+    terminal.update(&mut cx, |terminal, _| {
+        terminal.input(b"printf shell-ready\r".to_vec());
+    });
+    cx.update(|window, cx| {
+        terminal.update(cx, |terminal, cx| terminal.sync(window, cx));
+    });
+    cx.run_until_parked();
+    let shell_title = root
+        .path()
+        .file_name()
+        .expect("test workspace should have a directory name")
+        .to_string_lossy()
+        .into_owned();
+    wait_for_terminal_tab_title(&terminal, &terminal_view, &shell_title, &mut cx).await;
+
+    terminal.update(&mut cx, |terminal, _| {
+        terminal.input(
+            b"bash -c 'exec -a nvim bash -c \"while :; do printf .; sleep 0.1; done\"'\r".to_vec(),
+        );
+    });
+    wait_for_terminal_tab_title(&terminal, &terminal_view, "nvim", &mut cx).await;
+
+    terminal.update(&mut cx, |terminal, _| terminal.input(b"\x03".to_vec()));
+    wait_for_terminal_tab_title(&terminal, &terminal_view, &shell_title, &mut cx).await;
+}
+
+#[gpui::test]
+async fn workspace_metadata_click_activates_the_workspace(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
+    });
+    let opened = open_task.await.expect("workspace should open");
+    let panel = opened.workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .panel::<WorkspacesPanel>(cx)
+            .expect("workspaces panel is installed")
+    });
+    let origin = panel.read_with(cx, |panel, _| panel.active_workspace_id());
+
+    opened
+        .window
+        .update(cx, |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.create_workspace(window, cx));
+        })
+        .expect("window remains open");
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if panel.read_with(cx, |panel, _| panel.active_workspace_id()) != origin {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    assert_ne!(
+        panel.read_with(cx, |panel, _| panel.active_workspace_id()),
+        origin,
+        "the new workspace should be active before the click",
+    );
+
+    let mut cx = VisualTestContext::from_window(opened.window.into(), cx);
+    let selector = Box::leak(format!("WORKSPACE_METADATA-{origin}").into_boxed_str());
+    let mut metadata_bounds = None;
+    for _ in 0..50 {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        metadata_bounds = cx.debug_bounds(selector);
+        if metadata_bounds.is_some() {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    let metadata_bounds = metadata_bounds.expect("inactive workspace metadata should be rendered");
+    cx.simulate_click(metadata_bounds.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        panel.read_with(&cx, |panel, _| panel.active_workspace_id()),
+        origin,
+        "clicking shell, directory, git, or process metadata should activate its workspace",
+    );
 }
 
 #[gpui::test]
@@ -1919,6 +2120,31 @@ fn center_terminal_notification_routes(
     routes
 }
 
+#[cfg(unix)]
+async fn wait_for_terminal_tab_title(
+    terminal: &gpui::Entity<terminal::Terminal>,
+    terminal_view: &gpui::Entity<TerminalView>,
+    expected: &str,
+    cx: &mut VisualTestContext,
+) {
+    let mut actual = String::new();
+    for _ in 0..200 {
+        cx.update(|window, cx| {
+            terminal.update(cx, |terminal, cx| terminal.sync(window, cx));
+        });
+        cx.run_until_parked();
+        actual = terminal_view.read_with(cx, |view, cx| view.tab_content_text(0, cx).to_string());
+        if actual == expected {
+            return;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+
+    panic!("expected terminal tab title {expected:?}, got {actual:?}");
+}
+
 struct FreshWorkspaceRoot(PathBuf);
 
 impl FreshWorkspaceRoot {
@@ -2016,6 +2242,22 @@ fn embedded_assets_include_bundled_fonts() {
             .iter()
             .any(|path| path.ends_with("IBMPlexSans-Regular.ttf"))
     );
+
+    let icons = zmux::Assets
+        .list("icons")
+        .expect("embedded icons are listable");
+    for process_icon in [
+        "icons/ai_open_ai.svg",
+        "icons/ai_claude.svg",
+        "icons/ai_open_code.svg",
+        "icons/ai_pi.svg",
+        "icons/neovim.svg",
+    ] {
+        assert!(
+            icons.iter().any(|path| path.as_ref() == process_icon),
+            "missing embedded process icon {process_icon}: {icons:?}",
+        );
+    }
 }
 
 #[gpui::test]

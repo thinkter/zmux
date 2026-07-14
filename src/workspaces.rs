@@ -828,17 +828,6 @@ impl WorkspacesPanel {
                         .single_line(),
                 ),
             })
-            .when(!is_renaming, |this| {
-                this.cursor_pointer().on_click(cx.listener(
-                    move |this, event: &gpui::ClickEvent, window, cx| {
-                        if event.click_count() >= 2 {
-                            this.start_rename(id, window, cx);
-                        } else {
-                            this.activate_workspace(id, window, cx);
-                        }
-                    },
-                ))
-            })
             .when(unread_count > 0, |this| {
                 this.child(
                     div()
@@ -876,12 +865,14 @@ impl WorkspacesPanel {
             MetadataState::NotRequested => None,
         };
         let name_area = v_flex()
+            .id(("ws-name-area", id as usize))
             .flex_1()
             .gap_0p5()
             .overflow_hidden()
             .child(name_row)
             .child(
                 h_flex()
+                    .debug_selector(move || format!("WORKSPACE_METADATA-{id}"))
                     .gap_1()
                     .overflow_hidden()
                     .child(
@@ -932,6 +923,17 @@ impl WorkspacesPanel {
                         .color(Color::Accent)
                         .single_line(),
                 )
+            })
+            .when(!is_renaming, |this| {
+                this.cursor_pointer().on_click(cx.listener(
+                    move |this, event: &gpui::ClickEvent, window, cx| {
+                        if event.click_count() >= 2 {
+                            this.start_rename(id, window, cx);
+                        } else {
+                            this.activate_workspace(id, window, cx);
+                        }
+                    },
+                ))
             });
 
         let drag_ix = self

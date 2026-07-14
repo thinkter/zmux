@@ -11,7 +11,9 @@ use std::{
 };
 
 use alacritty_terminal::term::{build_zmux_notification_replay_ack, build_zmux_pty_response};
-use gpui::{AnyWindowHandle, App, Entity, EntityId, Focusable, Global, WeakEntity, Window};
+use gpui::{
+    AnyWindowHandle, App, Entity, EntityId, Focusable, Global, Subscription, WeakEntity, Window,
+};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use workspace::{Workspace, item::ItemHandle};
@@ -401,6 +403,7 @@ pub struct NotificationRuntime {
     osc_parsers: HashMap<(EntityId, EntityId), OscNotificationParser>,
     osc_bridge_sequences: HashMap<(EntityId, EntityId), u64>,
     kitty: KittyRegistry,
+    _notification_subscription: Option<Subscription>,
 }
 
 #[derive(Clone)]
@@ -645,9 +648,13 @@ impl Global for NotificationRuntime {}
 
 impl NotificationRuntime {
     pub fn init(cx: &mut App) {
-        crate::notifications::NotificationStore::init(cx);
+        let notification_store = crate::notifications::NotificationStore::init(cx);
         if !cx.has_global::<Self>() {
             cx.set_global(Self::default());
+            let subscription = cx.observe(&notification_store, |_store, cx| {
+                Self::notify_terminal_tabs(cx);
+            });
+            cx.global_mut::<Self>()._notification_subscription = Some(subscription);
             cx.observe_keystrokes(|_, window, cx| {
                 let routes = cx
                     .global::<Self>()
@@ -691,6 +698,18 @@ impl NotificationRuntime {
                 }
             });
             DesktopNotificationService::init(action_sender, action_task, cx);
+        }
+    }
+
+    fn notify_terminal_tabs(cx: &mut App) {
+        let views = cx
+            .global::<Self>()
+            .routes
+            .values()
+            .map(|route| route.view.clone())
+            .collect::<Vec<_>>();
+        for view in views {
+            let _ = view.update(cx, |_view, view_cx| view_cx.notify());
         }
     }
 

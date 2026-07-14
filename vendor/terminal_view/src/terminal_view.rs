@@ -10,7 +10,7 @@ use editor::{
 };
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, Font, Global, KeyContext, KeyDownEvent, Keystroke, MouseButton,
+    EntityId, FocusHandle, Focusable, Font, Global, KeyContext, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription,
     Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
@@ -76,6 +76,22 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const ZMUX_SHELL_TASK_ID_PREFIX: &str = "zmux-shell-";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalTabIcon {
+    Named(IconName),
+    Embedded(&'static str),
+}
+
+impl TerminalTabIcon {
+    fn render(self) -> Icon {
+        match self {
+            Self::Named(icon) => Icon::new(icon),
+            Self::Embedded(path) => Icon::from_path(path),
+        }
+    }
+}
 
 /// Application-provided factory for task-backed terminals created by
 /// `terminal_view` outside the embedder's ordinary new-terminal actions.
@@ -97,6 +113,21 @@ impl Global for RegisteredTerminalCreationHandler {}
 
 pub fn set_terminal_creation_handler(handler: TerminalCreationHandler, cx: &mut App) {
     cx.set_global(RegisteredTerminalCreationHandler(handler));
+}
+
+/// Application-provided unread-state lookup for task-backed terminal tabs.
+///
+/// Zed normally uses `Item::is_dirty` to show a running-task indicator. An
+/// embedder can replace that always-on state for its own task wrapper with a
+/// meaningful per-terminal indicator without changing genuine named tasks.
+pub type TerminalTabIndicatorHandler = Arc<dyn Fn(EntityId, &App) -> bool>;
+
+struct RegisteredTerminalTabIndicatorHandler(TerminalTabIndicatorHandler);
+
+impl Global for RegisteredTerminalTabIndicatorHandler {}
+
+pub fn set_terminal_tab_indicator_handler(handler: TerminalTabIndicatorHandler, cx: &mut App) {
+    cx.set_global(RegisteredTerminalTabIndicatorHandler(handler));
 }
 
 /// Event to transmit the scroll from the element to the view
@@ -230,6 +261,129 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
+    fn tab_title(&self, terminal: &Terminal, truncate: bool) -> String {
+        Self::select_tab_title(
+            self.custom_title.as_deref(),
+            terminal
+                .task()
+                .map(|task| &task.spawned_task.id),
+            || terminal.foreground_process_command_name(),
+            || Self::working_directory_title(terminal),
+            || terminal.title(truncate),
+        )
+    }
+
+    fn working_directory_title(terminal: &Terminal) -> Option<String> {
+        let working_directory = terminal.working_directory()?;
+        working_directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                let path = working_directory.to_string_lossy();
+                (!path.trim().is_empty()).then(|| path.into_owned())
+            })
+    }
+
+    fn uses_working_directory_title(&self, terminal: &Terminal) -> bool {
+        let foreground_process = terminal.foreground_process_command_name();
+        let working_directory = Self::working_directory_title(terminal);
+        Self::should_use_working_directory_icon(
+            self.custom_title.as_deref(),
+            terminal.task().map(|task| &task.spawned_task.id),
+            foreground_process.as_deref(),
+            working_directory.as_deref(),
+        )
+    }
+
+    fn foreground_process_icon(&self, terminal: &Terminal) -> Option<TerminalTabIcon> {
+        let process = terminal.foreground_process_command_name();
+        Self::select_foreground_process_icon(
+            self.custom_title.as_deref(),
+            terminal.task().map(|task| &task.spawned_task.id),
+            process.as_deref(),
+        )
+    }
+
+    fn select_foreground_process_icon(
+        custom_title: Option<&str>,
+        task_id: Option<&TaskId>,
+        foreground_process: Option<&str>,
+    ) -> Option<TerminalTabIcon> {
+        if custom_title.is_some_and(|title| !title.trim().is_empty())
+            || !task_id.is_some_and(|task_id| task_id.0.starts_with(ZMUX_SHELL_TASK_ID_PREFIX))
+        {
+            return None;
+        }
+
+        let executable = foreground_process?
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()?
+            .to_ascii_lowercase();
+        let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+
+        match executable {
+            "codex" => Some(TerminalTabIcon::Named(IconName::AiOpenAi)),
+            "claude" | "claude-code" => Some(TerminalTabIcon::Named(IconName::AiClaude)),
+            "opencode" => Some(TerminalTabIcon::Named(IconName::AiOpenCode)),
+            "pi" => Some(TerminalTabIcon::Embedded("icons/ai_pi.svg")),
+            "nvim" | "neovim" => Some(TerminalTabIcon::Embedded("icons/neovim.svg")),
+            _ => None,
+        }
+    }
+
+    fn task_marks_tab_dirty(
+        task_id: &TaskId,
+        status: &TaskStatus,
+        wrapper_has_unread_notification: bool,
+    ) -> bool {
+        if task_id.0.starts_with(ZMUX_SHELL_TASK_ID_PREFIX) {
+            wrapper_has_unread_notification
+        } else {
+            *status == TaskStatus::Running
+        }
+    }
+
+    fn should_use_working_directory_icon(
+        custom_title: Option<&str>,
+        task_id: Option<&TaskId>,
+        foreground_process: Option<&str>,
+        working_directory: Option<&str>,
+    ) -> bool {
+        custom_title.is_none_or(|title| title.trim().is_empty())
+            && task_id.is_some_and(|task_id| task_id.0.starts_with(ZMUX_SHELL_TASK_ID_PREFIX))
+            && foreground_process.is_none_or(|title| title.trim().is_empty())
+            && working_directory.is_some_and(|title| !title.trim().is_empty())
+    }
+
+    fn select_tab_title(
+        custom_title: Option<&str>,
+        task_id: Option<&TaskId>,
+        foreground_process_command_name: impl FnOnce() -> Option<String>,
+        working_directory_title: impl FnOnce() -> Option<String>,
+        fallback: impl FnOnce() -> String,
+    ) -> String {
+        if let Some(custom_title) = custom_title.filter(|title| !title.trim().is_empty()) {
+            return custom_title.to_owned();
+        }
+
+        if task_id.is_some_and(|task_id| task_id.0.starts_with(ZMUX_SHELL_TASK_ID_PREFIX)) {
+            if let Some(process_title) = foreground_process_command_name()
+                .filter(|title| !title.trim().is_empty())
+            {
+                return process_title;
+            }
+            if let Some(directory_title) =
+                working_directory_title().filter(|title| !title.trim().is_empty())
+            {
+                return directory_title;
+            }
+        }
+
+        fallback()
+    }
+
     ///Create a new Terminal in the current working directory or the user's home directory
     pub fn deploy(
         workspace: &mut Workspace,
@@ -1447,22 +1601,38 @@ impl Item for TerminalView {
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
         let terminal = self.terminal().read(cx);
-        let title = self
-            .custom_title
-            .as_ref()
-            .filter(|title| !title.trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| terminal.title(true));
+        let title = self.tab_title(terminal, true);
+        let foreground_process_icon = self.foreground_process_icon(terminal);
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
+            Some(terminal_task)
+                if matches!(terminal_task.status, TaskStatus::Running)
+                    && foreground_process_icon.is_some() =>
+            {
+                (
+                    foreground_process_icon.expect("checked above"),
+                    Color::Muted,
+                    TerminalView::rerun_button(terminal_task),
+                )
+            }
+            Some(terminal_task)
+                if matches!(terminal_task.status, TaskStatus::Running)
+                    && self.uses_working_directory_title(terminal) =>
+            {
+                (
+                    TerminalTabIcon::Named(IconName::Folder),
+                    Color::Muted,
+                    TerminalView::rerun_button(terminal_task),
+                )
+            }
             Some(terminal_task) => match &terminal_task.status {
                 TaskStatus::Running => (
-                    IconName::PlayFilled,
+                    TerminalTabIcon::Named(IconName::PlayFilled),
                     Color::Disabled,
                     TerminalView::rerun_button(terminal_task),
                 ),
                 TaskStatus::Unknown => (
-                    IconName::Warning,
+                    TerminalTabIcon::Named(IconName::Warning),
                     Color::Warning,
                     TerminalView::rerun_button(terminal_task),
                 ),
@@ -1470,13 +1640,25 @@ impl Item for TerminalView {
                     let rerun_button = TerminalView::rerun_button(terminal_task);
 
                     if *success {
-                        (IconName::Check, Color::Success, rerun_button)
+                        (
+                            TerminalTabIcon::Named(IconName::Check),
+                            Color::Success,
+                            rerun_button,
+                        )
                     } else {
-                        (IconName::XCircle, Color::Error, rerun_button)
+                        (
+                            TerminalTabIcon::Named(IconName::XCircle),
+                            Color::Error,
+                            rerun_button,
+                        )
                     }
                 }
             },
-            None => (IconName::Terminal, Color::Muted, None),
+            None => (
+                TerminalTabIcon::Named(IconName::Terminal),
+                Color::Muted,
+                None,
+            ),
         };
 
         let self_handle = self.self_handle.clone();
@@ -1499,7 +1681,7 @@ impl Item for TerminalView {
                             .when(rerun_button.is_some(), |this| {
                                 this.hover(|style| style.invisible().w_0())
                             })
-                            .child(Icon::new(icon).color(icon_color)),
+                            .child(icon.render().color(icon_color)),
                     )
                     .when_some(rerun_button, |this, rerun_button| {
                         this.child(
@@ -1549,11 +1731,8 @@ impl Item for TerminalView {
     }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
-        if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
-            return custom_title.clone().into();
-        }
         let terminal = self.terminal().read(cx);
-        terminal.title(detail == 0).into()
+        self.tab_title(terminal, detail == 0).into()
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -1775,7 +1954,23 @@ impl Item for TerminalView {
 
     fn is_dirty(&self, cx: &App) -> bool {
         match self.terminal.read(cx).task() {
-            Some(task) => task.status == TaskStatus::Running,
+            Some(task) => {
+                let wrapper_has_unread_notification = task
+                    .spawned_task
+                    .id
+                    .0
+                    .starts_with(ZMUX_SHELL_TASK_ID_PREFIX)
+                    && cx
+                        .try_global::<RegisteredTerminalTabIndicatorHandler>()
+                        .is_some_and(|handler| {
+                            (handler.0)(self.self_handle.entity_id(), cx)
+                        });
+                Self::task_marks_tab_dirty(
+                    &task.spawned_task.id,
+                    &task.status,
+                    wrapper_has_unread_notification,
+                )
+            }
             None => self.has_bell(),
         }
     }
@@ -2186,6 +2381,216 @@ mod tests {
     use util::rel_path::RelPath;
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
+
+    #[test]
+    fn zmux_shell_tab_title_uses_zed_normalized_process_titles() {
+        let task_id = TaskId("zmux-shell-test-route".to_owned());
+
+        for process_title in ["nvim", "cargo", "bun", "python", "pwsh", "cmd"] {
+            let title = TerminalView::select_tab_title(
+                None,
+                Some(&task_id),
+                || Some(process_title.to_owned()),
+                || -> Option<String> { panic!("process titles must bypass directory titles") },
+                || "Terminal".to_owned(),
+            );
+
+            assert_eq!(title, process_title);
+        }
+    }
+
+    #[test]
+    fn custom_terminal_title_overrides_zmux_process_title() {
+        let task_id = TaskId("zmux-shell-test-route".to_owned());
+        let title = TerminalView::select_tab_title(
+            Some("editor"),
+            Some(&task_id),
+            || -> Option<String> { panic!("custom titles must bypass process titles") },
+            || -> Option<String> { panic!("custom titles must bypass directory titles") },
+            || -> String { panic!("custom titles must bypass terminal titles") },
+        );
+
+        assert_eq!(title, "editor");
+    }
+
+    #[test]
+    fn genuine_zed_task_title_remains_authoritative() {
+        let task_id = TaskId("project-task-build".to_owned());
+        let title = TerminalView::select_tab_title(
+            None,
+            Some(&task_id),
+            || -> Option<String> { panic!("named tasks must not inspect process titles") },
+            || -> Option<String> { panic!("named tasks must not inspect working directories") },
+            || "Build project".to_owned(),
+        );
+
+        assert_eq!(title, "Build project");
+    }
+
+    #[test]
+    fn zmux_shell_tab_title_uses_working_directory_before_terminal_fallback() {
+        let task_id = TaskId("zmux-shell-test-route".to_owned());
+
+        let directory = TerminalView::select_tab_title(
+            None,
+            Some(&task_id),
+            || None,
+            || Some("zmux".to_owned()),
+            || "Terminal".to_owned(),
+        );
+        let missing = TerminalView::select_tab_title(
+            None,
+            Some(&task_id),
+            || None,
+            || None,
+            || "Terminal".to_owned(),
+        );
+        let empty = TerminalView::select_tab_title(
+            None,
+            Some(&task_id),
+            || Some("  ".to_owned()),
+            || Some("  ".to_owned()),
+            || "Terminal".to_owned(),
+        );
+
+        assert_eq!(directory, "zmux");
+        assert_eq!(missing, "Terminal");
+        assert_eq!(empty, "Terminal");
+    }
+
+    #[test]
+    fn only_idle_zmux_directory_titles_use_the_folder_icon() {
+        let task_id = TaskId("zmux-shell-test-route".to_owned());
+        let named_task_id = TaskId("project-task-build".to_owned());
+
+        assert!(TerminalView::should_use_working_directory_icon(
+            None,
+            Some(&task_id),
+            None,
+            Some("zmux"),
+        ));
+        assert!(!TerminalView::should_use_working_directory_icon(
+            None,
+            Some(&task_id),
+            Some("nvim"),
+            Some("zmux"),
+        ));
+        assert!(!TerminalView::should_use_working_directory_icon(
+            Some("server"),
+            Some(&task_id),
+            None,
+            Some("zmux"),
+        ));
+        assert!(!TerminalView::should_use_working_directory_icon(
+            None,
+            Some(&named_task_id),
+            None,
+            Some("zmux"),
+        ));
+        assert!(!TerminalView::should_use_working_directory_icon(
+            None,
+            Some(&task_id),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn zmux_foreground_processes_use_brand_icons() {
+        let task_id = TaskId("zmux-shell-test-route".to_owned());
+
+        for (process, expected) in [
+            (
+                "codex",
+                TerminalTabIcon::Named(IconName::AiOpenAi),
+            ),
+            (
+                "claude",
+                TerminalTabIcon::Named(IconName::AiClaude),
+            ),
+            (
+                "opencode",
+                TerminalTabIcon::Named(IconName::AiOpenCode),
+            ),
+            ("pi", TerminalTabIcon::Embedded("icons/ai_pi.svg")),
+            (
+                "nvim",
+                TerminalTabIcon::Embedded("icons/neovim.svg"),
+            ),
+            (
+                r"C:\\Program Files\\Neovim\\bin\\nvim.EXE",
+                TerminalTabIcon::Embedded("icons/neovim.svg"),
+            ),
+        ] {
+            assert_eq!(
+                TerminalView::select_foreground_process_icon(
+                    None,
+                    Some(&task_id),
+                    Some(process),
+                ),
+                Some(expected),
+                "unexpected icon for {process}",
+            );
+        }
+    }
+
+    #[test]
+    fn process_brand_icons_preserve_title_and_task_overrides() {
+        let zmux_task_id = TaskId("zmux-shell-test-route".to_owned());
+        let named_task_id = TaskId("project-task-build".to_owned());
+
+        assert_eq!(
+            TerminalView::select_foreground_process_icon(
+                Some("editor"),
+                Some(&zmux_task_id),
+                Some("nvim"),
+            ),
+            None,
+        );
+        assert_eq!(
+            TerminalView::select_foreground_process_icon(
+                None,
+                Some(&named_task_id),
+                Some("codex"),
+            ),
+            None,
+        );
+        assert_eq!(
+            TerminalView::select_foreground_process_icon(
+                None,
+                Some(&zmux_task_id),
+                Some("cargo"),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn internal_zmux_shells_use_unread_state_for_tab_indicators() {
+        let zmux_task_id = TaskId("zmux-shell-test-route".to_owned());
+        let named_task_id = TaskId("project-task-build".to_owned());
+
+        assert!(!TerminalView::task_marks_tab_dirty(
+            &zmux_task_id,
+            &TaskStatus::Running,
+            false,
+        ));
+        assert!(TerminalView::task_marks_tab_dirty(
+            &zmux_task_id,
+            &TaskStatus::Running,
+            true,
+        ));
+        assert!(TerminalView::task_marks_tab_dirty(
+            &named_task_id,
+            &TaskStatus::Running,
+            false,
+        ));
+        assert!(!TerminalView::task_marks_tab_dirty(
+            &named_task_id,
+            &TaskStatus::Completed { success: true },
+            true,
+        ));
+    }
 
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();

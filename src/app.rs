@@ -31,7 +31,7 @@ use crate::keymap::{
     configure_zoom_actions,
 };
 use crate::notification_runtime::NotificationRuntime;
-use crate::notifications::{NotificationTarget, WorkspaceId};
+use crate::notifications::{NotificationStore, NotificationTarget, WorkspaceId};
 use crate::settings_page::SettingsPage;
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
@@ -97,6 +97,14 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
         cx,
     );
     NotificationRuntime::init(cx);
+    terminal_view::set_terminal_tab_indicator_handler(
+        Arc::new(|item_id, cx| {
+            NotificationStore::global(cx)
+                .read(cx)
+                .item_has_unread(item_id)
+        }),
+        cx,
+    );
 
     if !cx.has_global::<CliServer>() {
         match CliServer::start() {

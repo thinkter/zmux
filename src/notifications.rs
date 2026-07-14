@@ -305,6 +305,14 @@ impl NotificationStore {
         })
     }
 
+    /// Item entity IDs are process-global, so terminal tab lookups do not need
+    /// to recover the sidebar scope that originally registered the route.
+    pub fn item_has_unread(&self, item_id: EntityId) -> bool {
+        self.notifications
+            .iter()
+            .any(|notification| notification.target.item_id == item_id && !notification.read)
+    }
+
     pub fn workspace_has_unread(&self, scope_id: EntityId, workspace_id: WorkspaceId) -> bool {
         self.notifications.iter().any(|notification| {
             notification.target.scope_id == scope_id
@@ -574,9 +582,13 @@ mod tests {
         record(&mut store, request(target(10, 1, 1), "first window"));
         record(&mut store, request(target(20, 1, 2), "second window"));
 
+        assert!(store.item_has_unread(entity_id(1)));
+        assert!(store.item_has_unread(entity_id(2)));
         assert_eq!(store.workspace_unread_count(entity_id(10), 1), 1);
         assert_eq!(store.workspace_unread_count(entity_id(20), 1), 1);
         assert_eq!(store.mark_workspace_read(entity_id(10), 1), 1);
+        assert!(!store.item_has_unread(entity_id(1)));
+        assert!(store.item_has_unread(entity_id(2)));
         assert!(!store.workspace_has_unread(entity_id(10), 1));
         assert!(store.workspace_has_unread(entity_id(20), 1));
     }
