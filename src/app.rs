@@ -4,8 +4,8 @@ use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
-    App, AppContext, Bounds, Context, InteractiveElement, Task, TaskExt, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, px, size,
+    App, AppContext, Bounds, Context, InteractiveElement, Task, TaskExt, UpdateGlobal, WeakEntity,
+    Window, WindowBounds, WindowHandle, WindowOptions, actions, px, size,
 };
 use gpui_platform::application;
 use http_client::{BlockedHttpClient, HttpClientWithUrl};
@@ -45,7 +45,8 @@ pub fn run() -> anyhow::Result<()> {
     application()
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
-            init_zmux(cx);
+            let app_state = init_zmux(cx);
+            load_user_settings(app_state.fs.clone(), cx);
 
             cx.spawn(async move |cx| {
                 let open_task = cx.update(|cx| open_zmux_workspace(None, cx));
@@ -65,6 +66,10 @@ pub fn run() -> anyhow::Result<()> {
 pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     if !cx.has_global::<db::AppDatabase>() {
         cx.set_global(db::AppDatabase::new());
+    }
+
+    if let Err(error) = crate::fonts::load_embedded_fonts(cx) {
+        eprintln!("failed to load embedded fonts: {error:#}");
     }
 
     settings::init(cx);
@@ -132,6 +137,36 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     cx.on_action(|_: &Quit, cx| cx.quit());
 
     app_state
+}
+
+/// Seed `paths::settings_file()` with the zmux defaults on first run, then
+/// load and watch it through Zed's settings machinery: hand edits and GUI
+/// edits both re-apply live (the watcher refreshes every window).
+///
+/// Only the real application calls this; tests configure settings directly
+/// via [`configure_terminal_fonts`] and must never touch on-disk config.
+pub fn load_user_settings(fs: Arc<dyn Fs>, cx: &mut App) {
+    let settings_path = paths::settings_file();
+    if !settings_path.exists() {
+        let seeded = settings_path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(settings_path, crate::theme::default_settings_json()));
+        if let Err(error) = seeded {
+            eprintln!(
+                "failed to create the settings file at {}: {error:#}",
+                settings_path.display()
+            );
+        }
+    }
+
+    settings::SettingsStore::update_global(cx, |store, cx| {
+        store.watch_settings_files(fs, cx, |file, result, _cx| {
+            if let settings::ParseStatus::Failed { error } = &result.parse_status {
+                eprintln!("failed to parse {file:?} settings: {error}");
+            }
+        });
+    });
 }
 
 pub fn open_zmux_workspace(

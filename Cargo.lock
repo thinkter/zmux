@@ -12719,6 +12719,7 @@ dependencies = [
  "mac-usernotifications",
  "node_runtime",
  "notify-rust",
+ "paths",
  "project",
  "rust-embed",
  "serde",

@@ -24,6 +24,7 @@ fs = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5
 http_client = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 language = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 node_runtime = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+paths = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 session = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 uuid = "1"
@@ -77,6 +78,7 @@ getrandom = "0.3"
 http_client = { workspace = true }
 language = { workspace = true }
 node_runtime = { workspace = true }
+paths = { workspace = true }
 session = { workspace = true }
 ui = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

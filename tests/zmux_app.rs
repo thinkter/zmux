@@ -1997,3 +1997,82 @@ fn terminal_env_scrubs_outer_image_protocol_hints() {
     assert_eq!(env.get("KITTY_WINDOW_ID").map(String::as_str), Some(""));
     assert_eq!(env.get("KITTY_PUBLIC_KEY").map(String::as_str), Some(""));
 }
+
+#[test]
+fn embedded_assets_include_bundled_fonts() {
+    use gpui::AssetSource;
+
+    let fonts = zmux::Assets
+        .list("fonts")
+        .expect("embedded assets are listable");
+    let ttf_count = fonts.iter().filter(|path| path.ends_with(".ttf")).count();
+
+    assert_eq!(ttf_count, 8, "{fonts:?}");
+    assert!(fonts.iter().any(|path| path.ends_with("Lilex-Regular.ttf")));
+    assert!(
+        fonts
+            .iter()
+            .any(|path| path.ends_with("IBMPlexSans-Regular.ttf"))
+    );
+}
+
+#[gpui::test]
+async fn default_settings_use_the_embedded_mono_font(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        settings::init(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::EditorSettings::register(cx);
+        terminal::terminal_settings::TerminalSettings::register(cx);
+        configure_terminal_fonts(cx);
+
+        let terminal_settings = TerminalSettings::get_global(cx);
+        assert_eq!(
+            terminal_settings
+                .font_family
+                .as_ref()
+                .map(|family| family.0.as_ref()),
+            Some(zmux::DEFAULT_MONO_FONT)
+        );
+        assert_eq!(terminal_settings.font_size, Some(px(14.0)));
+
+        let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+        assert_eq!(theme_settings.ui_font_size(cx), px(16.0));
+        assert_eq!(
+            theme_settings.buffer_font.family.as_ref(),
+            zmux::DEFAULT_MONO_FONT
+        );
+    });
+}
+
+#[gpui::test]
+async fn ui_font_size_setting_scales_the_ui_rem_size(cx: &mut TestAppContext) {
+    use gpui::UpdateGlobal;
+
+    cx.update(|cx| {
+        settings::init(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::EditorSettings::register(cx);
+        terminal::terminal_settings::TerminalSettings::register(cx);
+        configure_terminal_fonts(cx);
+
+        // A user bumping the UI scale in the settings page writes
+        // `ui_font_size` (16 px * scale); 150% scale = 24 px.
+        let mut settings_json: serde_json::Value =
+            serde_json::from_str(&zmux::default_settings_json()).unwrap();
+        settings_json["ui_font_size"] = serde_json::json!(24.0);
+        settings_json["buffer_font_size"] = serde_json::json!(21.0);
+        settings_json["terminal"]["font_size"] = serde_json::json!(21.0);
+        let settings_json = settings_json.to_string();
+        let result = settings::SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(&settings_json, cx)
+        });
+        assert!(
+            !matches!(result.parse_status, settings::ParseStatus::Failed { .. }),
+            "scaled settings JSON should parse"
+        );
+
+        let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+        assert_eq!(theme_settings.ui_font_size(cx), px(24.0));
+        assert_eq!(TerminalSettings::get_global(cx).font_size, Some(px(21.0)));
+    });
+}

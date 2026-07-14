@@ -1,86 +1,43 @@
-use gpui::{App, UpdateGlobal};
-use std::process::Command;
+//! Default settings for zmux, applied as the user-settings layer when no
+//! settings file exists (tests) and used to seed the settings file on first
+//! run. Fonts reference the `.ZedMono` alias, which GPUI resolves to the
+//! embedded Lilex family (see `crate::fonts`), so no font detection is needed.
 
-fn find_first_installed_font(preferred: &[&str]) -> Option<String> {
-    if cfg!(target_os = "linux")
-        && let Ok(output) = Command::new("fc-list")
-            .arg("-f")
-            .arg("%{family}\n")
-            .output()
-        && output.status.success()
-    {
-        let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        for &name in preferred {
-            if out.contains(&name.to_lowercase()) {
-                return Some(name.to_string());
+use gpui::{App, UpdateGlobal};
+use serde_json::json;
+
+/// GPUI resolves this alias to the embedded Lilex family.
+pub const DEFAULT_MONO_FONT: &str = ".ZedMono";
+pub const DEFAULT_UI_FONT_SIZE: f32 = 16.0;
+pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 14.0;
+
+pub fn default_settings_json() -> String {
+    let font_fallbacks = json!(["Lilex", "Noto Sans Mono", "Noto Color Emoji", "monospace"]);
+    let settings = json!({
+        "disable_ai": true,
+        "ui_font_size": DEFAULT_UI_FONT_SIZE,
+        "buffer_font_family": DEFAULT_MONO_FONT,
+        "buffer_font_features": {},
+        "buffer_font_size": DEFAULT_TERMINAL_FONT_SIZE,
+        "buffer_font_fallbacks": font_fallbacks,
+        "buffer_line_height": {
+            "custom": 1.2
+        },
+        "terminal": {
+            "font_family": DEFAULT_MONO_FONT,
+            "font_features": {},
+            "font_size": DEFAULT_TERMINAL_FONT_SIZE,
+            "font_fallbacks": font_fallbacks,
+            "line_height": {
+                "custom": 1.2
             }
         }
-    }
-    None
+    });
+    serde_json::to_string_pretty(&settings).expect("default settings serialize to JSON")
 }
 
 pub fn configure_terminal_fonts(cx: &mut App) {
-    let preferred_linux = [
-        "JetBrains Mono",
-        "SF Mono",
-        "Fira Code",
-        "Hack",
-        "DejaVu Sans Mono",
-        "Noto Sans Mono",
-        "Courier New",
-        "Consolas",
-        "monospace",
-    ];
-
-    let primary_family =
-        find_first_installed_font(&preferred_linux).unwrap_or_else(|| "monospace".to_string());
-
-    let fallbacks: Vec<&str> = vec![
-        "DejaVu Sans Mono",
-        "Noto Sans Mono",
-        "Noto Color Emoji",
-        "monospace",
-    ];
-
-    let fallbacks_json = {
-        let mut s = String::new();
-        s.push('[');
-        for (i, f) in fallbacks.iter().enumerate() {
-            if i > 0 {
-                s.push_str(", ");
-            }
-            s.push('"');
-            s.push_str(f);
-            s.push('"');
-        }
-        s.push(']');
-        s
-    };
-
-    let settings_json = format!(
-        r#"{{
-  "disable_ai": true,
-  "buffer_font_family": "{primary}",
-  "buffer_font_features": {{ }},
-  "buffer_font_size": 14,
-  "buffer_font_fallbacks": {fallbacks},
-  "buffer_line_height": {{
-    "custom": 1.2
-  }},
-  "terminal": {{
-    "font_family": "{primary}",
-    "font_features": {{ }},
-    "font_size": 14,
-    "font_fallbacks": {fallbacks},
-    "line_height": {{
-      "custom": 1.2
-    }}
-  }}
-}}"#,
-        primary = primary_family,
-        fallbacks = fallbacks_json
-    );
-
+    let settings_json = default_settings_json();
     settings::SettingsStore::update_global(cx, |store, cx| {
         let _ = store.set_user_settings(&settings_json, cx);
     });
