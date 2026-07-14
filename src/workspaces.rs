@@ -830,16 +830,35 @@ impl WorkspacesPanel {
             {
                 continue;
             }
-            let task = project.update(cx, |project, cx| {
-                project.find_or_create_worktree(&root, false, cx)
-            });
+            // `find_or_create_worktree` accepts any existing ancestor worktree,
+            // and Zed deliberately disables Git discovery for invisible
+            // worktrees. Both behaviors are wrong for terminal-driven discovery:
+            // attach an exact, Git-tracked worktree root. zmux has no project
+            // panel, so making it visible affects only Zed's internal scanning.
+            let existing = project
+                .read(cx)
+                .worktrees(cx)
+                .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path());
+            let task = if let Some(worktree) = existing {
+                Task::ready(Ok(worktree))
+            } else {
+                project.update(cx, |project, cx| project.create_worktree(&root, true, cx))
+            };
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 this.update(cx, |this, cx| {
                     this.pending_worktrees.remove(&root);
-                    if let Ok((worktree, _)) = result {
-                        this.attached_worktrees.insert(root.clone(), worktree);
-                        this.activate_selected_repository(cx);
+                    match result {
+                        Ok(worktree) => {
+                            this.attached_worktrees.insert(root.clone(), worktree);
+                            this.activate_selected_repository(cx);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "failed to attach Git repository {}: {error:#}",
+                                root.display()
+                            );
+                        }
                     }
                 })
                 .ok();
