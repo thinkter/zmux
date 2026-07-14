@@ -370,8 +370,10 @@ mod tests {
 
     #[test]
     fn enabling_vim_mode_disables_helix_mode() {
-        let mut content = SettingsContent::default();
-        content.helix_mode = Some(true);
+        let mut content = SettingsContent {
+            helix_mode: Some(true),
+            ..Default::default()
+        };
 
         apply_vim_mode(&mut content, true);
 
