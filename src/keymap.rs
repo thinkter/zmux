@@ -1,8 +1,6 @@
 use gpui::{App, KeyBinding, actions};
 use terminal::{Copy, Paste, ScrollPageDown, ScrollPageUp, ScrollToBottom};
-use workspace::pane::{
-    ActivateNextItem, ActivatePreviousItem, CloseActiveItem, CloseAllItems, CloseOtherItems,
-};
+use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
@@ -63,8 +61,12 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-shift-u", JumpToLatestNotification, None),
         KeyBinding::new("cmd-i", ToggleNotificationCenter, None),
         KeyBinding::new("ctrl-shift-i", ToggleNotificationCenter, None),
-        KeyBinding::new("ctrl-tab", ActivateNextItem::default(), None),
-        KeyBinding::new("ctrl-shift-tab", ActivatePreviousItem::default(), None),
+        KeyBinding::new("ctrl-tab", tab_switcher::Toggle::default(), None),
+        KeyBinding::new(
+            "ctrl-shift-tab",
+            tab_switcher::Toggle { select_last: true },
+            None,
+        ),
         KeyBinding::new("ctrl-shift-w", CloseActiveItem::default(), None),
         KeyBinding::new("ctrl-shift-alt-w", CloseAllItems::default(), None),
         KeyBinding::new("ctrl-shift-o", CloseOtherItems::default(), None),

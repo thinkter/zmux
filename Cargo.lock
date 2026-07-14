@@ -6974,6 +6974,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "picker"
+version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "menu",
+ "schemars",
+ "serde",
+ "theme",
+ "theme_settings",
+ "ui",
+ "ui_input",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "pico-args"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9382,6 +9400,26 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "tab_switcher"
+version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
+dependencies = [
+ "collections",
+ "editor",
+ "fuzzy_nucleo",
+ "gpui",
+ "menu",
+ "picker",
+ "project",
+ "schemars",
+ "serde",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]
@@ -12727,6 +12765,7 @@ dependencies = [
  "session",
  "settings",
  "sha2",
+ "tab_switcher",
  "task",
  "terminal",
  "terminal_view",

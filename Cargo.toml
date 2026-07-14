@@ -11,6 +11,7 @@ settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf
 task = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 terminal = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 terminal_view = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+tab_switcher = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 theme = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 theme_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 util = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -64,6 +65,7 @@ sha2 = "0.10"
 task = { workspace = true }
 terminal = { workspace = true }
 terminal_view = { workspace = true }
+tab_switcher = { workspace = true }
 theme = { workspace = true }
 theme_settings = { workspace = true }
 util = { workspace = true }

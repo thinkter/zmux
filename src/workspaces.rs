@@ -134,6 +134,14 @@ struct WorkspaceRow {
     latest_unread: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WorkspaceSwitcherEntry {
+    pub(crate) id: WorkspaceId,
+    pub(crate) name: String,
+    pub(crate) detail: String,
+    pub(crate) unread_count: usize,
+}
+
 struct RenameState {
     id: WorkspaceId,
     editor: Entity<Editor>,
@@ -294,6 +302,36 @@ impl WorkspacesPanel {
             .iter_mut()
             .find(|entry| entry.id == self.active)
             .and_then(|entry| entry.restore.take())
+    }
+
+    pub(crate) fn switcher_entries(&self, cx: &App) -> Vec<WorkspaceSwitcherEntry> {
+        let notifications = NotificationStore::global(cx).read(cx);
+        self.entries
+            .iter()
+            .map(|entry| {
+                let mut detail = Vec::new();
+                detail.push(match entry.context.shell_count {
+                    0 => "No shells".to_string(),
+                    1 => "1 shell".to_string(),
+                    count => format!("{count} shells"),
+                });
+                if let Some(cwd) = workspace_cwd_label(&entry.context) {
+                    detail.push(cwd);
+                }
+                if let MetadataState::Ready(git) = &entry.git {
+                    detail.push(git.compact_label());
+                }
+                if let Some(process) = entry.context.foreground_processes.first() {
+                    detail.push(process.clone());
+                }
+                WorkspaceSwitcherEntry {
+                    id: entry.id,
+                    name: entry.display_name().to_string(),
+                    detail: detail.join(" · "),
+                    unread_count: notifications.workspace_unread_count(self.scope_id, entry.id),
+                }
+            })
+            .collect()
     }
 
     /// Resolve an item's logical workspace even if an `ItemAdded` callback is

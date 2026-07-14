@@ -11,9 +11,7 @@ use terminal::{TerminalBounds, TerminalBuilder};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use util::paths::PathStyle;
 use workspace::dock::Panel;
-use workspace::pane::{
-    ActivateNextItem, ActivatePreviousItem, CloseActiveItem, CloseAllItems, CloseOtherItems,
-};
+use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zmux::{
     CliEndpoint, CliNotification, CliServer, JumpToLatestNotification, NOTIFY_ENDPOINT_ENV,
@@ -1854,8 +1852,12 @@ async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppCon
         );
         assert_bound(cx, "ctrl-shift-t", &ZmuxNewTerminal);
         assert_bound(cx, "ctrl-shift-n", &ZmuxNewTerminal);
-        assert_bound(cx, "ctrl-tab", &ActivateNextItem::default());
-        assert_bound(cx, "ctrl-shift-tab", &ActivatePreviousItem::default());
+        assert_bound(cx, "ctrl-tab", &tab_switcher::Toggle::default());
+        assert_bound(
+            cx,
+            "ctrl-shift-tab",
+            &tab_switcher::Toggle { select_last: true },
+        );
         assert_bound(cx, "ctrl-shift-w", &CloseActiveItem::default());
         assert_bound(cx, "ctrl-shift-alt-w", &CloseAllItems::default());
         assert_bound(cx, "ctrl-shift-o", &CloseOtherItems::default());

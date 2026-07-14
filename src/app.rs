@@ -35,6 +35,7 @@ use crate::notifications::{NotificationTarget, WorkspaceId};
 use crate::settings_page::SettingsPage;
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
+use crate::workspace_switcher::{SwitchDirection, WorkspaceSwitcher};
 use crate::workspaces::{
     ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, RestoredTerminal,
     ToggleNotificationCenter, ToggleWorkspacesPanel, WorkspacesPanel, restore_startup_layout,
@@ -83,6 +84,7 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     Project::init(&app_state.client, cx);
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
+    tab_switcher::init(cx);
     terminal_view::init(cx);
     terminal_view::set_terminal_creation_handler(
         Arc::new(|project, working_directory, cx| {
@@ -360,29 +362,13 @@ fn open_zmux_workspace_for_paths(
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
                 };
-                let window_handle = window.window_handle();
-                cx.defer(move |cx| {
-                    window_handle
-                        .update(cx, |_, window, cx| {
-                            panel.update(cx, |panel, cx| panel.activate_next_workspace(window, cx));
-                        })
-                        .ok();
-                });
+                WorkspaceSwitcher::toggle(workspace, panel, SwitchDirection::Next, window, cx);
             });
             workspace.register_action(|workspace, _: &ActivatePreviousWorkspace, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
                     return;
                 };
-                let window_handle = window.window_handle();
-                cx.defer(move |cx| {
-                    window_handle
-                        .update(cx, |_, window, cx| {
-                            panel.update(cx, |panel, cx| {
-                                panel.activate_previous_workspace(window, cx)
-                            });
-                        })
-                        .ok();
-                });
+                WorkspaceSwitcher::toggle(workspace, panel, SwitchDirection::Previous, window, cx);
             });
             workspace.register_action(|workspace, _: &NotifyCurrentPane, window, cx| {
                 let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {

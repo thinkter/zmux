@@ -13,6 +13,7 @@ mod session;
 mod settings_page;
 mod theme;
 mod welcome;
+mod workspace_switcher;
 mod workspaces;
 
 pub use app::{
