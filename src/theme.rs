@@ -12,7 +12,9 @@ pub const DEFAULT_UI_FONT_SIZE: f32 = 16.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 14.0;
 
 pub fn default_settings_json() -> String {
-    let font_fallbacks = json!(["Lilex", "Noto Sans Mono", "Noto Color Emoji", "monospace"]);
+    // Leave explicit fallbacks unset, as Zed does. GPUI merges configured
+    // families ahead of the native CoreText, DirectWrite, or fontconfig
+    // cascade, so a cross-platform default must not name OS-specific fonts.
     let settings = json!({
         "disable_ai": true,
         "theme": DEFAULT_THEME,
@@ -20,7 +22,6 @@ pub fn default_settings_json() -> String {
         "buffer_font_family": DEFAULT_MONO_FONT,
         "buffer_font_features": {},
         "buffer_font_size": DEFAULT_TERMINAL_FONT_SIZE,
-        "buffer_font_fallbacks": font_fallbacks,
         "buffer_line_height": {
             "custom": 1.2
         },
@@ -28,7 +29,6 @@ pub fn default_settings_json() -> String {
             "font_family": DEFAULT_MONO_FONT,
             "font_features": {},
             "font_size": DEFAULT_TERMINAL_FONT_SIZE,
-            "font_fallbacks": font_fallbacks,
             "line_height": {
                 "custom": 1.2
             }

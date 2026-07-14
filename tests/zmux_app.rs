@@ -2292,12 +2292,27 @@ async fn default_settings_use_the_bundled_theme_and_mono_font(cx: &mut TestAppCo
             Some(zmux::DEFAULT_MONO_FONT)
         );
         assert_eq!(terminal_settings.font_size, Some(px(14.0)));
+        assert!(
+            terminal_settings
+                .font_fallbacks
+                .as_ref()
+                .is_none_or(|fallbacks| fallbacks.fallback_list().is_empty()),
+            "terminal defaults should not prepend named font fallbacks"
+        );
 
         let theme_settings = theme_settings::ThemeSettings::get_global(cx);
         assert_eq!(theme_settings.ui_font_size(cx), px(16.0));
         assert_eq!(
             theme_settings.buffer_font.family.as_ref(),
             zmux::DEFAULT_MONO_FONT
+        );
+        assert!(
+            theme_settings
+                .buffer_font
+                .fallbacks
+                .as_ref()
+                .is_none_or(|fallbacks| fallbacks.fallback_list().is_empty()),
+            "buffer defaults should not prepend named font fallbacks"
         );
     });
 

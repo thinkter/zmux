@@ -195,7 +195,28 @@ pub fn load_user_settings(fs: Arc<dyn Fs>, cx: &mut App) {
                 DEFAULT_THEME.into(),
             )));
         }
+        clear_legacy_font_fallbacks(content);
     });
+}
+
+/// Earlier builds seeded every settings file with a Linux-oriented font
+/// fallback list. Zed leaves this unset so GPUI can use the native platform
+/// cascade, so remove the exact seeded list while preserving hand-edited ones.
+fn clear_legacy_font_fallbacks(content: &mut settings::SettingsContent) {
+    let legacy_fallbacks = ["Lilex", "Noto Sans Mono", "Noto Color Emoji", "monospace"];
+    let is_legacy = |fallbacks: &Option<Vec<settings::FontFamilyName>>| {
+        fallbacks
+            .as_ref()
+            .is_some_and(|list| list.iter().map(AsRef::as_ref).eq(legacy_fallbacks))
+    };
+    if is_legacy(&content.theme.buffer_font_fallbacks) {
+        content.theme.buffer_font_fallbacks = None;
+    }
+    if let Some(terminal) = content.terminal.as_mut()
+        && is_legacy(&terminal.font_fallbacks)
+    {
+        terminal.font_fallbacks = None;
+    }
 }
 
 pub fn open_zmux_workspace(
@@ -973,8 +994,21 @@ fn build_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOpt
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RESTORED_TERMINAL_ATTEMPTS, restored_terminal_retry_delay};
+    use super::{
+        MAX_RESTORED_TERMINAL_ATTEMPTS, clear_legacy_font_fallbacks, restored_terminal_retry_delay,
+    };
     use std::time::Duration;
+
+    fn fallbacks(names: &[&str]) -> Option<Vec<settings::FontFamilyName>> {
+        Some(
+            names
+                .iter()
+                .map(|name| settings::FontFamilyName((*name).into()))
+                .collect(),
+        )
+    }
+
+    const LEGACY: &[&str] = &["Lilex", "Noto Sans Mono", "Noto Color Emoji", "monospace"];
 
     #[test]
     fn restored_terminal_retries_back_off_with_a_strict_cap() {
@@ -983,5 +1017,30 @@ mod tests {
         assert_eq!(restored_terminal_retry_delay(2), Duration::from_secs(2));
         assert_eq!(restored_terminal_retry_delay(6), Duration::from_secs(32));
         assert_eq!(restored_terminal_retry_delay(100), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn seeded_legacy_font_fallbacks_are_cleared() {
+        let mut content = settings::SettingsContent::default();
+        content.theme.buffer_font_fallbacks = fallbacks(LEGACY);
+        content.terminal.get_or_insert_default().font_fallbacks = fallbacks(LEGACY);
+
+        clear_legacy_font_fallbacks(&mut content);
+
+        assert_eq!(content.theme.buffer_font_fallbacks, None);
+        assert_eq!(content.terminal.unwrap().font_fallbacks, None);
+    }
+
+    #[test]
+    fn hand_edited_font_fallbacks_are_kept() {
+        let custom = &["JetBrainsMono Nerd Font"][..];
+        let mut content = settings::SettingsContent::default();
+        content.theme.buffer_font_fallbacks = fallbacks(custom);
+        content.terminal.get_or_insert_default().font_fallbacks = fallbacks(custom);
+
+        clear_legacy_font_fallbacks(&mut content);
+
+        assert_eq!(content.theme.buffer_font_fallbacks, fallbacks(custom));
+        assert_eq!(content.terminal.unwrap().font_fallbacks, fallbacks(custom));
     }
 }
