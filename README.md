@@ -38,6 +38,22 @@ process keeps going in the background while you work elsewhere.
 - Workspaces with unread agent notifications show a dot; the latest notification appears at the bottom of the sidebar.
 - Use the trash button to close a workspace; the last one can't be closed.
 
+### Trusting terminal-discovered repositories
+
+Terminal working directories and the Git repositories containing them are
+treated as untrusted input. zmux periodically invokes the `git` executable from
+its trusted host environment to populate workspace-rail metadata, but those
+automatic commands do not inherit `GIT_*` overrides. They also disable optional
+index writes and repository-local filesystem monitors; diff statistics disable
+external diff drivers and text conversion helpers.
+
+This hardening applies to zmux's automatic branch, status, and line-count
+collection. It is not a general Git sandbox: standard configuration and
+repository data are still parsed, and Git commands that you explicitly run in
+a terminal retain their normal environment and behavior. The executable search
+path and other non-Git host environment are part of the trusted application
+launch context.
+
 ## Notifications
 
 zmux accepts the terminal notification protocols used by contemporary terminal
