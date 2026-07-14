@@ -355,6 +355,7 @@ impl SessionStore {
         result
     }
 
+    #[cfg(test)]
     pub fn save(&self, snapshot: &SessionSnapshot) -> Result<SessionWriteOutcome> {
         let write = self.prepare_save(snapshot)?;
         self.commit(&write)
