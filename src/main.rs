@@ -15,21 +15,163 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    configure_zmux_paths()?;
+    configure_zmux_paths();
     zmux::run()
 }
 
 /// Point Zed's `paths` crate at a zmux-owned base directory so the settings
 /// file and database live under e.g. `~/.local/share/zmux` instead of Zed's
 /// own directories. Must run before anything resolves a path;
-/// `set_custom_data_dir` panics if called too late. A failed migration aborts
-/// startup before the database layer can create `db`, preserving the retry on
-/// the next launch.
-fn configure_zmux_paths() -> anyhow::Result<()> {
+/// `set_custom_data_dir` panics if called too late. If legacy migration fails,
+/// run from an isolated recovery directory instead of creating `base/db`: this
+/// keeps the app usable, leaves both the legacy source and intended destination
+/// untouched, and lets every later launch retry the transactional migration.
+fn configure_zmux_paths() {
     let base = zmux_data_dir();
-    migrate_legacy_database(&base)?;
-    paths::set_custom_data_dir(&base.to_string_lossy());
-    Ok(())
+    let migration = match recovery_promotion_in_progress(&base) {
+        Ok(true) => Ok(()),
+        Ok(false) => migrate_legacy_database(&base),
+        Err(error) => Err(error),
+    };
+    let data_dir = data_dir_after_legacy_migration(&base, migration);
+    paths::set_custom_data_dir(&data_dir.to_string_lossy());
+}
+
+fn data_dir_after_legacy_migration(base: &Path, migration: anyhow::Result<()>) -> PathBuf {
+    match migration {
+        Ok(()) => match promote_recovery_data(base) {
+            Ok(()) => base.to_path_buf(),
+            Err(error) => {
+                let recovery = migration_recovery_dir(base);
+                eprintln!(
+                    "failed to promote recovered zmux data: {error:#}; continuing from {}",
+                    recovery.display()
+                );
+                if base.join("db").exists() {
+                    base.to_path_buf()
+                } else {
+                    recovery
+                }
+            }
+        },
+        Err(error) => {
+            let recovery = migration_recovery_dir(base);
+            eprintln!(
+                "failed to migrate the legacy zmux database: {error:#}\n\
+                 continuing with isolated data at {}; legacy data remains untouched",
+                recovery.display()
+            );
+            recovery
+        }
+    }
+}
+
+fn migration_recovery_dir(base: &Path) -> PathBuf {
+    base.join("migration-recovery")
+}
+
+fn recovery_promotion_marker(base: &Path) -> PathBuf {
+    base.join(".recovery-promotion-in-progress")
+}
+
+fn recovery_promotion_in_progress(base: &Path) -> anyhow::Result<bool> {
+    recovery_promotion_marker(base)
+        .try_exists()
+        .context("checking recovery promotion marker")
+}
+
+/// Promote state written while migration was unavailable without discarding a
+/// later successful legacy migration. Recovery data wins because it is the
+/// user's newest state; any colliding migrated entry is atomically moved under
+/// `pre-recovery/` first so both copies remain available.
+fn promote_recovery_data(base: &Path) -> anyhow::Result<()> {
+    promote_recovery_data_with_sync(base, sync_directory)
+}
+
+fn promote_recovery_data_with_sync(
+    base: &Path,
+    mut sync: impl FnMut(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let recovery = migration_recovery_dir(base);
+    let marker = recovery_promotion_marker(base);
+    let mut entries = match fs::read_dir(&recovery) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if marker
+                .try_exists()
+                .context("checking stale promotion marker")?
+            {
+                sync(base).context("syncing completed recovery promotion")?;
+                fs::remove_file(&marker).context("removing completed promotion marker")?;
+                sync(base).context("syncing recovery promotion marker removal")?;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("reading migration recovery data"),
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.is_empty() {
+        fs::remove_dir(&recovery).context("removing empty migration recovery directory")?;
+        sync(base).context("syncing empty recovery directory removal")?;
+        if marker.try_exists().context("checking promotion marker")? {
+            fs::remove_file(&marker).context("removing recovery promotion marker")?;
+            sync(base).context("syncing empty recovery promotion marker removal")?;
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(base).context("creating zmux data directory for recovery promotion")?;
+    if !marker.try_exists().context("checking promotion marker")? {
+        let marker_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .context("creating recovery promotion marker")?;
+        marker_file
+            .sync_all()
+            .context("syncing recovery promotion marker")?;
+        sync(base).context("syncing recovery promotion start")?;
+    }
+    let archive = base.join("pre-recovery");
+    let mut archive_used = false;
+    for entry in entries {
+        let name = entry.file_name();
+        let destination = base.join(&name);
+        if destination
+            .try_exists()
+            .context("checking recovery promotion destination")?
+        {
+            fs::create_dir_all(&archive).context("creating pre-recovery archive")?;
+            let archived = archive.join(&name);
+            if archived
+                .try_exists()
+                .context("checking pre-recovery archive destination")?
+            {
+                anyhow::bail!(
+                    "cannot preserve both {} and existing archive {}",
+                    destination.display(),
+                    archived.display()
+                );
+            }
+            fs::rename(&destination, &archived).with_context(|| {
+                format!(
+                    "archiving migrated data {} as {}",
+                    destination.display(),
+                    archived.display()
+                )
+            })?;
+            archive_used = true;
+        }
+        fs::rename(entry.path(), &destination)
+            .with_context(|| format!("promoting recovered data into {}", destination.display()))?;
+    }
+    fs::remove_dir(&recovery).context("removing promoted recovery directory")?;
+    if archive_used {
+        sync(&archive).context("syncing pre-recovery archive")?;
+    }
+    sync(base).context("syncing promoted recovery data before completion")?;
+    fs::remove_file(&marker).context("removing recovery promotion marker")?;
+    sync(base).context("syncing recovery promotion completion")
 }
 
 fn zmux_data_dir() -> PathBuf {
@@ -487,6 +629,117 @@ mod tests {
             "current"
         );
         assert_eq!(fs::read_to_string(legacy.join("state")).unwrap(), "legacy");
+    }
+
+    #[test]
+    fn failed_migration_uses_isolated_data_and_keeps_primary_destination_retryable() {
+        let root = TestDirectory::new();
+        let base = root.path().join("zmux");
+
+        let selected = data_dir_after_legacy_migration(
+            &base,
+            Err(anyhow::anyhow!("injected deterministic migration failure")),
+        );
+
+        assert_eq!(selected, base.join("migration-recovery"));
+        assert!(!base.join("db").exists());
+        assert_ne!(selected, base);
+    }
+
+    #[test]
+    fn recovered_state_is_promoted_without_discarding_successfully_migrated_data() {
+        let root = TestDirectory::new();
+        let base = root.path().join("zmux");
+        let recovery = migration_recovery_dir(&base);
+        fs::create_dir_all(base.join("db")).unwrap();
+        fs::create_dir_all(recovery.join("db")).unwrap();
+        fs::create_dir_all(recovery.join("state")).unwrap();
+        fs::write(base.join("db/legacy"), "legacy").unwrap();
+        fs::write(base.join("settings.json"), "legacy settings").unwrap();
+        fs::write(recovery.join("db/current"), "current").unwrap();
+        fs::write(recovery.join("settings.json"), "current settings").unwrap();
+        fs::write(recovery.join("state/session-v1.json"), "current session").unwrap();
+
+        promote_recovery_data(&base).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(base.join("db/current")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("settings.json")).unwrap(),
+            "current settings"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("state/session-v1.json")).unwrap(),
+            "current session"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("pre-recovery/db/legacy")).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("pre-recovery/settings.json")).unwrap(),
+            "legacy settings"
+        );
+        assert!(!recovery.exists());
+        assert!(!recovery_promotion_marker(&base).exists());
+    }
+
+    #[test]
+    fn recovery_promotion_syncs_moves_before_clearing_its_journal() {
+        let root = TestDirectory::new();
+        let base = root.path().join("zmux");
+        let recovery = migration_recovery_dir(&base);
+        let archive = base.join("pre-recovery");
+        let marker = recovery_promotion_marker(&base);
+        fs::create_dir_all(base.join("db")).unwrap();
+        fs::create_dir_all(recovery.join("db")).unwrap();
+        fs::write(base.join("db/legacy"), "legacy").unwrap();
+        fs::write(recovery.join("db/current"), "current").unwrap();
+
+        let mut syncs = Vec::new();
+        promote_recovery_data_with_sync(&base, |directory| {
+            syncs.push((directory.to_path_buf(), marker.exists()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            syncs,
+            vec![
+                (base.clone(), true),
+                (archive, true),
+                (base.clone(), true),
+                (base, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_recovery_promotion_resumes_without_remigrating_or_stranding_state() {
+        let root = TestDirectory::new();
+        let base = root.path().join("zmux");
+        let recovery = migration_recovery_dir(&base);
+        fs::create_dir_all(base.join("pre-recovery/db")).unwrap();
+        fs::create_dir_all(recovery.join("db")).unwrap();
+        fs::write(base.join("pre-recovery/db/legacy"), "legacy").unwrap();
+        fs::write(recovery.join("db/current"), "current").unwrap();
+        fs::write(recovery_promotion_marker(&base), "").unwrap();
+
+        assert!(recovery_promotion_in_progress(&base).unwrap());
+        promote_recovery_data(&base).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(base.join("db/current")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("pre-recovery/db/legacy")).unwrap(),
+            "legacy"
+        );
+        assert!(!recovery.exists());
+        assert!(!recovery_promotion_marker(&base).exists());
     }
 
     #[test]

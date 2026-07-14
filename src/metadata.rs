@@ -141,7 +141,10 @@ fn metadata_git_command_with_environment(
     repository: &Path,
     environment: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Command {
-    let mut command = Command::new("git");
+    // Zed's helper applies CREATE_NO_WINDOW on Windows, avoiding a console
+    // flash for these periodic background probes while preserving std::process
+    // inspection APIs used by the hardening tests below.
+    let mut command = util::command::new_std_command("git");
     command
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .current_dir(repository)

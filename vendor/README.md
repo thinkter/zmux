@@ -21,7 +21,9 @@ notification capability before the terminal is mounted.
   `abbe85a3321bf6cb7f5b241e623d9c2e16c29187`. It adds one application-owned
   terminal factory hook and uses it for direct split cloning and persisted
   terminal deserialization, closing creation paths that otherwise bypass the
-  exact-pane CLI capability setup.
+  exact-pane CLI capability setup. Its standalone manifest repeats the same
+  release-relevant Zed lint policy as `git_ui/`; preserve that block when
+  refreshing either vendored snapshot.
 - `git_ui/` is Zed commit
   `abbe85a3321bf6cb7f5b241e623d9c2e16c29187`, copied from `crates/git_ui`.
   Its local `zmux-core` feature hides Zed-only worktree/window actions and adds

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ pub const MAX_PANES_PER_WORKSPACE: usize = 128;
 pub const MAX_TERMINALS_PER_WORKSPACE: usize = 256;
 pub const MAX_NAME_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 4_096;
+const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -234,16 +236,22 @@ struct SessionWriter {
     write_lock: Mutex<()>,
 }
 
+/// Durable session-file boundary.
+///
+/// `WorkspacesPanel` coalesces ordinary UI requests, while this store also
+/// orders direct/concurrent callers and performs the platform-specific durable
+/// replacement. Keeping both layers is intentional: scheduler correctness must
+/// not be required for an older write to avoid replacing a newer file.
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     path: PathBuf,
     writer: Arc<SessionWriter>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SessionWrite {
     sequence: u64,
-    bytes: Vec<u8>,
+    snapshot: SessionSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,13 +293,10 @@ impl SessionStore {
         Ok(Some(snapshot))
     }
 
+    /// Reserve this write's place in the newest-wins order. Validation and
+    /// serialization are deferred to `commit` so callers on the UI thread
+    /// only pay for an atomic increment here.
     pub fn prepare_save(&self, snapshot: &SessionSnapshot) -> Result<SessionWrite> {
-        snapshot.validate()?;
-        let bytes = serde_json::to_vec_pretty(snapshot).context("serializing zmux session")?;
-        if bytes.len() as u64 > MAX_SESSION_BYTES {
-            bail!("serialized zmux session exceeds the {MAX_SESSION_BYTES}-byte limit");
-        }
-
         let sequence = self
             .writer
             .next_sequence
@@ -304,10 +309,20 @@ impl SessionStore {
         self.writer
             .newest_sequence
             .fetch_max(sequence, Ordering::Release);
-        Ok(SessionWrite { sequence, bytes })
+        Ok(SessionWrite {
+            sequence,
+            snapshot: snapshot.clone(),
+        })
     }
 
     pub fn commit(&self, write: &SessionWrite) -> Result<SessionWriteOutcome> {
+        write.snapshot.validate()?;
+        let bytes =
+            serde_json::to_vec_pretty(&write.snapshot).context("serializing zmux session")?;
+        if bytes.len() as u64 > MAX_SESSION_BYTES {
+            bail!("serialized zmux session exceeds the {MAX_SESSION_BYTES}-byte limit");
+        }
+
         let _write_guard = self
             .writer
             .write_lock
@@ -322,6 +337,9 @@ impl SessionStore {
             .parent()
             .context("zmux session path has no parent")?;
         fs::create_dir_all(parent).context("creating zmux session directory")?;
+        // Reclaim crash-orphaned siblings without deleting a young temporary
+        // that another process may still be preparing for the same path.
+        remove_stale_temporaries(&self.path);
         let temporary = temporary_path(&self.path)?;
         let mut temporary_created = false;
         let result = (|| {
@@ -331,7 +349,7 @@ impl SessionStore {
                 .open(&temporary)
                 .context("creating temporary zmux session")?;
             temporary_created = true;
-            file.write_all(&write.bytes)
+            file.write_all(&bytes)
                 .context("writing temporary zmux session")?;
             file.sync_all().context("syncing temporary zmux session")?;
             drop(file);
@@ -364,6 +382,35 @@ impl SessionStore {
     fn is_superseded(&self, write: &SessionWrite) -> bool {
         write.sequence < self.writer.newest_sequence.load(Ordering::Acquire)
     }
+}
+
+fn remove_stale_temporaries(path: &Path) {
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let mut prefix = file_name.to_os_string();
+    prefix.push(".tmp-");
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if entry.file_name().to_string_lossy().starts_with(&prefix)
+            && modified.is_some_and(|modified| temporary_is_stale(modified, now))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn temporary_is_stale(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= STALE_TEMPORARY_AGE)
 }
 
 fn temporary_path(path: &Path) -> Result<PathBuf> {
@@ -493,6 +540,45 @@ mod tests {
         let mut invalid = snapshot();
         invalid.workspaces[0].manual_name = Some("x".repeat(MAX_NAME_BYTES + 1));
         assert!(store.save(&invalid).is_err());
+    }
+
+    #[test]
+    fn only_old_temporary_session_files_are_reclaimed() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        assert!(!temporary_is_stale(
+            now - STALE_TEMPORARY_AGE + Duration::from_secs(1),
+            now
+        ));
+        assert!(temporary_is_stale(now - STALE_TEMPORARY_AGE, now));
+        assert!(!temporary_is_stale(now + Duration::from_secs(1), now));
+    }
+
+    #[test]
+    fn stale_temporary_cleanup_is_scoped_to_the_session_file() {
+        let store = test_store("stale-temporary-cleanup");
+        let parent = store.path().parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        let session_name = store.path().file_name().unwrap().to_string_lossy();
+        let stale = parent.join(format!("{session_name}.tmp-dead-process"));
+        let recent = parent.join(format!("{session_name}.tmp-live-process"));
+        let unrelated = parent.join("other-session.json.tmp-dead-process");
+        fs::write(&stale, "stale").unwrap();
+        fs::write(&recent, "recent").unwrap();
+        fs::write(&unrelated, "unrelated").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(SystemTime::now() - STALE_TEMPORARY_AGE),
+            )
+            .unwrap();
+
+        remove_stale_temporaries(store.path());
+
+        assert!(!stale.exists());
+        assert!(recent.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]
