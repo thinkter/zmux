@@ -22,6 +22,8 @@ pub struct GitMetadata {
     pub dirty_files: usize,
     pub ahead: usize,
     pub behind: usize,
+    pub added_lines: usize,
+    pub deleted_lines: usize,
 }
 
 impl GitMetadata {
@@ -88,9 +90,57 @@ pub fn collect_git_metadata(repository: &Path) -> MetadataState<GitMetadata> {
     let _ = status;
 
     match parse_git_status(&String::from_utf8_lossy(&output)) {
-        Some(metadata) => MetadataState::Ready(metadata),
+        Some(mut metadata) => {
+            if let Some((added_lines, deleted_lines)) = collect_git_diff_stats(repository) {
+                metadata.added_lines = added_lines;
+                metadata.deleted_lines = deleted_lines;
+            }
+            MetadataState::Ready(metadata)
+        }
         None => MetadataState::Error("git returned an invalid status summary".into()),
     }
+}
+
+fn collect_git_diff_stats(repository: &Path) -> Option<(usize, usize)> {
+    let mut child = Command::new("git")
+        .args(["diff", "--numstat", "HEAD", "--"])
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut output = Vec::new();
+    if child
+        .stdout
+        .take()?
+        .take(MAX_GIT_OUTPUT_BYTES + 1)
+        .read_to_end(&mut output)
+        .is_err()
+        || output.len() as u64 > MAX_GIT_OUTPUT_BYTES
+        || !child.wait().ok()?.success()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    Some(parse_git_numstat(&String::from_utf8_lossy(&output)))
+}
+
+fn parse_git_numstat(output: &str) -> (usize, usize) {
+    output.lines().fold((0usize, 0usize), |totals, line| {
+        let mut fields = line.splitn(3, '\t');
+        let Some(added) = fields.next().and_then(|value| value.parse::<usize>().ok()) else {
+            return totals;
+        };
+        let Some(deleted) = fields.next().and_then(|value| value.parse::<usize>().ok()) else {
+            return totals;
+        };
+        (
+            totals.0.saturating_add(added),
+            totals.1.saturating_add(deleted),
+        )
+    })
 }
 
 fn parse_git_status(output: &str) -> Option<GitMetadata> {
@@ -115,6 +165,8 @@ fn parse_git_status(output: &str) -> Option<GitMetadata> {
         dirty_files: lines.count(),
         ahead,
         behind,
+        added_lines: 0,
+        deleted_lines: 0,
     })
 }
 
@@ -146,6 +198,8 @@ mod tests {
         assert_eq!(metadata.dirty_files, 2);
         assert_eq!(metadata.ahead, 2);
         assert_eq!(metadata.behind, 1);
+        assert_eq!(metadata.added_lines, 0);
+        assert_eq!(metadata.deleted_lines, 0);
     }
 
     #[test]
@@ -159,6 +213,14 @@ mod tests {
         assert_eq!(
             parse_git_status("## HEAD (no branch)\n").unwrap().branch,
             "detached"
+        );
+    }
+
+    #[test]
+    fn parses_numstat_totals_and_ignores_binary_files() {
+        assert_eq!(
+            parse_git_numstat("8\t4\tsrc/app.rs\n7\t2\tsrc/workspaces.rs\n-\t-\timage.png\n"),
+            (15, 6)
         );
     }
 }

@@ -1116,6 +1116,12 @@ impl WorkspacesPanel {
             }
             MetadataState::NotRequested => None,
         };
+        let diff_stats = match &entry.git {
+            MetadataState::Ready(git) if git.added_lines > 0 || git.deleted_lines > 0 => {
+                Some((git.added_lines, git.deleted_lines))
+            }
+            _ => None,
+        };
         let name_area = v_flex()
             .id(("ws-name-area", id as usize))
             .flex_1()
@@ -1152,6 +1158,22 @@ impl WorkspacesPanel {
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .single_line(),
+                                ),
+                        )
+                    })
+                    .when_some(diff_stats, |this, (added, deleted)| {
+                        this.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(
+                                    Label::new(format!("+{added}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Success),
+                                )
+                                .child(
+                                    Label::new(format!("-{deleted}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Error),
                                 ),
                         )
                     })
