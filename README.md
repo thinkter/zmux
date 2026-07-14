@@ -102,6 +102,7 @@ Vulkan-capable driver and declares the Vulkan loader dependency explicitly.
 Build notes:
 
 - `zmux` wraps Zed's GPUI terminal view, which pulls in substantial editor/workspace/UI code. The required Zed crates are fetched from `https://github.com/zed-industries/zed` at the pinned revision recorded in `Cargo.toml` and `Cargo.lock`
+- On the first run after moving away from Zed's data directory, legacy databases are copied into a private staging directory and atomically installed without changing the Zed copy. Each live WAL-mode `db.sqlite` is captured with SQLite's online backup API; raw WAL, shared-memory, and rollback-journal sidecars are not copied.
 - Release builds strip symbols and use `panic = "abort"` to reduce artifact size without enabling slower size optimizations such as LTO by default.
 - Linux and FreeBSD builds enable `gpui_platform`'s `font-kit`, `wayland`, and `x11` backends. macOS and Windows avoid those Linux display features in this crate's target-specific dependency configuration.
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.
