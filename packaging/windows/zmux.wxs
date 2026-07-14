@@ -15,7 +15,10 @@
       <Directory Id="LocalProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="zmux">
           <Component Id="MainExecutable" Guid="500E1C04-CA58-4D10-885C-F6965DD98457">
-            <File Id="ZMuxExecutable" Source="$(var.SourceDir)\zmux.exe">
+            <!-- Start Menu launches the GUI-subsystem binary so Windows never
+                 allocates a background console. The console-subsystem binary
+                 remains installed for `zmux notify` and useful CLI errors. -->
+            <File Id="ZMuxGuiExecutable" Source="$(var.SourceDir)\zmux-gui.exe">
               <Shortcut
                 Id="StartMenuShortcut"
                 Directory="ProgramMenuFolder"
@@ -28,6 +31,7 @@
                   Value="io.github.thinkter.zmux" />
               </Shortcut>
             </File>
+            <File Id="ZMuxCliExecutable" Source="$(var.SourceDir)\zmux.exe" />
             <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
             <RegistryValue
               Root="HKCU"

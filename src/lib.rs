@@ -5,6 +5,7 @@ mod desktop_notifications;
 mod env;
 mod fonts;
 mod keymap;
+mod launcher;
 mod metadata;
 mod notification_runtime;
 mod notifications;
@@ -31,6 +32,7 @@ pub use keymap::{
     NewTerminal, OpenSettings, SplitTerminalDown, SplitTerminalRight, configure_keybindings,
     configure_zoom_actions,
 };
+pub use launcher::run_gui;
 pub use notifications::{
     Notification, NotificationId, NotificationLevel, NotificationRequest, NotificationSequence,
     NotificationSource, NotificationStore, NotificationTarget, WorkspaceId,

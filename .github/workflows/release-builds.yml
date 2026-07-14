@@ -366,6 +366,16 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Signing zmux.exe failed' }
             & $signTool.FullName verify /pa /v target/release/zmux.exe
             if ($LASTEXITCODE -ne 0) { throw 'Verifying zmux.exe failed' }
+            & $signTool.FullName sign `
+              /fd SHA256 `
+              /f $certificate `
+              /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              target/release/zmux-gui.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Signing zmux-gui.exe failed' }
+            & $signTool.FullName verify /pa /v target/release/zmux-gui.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Verifying zmux-gui.exe failed' }
             $msiName = 'zmux-windows-x86_64.msi'
           } else {
             if ($isTagRelease) {
@@ -422,10 +432,23 @@ jobs:
               ForEach-Object FullName
           }
           if (-not $dumpbinPath) { throw 'Could not find dumpbin.exe' }
-          $dependencies = (& $dumpbinPath /DEPENDENTS target/release/zmux.exe | Out-String)
-          if ($LASTEXITCODE -ne 0) { throw 'Inspecting zmux.exe dependencies failed' }
-          if ($dependencies -match '(?im)\b(?:vcruntime14|msvcp14|concrt14)[^\s]*\.dll\b') {
-            throw "The MSI executable still requires an unbundled VC++ runtime:`n$dependencies"
+          foreach ($executable in @('target/release/zmux.exe', 'target/release/zmux-gui.exe')) {
+            $dependencies = (& $dumpbinPath /DEPENDENTS $executable | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "Inspecting $executable dependencies failed" }
+            if ($dependencies -match '(?im)\b(?:vcruntime14|msvcp14|concrt14)[^\s]*\.dll\b') {
+              throw "$executable still requires an unbundled VC++ runtime:`n$dependencies"
+            }
+          }
+
+          $guiHeaders = (& $dumpbinPath /HEADERS target/release/zmux-gui.exe | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw 'Inspecting zmux-gui.exe headers failed' }
+          if ($guiHeaders -notmatch '(?im)^\s*2\s+subsystem\s+\(Windows GUI\)\s*$') {
+            throw "zmux-gui.exe is not a Windows GUI-subsystem executable:`n$guiHeaders"
+          }
+          $cliHeaders = (& $dumpbinPath /HEADERS target/release/zmux.exe | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw 'Inspecting zmux.exe headers failed' }
+          if ($cliHeaders -notmatch '(?im)^\s*3\s+subsystem\s+\(Windows CUI\)\s*$') {
+            throw "zmux.exe is not a Windows console-subsystem executable:`n$cliHeaders"
           }
 
           $decompiled = Join-Path $env:RUNNER_TEMP 'zmux-decompiled.wxs'
@@ -440,18 +463,19 @@ jobs:
             -PassThru
           if ($install.ExitCode -ne 0) { throw "MSI install failed with $($install.ExitCode)" }
           $installedExecutable = Join-Path $env:LOCALAPPDATA 'Programs\zmux\zmux.exe'
+          $installedGuiExecutable = Join-Path $env:LOCALAPPDATA 'Programs\zmux\zmux-gui.exe'
           $installedLicense = Join-Path $env:LOCALAPPDATA 'Programs\zmux\LICENSE'
           $installedShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\zmux.lnk'
-          foreach ($path in @($installedExecutable, $installedLicense, $installedShortcut)) {
+          foreach ($path in @($installedExecutable, $installedGuiExecutable, $installedLicense, $installedShortcut)) {
             if (-not (Test-Path $path)) { throw "MSI did not install expected path: $path" }
           }
           $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($installedShortcut)
-          if ($shortcut.TargetPath -ne $installedExecutable) {
-            throw "Start Menu shortcut targets $($shortcut.TargetPath), expected $installedExecutable"
+          if ($shortcut.TargetPath -ne $installedGuiExecutable) {
+            throw "Start Menu shortcut targets $($shortcut.TargetPath), expected $installedGuiExecutable"
           }
           $stdout = Join-Path $env:RUNNER_TEMP 'zmux-windows-smoke.stdout.log'
           $stderr = Join-Path $env:RUNNER_TEMP 'zmux-windows-smoke.stderr.log'
-          $application = Start-Process $installedExecutable `
+          $application = Start-Process $installedGuiExecutable `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr `
             -PassThru
