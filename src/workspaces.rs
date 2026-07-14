@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Axis, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global,
-    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
+    App, Axis, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
+    Global, IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
     WeakEntity, Window, actions, div, point, px, size,
 };
 use terminal_view::TerminalView;
@@ -165,7 +165,11 @@ impl Render for DraggedWorkspace {
             .shadow_md()
             .bg(cx.theme().colors().element_selected)
             .child(Icon::new(IconName::Terminal).size(IconSize::Small))
-            .child(Label::new(self.name.clone()).size(LabelSize::Small))
+            .child(
+                Label::new(self.name.clone())
+                    .size(LabelSize::Default)
+                    .weight(FontWeight::BOLD),
+            )
     }
 }
 
@@ -819,12 +823,9 @@ impl WorkspacesPanel {
                 ),
                 None => this.child(
                     Label::new(entry.name.clone())
-                        .size(LabelSize::Small)
-                        .color(if is_active {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        })
+                        .size(LabelSize::Default)
+                        .weight(FontWeight::BOLD)
+                        .color(Color::Default)
                         .single_line(),
                 ),
             })
@@ -843,7 +844,7 @@ impl WorkspacesPanel {
                         }))
                         .child(
                             Label::new(unread_count.to_string())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(Color::Accent),
                         ),
                 )
@@ -877,14 +878,14 @@ impl WorkspacesPanel {
                     .overflow_hidden()
                     .child(
                         Label::new(shell_label)
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Small)
                             .color(Color::Muted)
                             .single_line(),
                     )
                     .when_some(cwd_label, |this, cwd| {
                         this.child(
                             Label::new(cwd)
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(Color::Muted)
                                 .single_line(),
                         )
@@ -897,7 +898,7 @@ impl WorkspacesPanel {
                                 .bg(cx.theme().colors().element_background)
                                 .child(
                                     Label::new(git)
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .single_line(),
                                 ),
@@ -910,7 +911,7 @@ impl WorkspacesPanel {
                             .bg(cx.theme().colors().element_background)
                             .child(
                                 Label::new(process.clone())
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Small)
                                     .color(Color::Muted)
                                     .single_line(),
                             )
@@ -919,7 +920,7 @@ impl WorkspacesPanel {
             .when_some(entry.latest_unread.clone(), |this, latest| {
                 this.child(
                     Label::new(latest)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Accent)
                         .single_line(),
                 )
@@ -1225,8 +1226,9 @@ impl Render for WorkspacesPanel {
                     .border_color(cx.theme().colors().border)
                     .child(
                         Label::new("Workspaces")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                            .size(LabelSize::Default)
+                            .weight(FontWeight::SEMIBOLD)
+                            .color(Color::Default),
                     )
                     .child(
                         h_flex()
