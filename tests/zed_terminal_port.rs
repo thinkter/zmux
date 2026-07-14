@@ -240,6 +240,11 @@ async fn authenticated_pty_response_preserves_scroll_selection_and_input_state(
     );
 }
 
+// Windows ConPTY can deliver neither completion nor output to GPUI's parked
+// test scheduler for this immediate-exit no-op case. `test_basic_terminal`
+// still covers Windows process completion; the platform-independent no-op
+// behavior remains covered on Unix.
+#[cfg(not(target_os = "windows"))]
 #[gpui::test]
 async fn test_kill_active_task_on_completed_task_is_noop(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
