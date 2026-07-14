@@ -39,7 +39,13 @@ actions!(
     ]
 );
 
-const PANEL_WIDTH: f32 = 240.0;
+const PANEL_WIDTH_REMS: f32 = 15.0;
+const PANEL_MIN_WIDTH_REMS: f32 = 12.0;
+const NOTIFICATION_DRAWER_HEIGHT_REMS: f32 = 17.5;
+
+fn scaled_panel_size(rem_size: Pixels, rems: f32) -> Pixels {
+    px(f32::from(rem_size) * rems)
+}
 
 /// A detached snapshot of a workspace's center: the split tree plus the live
 /// terminal item handles, which keep the underlying terminals running while the
@@ -639,7 +645,7 @@ impl Focusable for WorkspacesPanel {
 impl EventEmitter<PanelEvent> for WorkspacesPanel {}
 
 impl Render for WorkspacesPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<_> = self
             .entries
             .iter()
@@ -721,7 +727,10 @@ impl Render for WorkspacesPanel {
             .when(self.notifications_expanded, |this| {
                 this.child(
                     v_flex()
-                        .max_h(px(280.0))
+                        .max_h(scaled_panel_size(
+                            window.rem_size(),
+                            NOTIFICATION_DRAWER_HEIGHT_REMS,
+                        ))
                         .border_t_1()
                         .border_color(cx.theme().colors().border)
                         .child(
@@ -845,8 +854,12 @@ impl Panel for WorkspacesPanel {
     ) {
     }
 
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(PANEL_WIDTH)
+    fn default_size(&self, window: &Window, _cx: &App) -> Pixels {
+        scaled_panel_size(window.rem_size(), PANEL_WIDTH_REMS)
+    }
+
+    fn min_size(&self, window: &Window, _cx: &App) -> Option<Pixels> {
+        Some(scaled_panel_size(window.rem_size(), PANEL_MIN_WIDTH_REMS))
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
@@ -1074,6 +1087,13 @@ fn restore_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_panel_dimensions_follow_ui_scale() {
+        assert_eq!(scaled_panel_size(px(16.0), PANEL_WIDTH_REMS), px(240.0));
+        assert_eq!(scaled_panel_size(px(22.4), PANEL_WIDTH_REMS), px(336.0));
+        assert_eq!(scaled_panel_size(px(22.4), PANEL_MIN_WIDTH_REMS), px(268.8));
+    }
 
     fn leaf(x: f32, y: f32, w: f32, h: f32) -> (Bounds<Pixels>, StoredLayout) {
         (
