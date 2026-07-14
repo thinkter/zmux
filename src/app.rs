@@ -432,7 +432,7 @@ fn open_zmux_workspace_for_paths(
                 };
                 NotificationRuntime::jump_to_latest_unread(panel.entity_id(), cx);
             });
-            let startup_restore = panel.update(cx, |panel, _| panel.take_initial_restore());
+            let startup_restore = panel.read(cx).initial_restore();
             if let Some(layout) = startup_restore {
                 let workspace_id = panel.read(cx).active_workspace_id();
                 let generation = panel.read(cx).active_workspace_generation();
@@ -620,9 +620,17 @@ pub(crate) fn create_restored_terminals_for_workspace(
                 true
             })?;
             if !attached {
-                break;
+                // A workspace switch deliberately aborts the remainder of the
+                // restore. Its partial context must not become authoritative
+                // and overwrite the persisted repository selection.
+                return Ok(());
             }
         }
+        panel
+            .update(cx, |panel, cx| {
+                panel.finish_restored_git_discovery(owning_workspace_id, cx);
+            })
+            .ok();
         Ok(())
     })
 }

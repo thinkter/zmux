@@ -9,7 +9,7 @@
 //! stays snappy regardless of how many terminals are open.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,14 +85,28 @@ struct WorkspaceEntry {
     context: WorkspaceContext,
     default_directory: Option<PathBuf>,
     selected_git_root: Option<PathBuf>,
+    git_discovery: GitDiscoveryState,
     git: MetadataState<GitMetadata>,
     metadata_root: Option<PathBuf>,
     metadata_refreshed_at: Option<Instant>,
-    /// A persisted layout that has not been materialized into fresh terminals yet.
+    /// The complete persisted layout, retained until every fresh terminal has
+    /// materialized so an interrupted restore can retry without losing tabs.
     restore: Option<LayoutSnapshot>,
     /// `Some` while the workspace is parked in the background, `None` while it is
     /// the active workspace displayed in the center.
     stored: Option<StoredLayout>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitDiscoveryState {
+    /// A persisted layout has not finished recreating all of its terminals, so
+    /// an empty or partial context cannot disprove the persisted selection.
+    Restoring,
+    /// Every restored terminal view is mounted, but one or more shells have
+    /// not reported the working directory needed for repository discovery.
+    Discovering,
+    /// Every currently owned terminal contributes to repository discovery.
+    Authoritative,
 }
 
 #[derive(Default)]
@@ -127,6 +141,89 @@ struct WorkspaceContext {
     git_root: Option<PathBuf>,
     foreground_processes: Vec<String>,
     shell_count: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GitRootReconciliation {
+    added: BTreeSet<PathBuf>,
+    removed: BTreeSet<PathBuf>,
+}
+
+fn git_root_reference_counts<'a>(
+    roots_by_workspace: impl IntoIterator<Item = &'a [PathBuf]>,
+) -> BTreeMap<PathBuf, usize> {
+    let mut counts = BTreeMap::new();
+    for roots in roots_by_workspace {
+        for root in roots {
+            *counts.entry(root.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn git_root_is_referenced<'a>(
+    roots_by_workspace: impl IntoIterator<Item = &'a [PathBuf]>,
+    root: &Path,
+) -> bool {
+    roots_by_workspace
+        .into_iter()
+        .any(|roots| roots.iter().any(|candidate| candidate == root))
+}
+
+fn plan_git_root_reconciliation(
+    reference_counts: BTreeMap<PathBuf, usize>,
+    attached: &BTreeSet<PathBuf>,
+    pending: &BTreeSet<PathBuf>,
+) -> GitRootReconciliation {
+    let added = reference_counts
+        .keys()
+        .filter(|root| !attached.contains(*root) && !pending.contains(*root))
+        .cloned()
+        .collect();
+    let removed = attached
+        .iter()
+        .filter(|root| !reference_counts.contains_key(*root))
+        .cloned()
+        .collect();
+    GitRootReconciliation { added, removed }
+}
+
+fn reconcile_selected_git_root(
+    selected: &mut Option<PathBuf>,
+    discovered_roots: &[PathBuf],
+    discovery: GitDiscoveryState,
+) {
+    if discovery != GitDiscoveryState::Authoritative {
+        return;
+    }
+    if selected
+        .as_ref()
+        .is_none_or(|root| !discovered_roots.contains(root))
+    {
+        *selected = discovered_roots.first().cloned();
+    }
+}
+
+fn restored_snapshot_git_roots(layout: &LayoutSnapshot) -> BTreeSet<PathBuf> {
+    fn visit(node: &LayoutNodeSnapshot, roots: &mut BTreeSet<PathBuf>) {
+        match node {
+            LayoutNodeSnapshot::Leaf { tabs, .. } => {
+                roots.extend(
+                    tabs.iter()
+                        .filter_map(|terminal| terminal.working_directory.as_deref())
+                        .filter_map(nearest_git_root),
+                );
+            }
+            LayoutNodeSnapshot::Split { first, second, .. } => {
+                visit(first, roots);
+                visit(second, roots);
+            }
+        }
+    }
+
+    let mut roots = BTreeSet::new();
+    visit(&layout.root, &mut roots);
+    roots
 }
 
 #[derive(Clone)]
@@ -389,6 +486,7 @@ impl WorkspacesPanel {
                         context: WorkspaceContext::default(),
                         default_directory: workspace.default_directory.clone(),
                         selected_git_root: workspace.selected_git_root.clone(),
+                        git_discovery: GitDiscoveryState::Restoring,
                         git: MetadataState::NotRequested,
                         metadata_root: None,
                         metadata_refreshed_at: None,
@@ -408,6 +506,7 @@ impl WorkspacesPanel {
                     context: WorkspaceContext::default(),
                     default_directory: None,
                     selected_git_root: None,
+                    git_discovery: GitDiscoveryState::Authoritative,
                     git: MetadataState::NotRequested,
                     metadata_root: None,
                     metadata_refreshed_at: None,
@@ -499,11 +598,11 @@ impl WorkspacesPanel {
             .and_then(|entry| entry.default_directory.clone())
     }
 
-    pub(crate) fn take_initial_restore(&mut self) -> Option<LayoutSnapshot> {
+    pub(crate) fn initial_restore(&self) -> Option<LayoutSnapshot> {
         self.entries
-            .iter_mut()
+            .iter()
             .find(|entry| entry.id == self.active)
-            .and_then(|entry| entry.restore.take())
+            .and_then(|entry| entry.restore.clone())
     }
 
     pub(crate) fn switcher_entries(&self, cx: &App) -> Vec<WorkspaceSwitcherEntry> {
@@ -592,6 +691,7 @@ impl WorkspacesPanel {
             context: WorkspaceContext::default(),
             default_directory,
             selected_git_root: None,
+            git_discovery: GitDiscoveryState::Authoritative,
             git: MetadataState::NotRequested,
             metadata_root: None,
             metadata_refreshed_at: None,
@@ -633,46 +733,87 @@ impl WorkspacesPanel {
         let target_generation = self.activation_generation;
         // Take the target's parked layout out before we borrow the workspace so we
         // don't have to touch `self` inside the update closure.
-        let target_layout = self
+        let (target_layout, target_restore) = self
             .entries
             .iter_mut()
             .find(|entry| entry.id == id)
-            .and_then(|entry| entry.stored.take());
-        let target_restore = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| entry.restore.take());
+            .map(|entry| {
+                let restore = (entry.git_discovery == GitDiscoveryState::Restoring)
+                    .then(|| entry.restore.clone())
+                    .flatten();
+                (entry.stored.take(), restore)
+            })
+            .unwrap_or_default();
         let target_default_directory = self.default_directory_for(id);
 
-        let (captured, restored_terminals) = workspace.update(cx, |workspace, cx| {
-            let captured = capture_layout(workspace, cx);
-            clear_center(workspace, window, cx);
-            let mut restored_terminals = Vec::new();
+        let (captured, restored_terminals, restored_snapshot) =
+            workspace.update(cx, |workspace, cx| {
+                let captured = capture_layout(workspace, cx);
+                clear_center(workspace, window, cx);
+                let mut restored_terminals = Vec::new();
+                let mut restored_snapshot = false;
 
-            let target_pane = workspace.active_pane().clone();
-            match (target_layout, target_restore) {
-                (Some(layout), _) => {
-                    let mut pending_ratios = Vec::new();
-                    let focused = restore_layout(
-                        workspace,
-                        target_pane,
-                        layout,
-                        window,
-                        cx,
-                        &mut pending_ratios,
-                    );
-                    if let Some(focused) = focused {
-                        window.focus(&focused.focus_handle(cx), cx);
+                let target_pane = workspace.active_pane().clone();
+                match (target_restore, target_layout) {
+                    (Some(layout), _) => {
+                        // A restore snapshot remains owned by the entry until
+                        // all shells attach. If a previous attempt was parked
+                        // midway through, discard that partial live layout and
+                        // retry the complete persisted snapshot.
+                        restored_snapshot = true;
+                        let mut pending_ratios = Vec::new();
+                        let focused = restore_snapshot_layout(
+                            workspace,
+                            target_pane,
+                            &layout,
+                            window,
+                            cx,
+                            &mut restored_terminals,
+                            &mut pending_ratios,
+                        );
+                        if let Some(focused) = focused {
+                            window.focus(&focused.focus_handle(cx), cx);
+                        }
+                        schedule_ratio_restores(workspace, pending_ratios, window, cx);
                     }
-                    schedule_ratio_restores(workspace, pending_ratios, window, cx);
-                    // A new workspace can be parked while its asynchronous
-                    // first shell is still spawning. That stale completion is
-                    // correctly rejected by the explicit workspace/pane
-                    // guard, but the parked snapshot then contains only the
-                    // Welcome item. Retry when that snapshot is activated so
-                    // `Some(layout)` cannot become permanently terminal-less.
-                    if !center_has_provisioned_terminal(workspace, cx) {
+                    (None, Some(layout)) => {
+                        let mut pending_ratios = Vec::new();
+                        let focused = restore_layout(
+                            workspace,
+                            target_pane,
+                            layout,
+                            window,
+                            cx,
+                            &mut pending_ratios,
+                        );
+                        if let Some(focused) = focused {
+                            window.focus(&focused.focus_handle(cx), cx);
+                        }
+                        schedule_ratio_restores(workspace, pending_ratios, window, cx);
+                        // A new workspace can be parked while its asynchronous
+                        // first shell is still spawning. Non-restored workspaces
+                        // do not own a retry snapshot, so provision a replacement
+                        // if their parked layout is still terminal-less.
+                        if !center_has_provisioned_terminal(workspace, cx) {
+                            create_center_terminal_for_workspace(
+                                workspace,
+                                id,
+                                target_generation,
+                                target_default_directory.clone(),
+                                window,
+                                cx,
+                            )
+                            .detach_and_log_err(cx);
+                        }
+                    }
+                    (None, None) => {
+                        //spawning a new terminal sometimes fails...
+                        // this a good workarround for now. gotta add some sorta retry logic
+                        let welcome = cx.new(ZmuxWelcome::new);
+                        let target_pane = workspace.active_pane().clone();
+                        target_pane.update(cx, |pane, cx| {
+                            pane.add_item(Box::new(welcome), true, true, None, window, cx);
+                        });
                         create_center_terminal_for_workspace(
                             workspace,
                             id,
@@ -684,50 +825,19 @@ impl WorkspacesPanel {
                         .detach_and_log_err(cx);
                     }
                 }
-                (None, Some(layout)) => {
-                    let mut pending_ratios = Vec::new();
-                    let focused = restore_snapshot_layout(
-                        workspace,
-                        target_pane,
-                        &layout,
-                        window,
-                        cx,
-                        &mut restored_terminals,
-                        &mut pending_ratios,
-                    );
-                    if let Some(focused) = focused {
-                        window.focus(&focused.focus_handle(cx), cx);
-                    }
-                    schedule_ratio_restores(workspace, pending_ratios, window, cx);
-                }
-                (None, None) => {
-                    //spawning a new terminal sometimes fails...
-                    // this a good workarround for now. gotta add some sorta retry logic
-                    let welcome = cx.new(ZmuxWelcome::new);
-                    let target_pane = workspace.active_pane().clone();
-                    target_pane.update(cx, |pane, cx| {
-                        pane.add_item(Box::new(welcome), true, true, None, window, cx);
-                    });
-                    create_center_terminal_for_workspace(
-                        workspace,
-                        id,
-                        target_generation,
-                        target_default_directory.clone(),
-                        window,
-                        cx,
-                    )
-                    .detach_and_log_err(cx);
-                }
-            }
-            workspace.focus_center_pane(window, cx);
-            (captured, restored_terminals)
-        });
+                workspace.focus_center_pane(window, cx);
+                (captured, restored_terminals, restored_snapshot)
+            });
 
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == previous) {
             entry.stored = Some(captured);
         }
         self.active = id;
-        if !restored_terminals.is_empty() {
+        if restored_snapshot && restored_terminals.is_empty() {
+            // Empty snapshots have no asynchronous terminal task that could
+            // otherwise announce completion.
+            self.finish_restored_git_discovery(id, cx);
+        } else if !restored_terminals.is_empty() {
             workspace.update(cx, |workspace, cx| {
                 create_restored_terminals_for_workspace(
                     workspace,
@@ -792,6 +902,8 @@ impl WorkspacesPanel {
 
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
+        self.reconcile_git_context(cx);
+        self.request_metadata_refreshes(cx);
         if self.notification_filter == Some(id) {
             self.notification_filter = None;
         }
@@ -849,38 +961,67 @@ impl WorkspacesPanel {
             }
         }
 
-        if changed {
+        let discovery_changed = self.promote_restored_git_discovery();
+        if changed || discovery_changed {
             cx.notify();
         }
         self.reconcile_git_context(cx);
     }
 
-    fn reconcile_git_context(&mut self, cx: &mut Context<Self>) {
+    fn promote_restored_git_discovery(&mut self) -> bool {
+        let mut changed = false;
         for entry in &mut self.entries {
-            if entry
-                .selected_git_root
+            if entry.git_discovery != GitDiscoveryState::Discovering {
+                continue;
+            }
+            let expected_roots = entry
+                .restore
                 .as_ref()
-                .is_none_or(|root| !entry.context.git_roots.contains(root))
+                .map(restored_snapshot_git_roots)
+                .unwrap_or_default();
+            if expected_roots
+                .iter()
+                .all(|root| entry.context.git_roots.contains(root))
             {
-                entry.selected_git_root = entry.context.git_roots.first().cloned();
+                entry.restore = None;
+                entry.git_discovery = GitDiscoveryState::Authoritative;
+                changed = true;
             }
         }
+        changed
+    }
 
-        let roots = self
-            .entries
-            .iter()
-            .flat_map(|entry| entry.context.git_roots.iter().cloned())
-            .collect::<BTreeSet<_>>();
+    fn reconcile_git_context(&mut self, cx: &mut Context<Self>) {
+        for entry in &mut self.entries {
+            reconcile_selected_git_root(
+                &mut entry.selected_git_root,
+                &entry.context.git_roots,
+                entry.git_discovery,
+            );
+        }
+
+        let reference_counts = git_root_reference_counts(
+            self.entries
+                .iter()
+                .map(|entry| entry.context.git_roots.as_slice()),
+        );
+        let attached = self.attached_worktrees.keys().cloned().collect();
+        let reconciliation =
+            plan_git_root_reconciliation(reference_counts, &attached, &self.pending_worktrees);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         let project = workspace.read(cx).project().clone();
-        for root in roots {
-            if self.attached_worktrees.contains_key(&root)
-                || !self.pending_worktrees.insert(root.clone())
-            {
-                continue;
+
+        for root in reconciliation.removed {
+            if let Some(worktree) = self.attached_worktrees.remove(&root) {
+                let id = worktree.read(cx).id();
+                project.update(cx, |project, cx| project.remove_worktree(id, cx));
             }
+        }
+
+        for root in reconciliation.added {
+            debug_assert!(self.pending_worktrees.insert(root.clone()));
             // `find_or_create_worktree` accepts any existing ancestor worktree,
             // and Zed deliberately disables Git discovery for invisible
             // worktrees. Both behaviors are wrong for terminal-driven discovery:
@@ -895,14 +1036,29 @@ impl WorkspacesPanel {
             } else {
                 project.update(cx, |project, cx| project.create_worktree(&root, true, cx))
             };
+            let project = project.clone();
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 this.update(cx, |this, cx| {
                     this.pending_worktrees.remove(&root);
                     match result {
-                        Ok(worktree) => {
+                        Ok(worktree)
+                            if git_root_is_referenced(
+                                this.entries
+                                    .iter()
+                                    .map(|entry| entry.context.git_roots.as_slice()),
+                                &root,
+                            ) =>
+                        {
                             this.attached_worktrees.insert(root.clone(), worktree);
                             this.activate_selected_repository(cx);
+                        }
+                        Ok(worktree) => {
+                            // Repository discovery moved on while this worktree
+                            // was scanning. Remove the Project's ownership as
+                            // well as dropping this late result.
+                            let id = worktree.read(cx).id();
+                            project.update(cx, |project, cx| project.remove_worktree(id, cx));
                         }
                         Err(error) => {
                             eprintln!(
@@ -917,6 +1073,22 @@ impl WorkspacesPanel {
             .detach();
         }
         self.activate_selected_repository(cx);
+    }
+
+    pub(crate) fn finish_restored_git_discovery(
+        &mut self,
+        id: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        if entry.git_discovery == GitDiscoveryState::Restoring {
+            entry.git_discovery = GitDiscoveryState::Discovering;
+        }
+        self.refresh_workspace_contexts(cx);
+        self.request_metadata_refreshes(cx);
+        self.persist_session(cx);
     }
 
     fn activate_selected_repository(&self, cx: &mut Context<Self>) {
@@ -1000,7 +1172,12 @@ impl WorkspacesPanel {
         let active_layout = snapshot_active_layout(workspace.read(cx), cx);
         let mut workspaces = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
-            let layout = if entry.id == self.active {
+            let retained_restore = (entry.git_discovery != GitDiscoveryState::Authoritative)
+                .then(|| entry.restore.clone())
+                .flatten();
+            let layout = if let Some(restore) = retained_restore {
+                restore
+            } else if entry.id == self.active {
                 active_layout.clone()
             } else if let Some(stored) = &entry.stored {
                 snapshot_stored_layout(stored, cx)
@@ -2720,6 +2897,466 @@ mod tests {
         assert_eq!(context.git_roots, vec![base.clone()]);
         assert_eq!(context.git_root, Some(base.clone()));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn inactive_restored_workspace_keeps_selection_before_discovery() {
+        let selected_root = PathBuf::from("/repos/selected");
+        let mut selected = Some(selected_root.clone());
+
+        reconcile_selected_git_root(&mut selected, &[], GitDiscoveryState::Restoring);
+
+        assert_eq!(selected, Some(selected_root));
+    }
+
+    #[test]
+    fn active_restore_waits_for_complete_multi_repo_discovery() {
+        let first_root = PathBuf::from("/repos/first");
+        let selected_root = PathBuf::from("/repos/selected");
+        let mut selected = Some(selected_root.clone());
+
+        // The first restored terminal must not win merely because its shell
+        // was created before the selected repository's terminal.
+        reconcile_selected_git_root(
+            &mut selected,
+            std::slice::from_ref(&first_root),
+            GitDiscoveryState::Restoring,
+        );
+        assert_eq!(selected, Some(selected_root.clone()));
+        reconcile_selected_git_root(
+            &mut selected,
+            std::slice::from_ref(&first_root),
+            GitDiscoveryState::Discovering,
+        );
+        assert_eq!(selected, Some(selected_root.clone()));
+
+        reconcile_selected_git_root(
+            &mut selected,
+            &[first_root, selected_root.clone()],
+            GitDiscoveryState::Authoritative,
+        );
+        assert_eq!(selected, Some(selected_root));
+    }
+
+    #[test]
+    fn authoritative_discovery_replaces_a_missing_selection() {
+        let discovered_root = PathBuf::from("/repos/current");
+        let mut selected = Some(PathBuf::from("/repos/gone"));
+
+        reconcile_selected_git_root(
+            &mut selected,
+            std::slice::from_ref(&discovered_root),
+            GitDiscoveryState::Authoritative,
+        );
+
+        assert_eq!(selected, Some(discovered_root));
+    }
+
+    #[test]
+    fn git_root_reconciliation_counts_shared_workspace_ownership() {
+        let shared = PathBuf::from("/repos/shared");
+        let first = PathBuf::from("/repos/first");
+        let second = PathBuf::from("/repos/second");
+        let stale = PathBuf::from("/repos/stale");
+        let workspace_a = [shared.clone(), first.clone()];
+        let workspace_b = [shared.clone(), second.clone()];
+        let counts = git_root_reference_counts([workspace_a.as_slice(), workspace_b.as_slice()]);
+        assert_eq!(counts[&shared], 2);
+        assert_eq!(counts[&first], 1);
+        assert_eq!(counts[&second], 1);
+        let attached = BTreeSet::from([shared.clone(), stale.clone()]);
+        let pending = BTreeSet::from([second.clone()]);
+
+        let reconciliation = plan_git_root_reconciliation(counts, &attached, &pending);
+
+        assert_eq!(reconciliation.added, BTreeSet::from([first]));
+        assert_eq!(reconciliation.removed, BTreeSet::from([stale]));
+    }
+
+    #[test]
+    fn late_attachment_is_unreferenced_after_its_workspace_moves_on() {
+        let late = PathBuf::from("/repos/late");
+        let current = PathBuf::from("/repos/current");
+        let roots = [current];
+
+        assert!(!git_root_is_referenced([roots.as_slice()], &late));
+    }
+
+    #[test]
+    fn git_root_reconciliation_stress_returns_to_active_roots() {
+        let visited = (0..256)
+            .map(|index| PathBuf::from(format!("/repos/visited-{index}")))
+            .collect::<BTreeSet<_>>();
+        let active = visited.iter().rev().take(3).cloned().collect::<Vec<_>>();
+        let reference_counts = git_root_reference_counts([active.as_slice()]);
+
+        let reconciliation =
+            plan_git_root_reconciliation(reference_counts, &visited, &BTreeSet::new());
+        let mut retained = visited;
+        for root in reconciliation.removed {
+            retained.remove(&root);
+        }
+        retained.extend(reconciliation.added);
+
+        assert_eq!(retained, active.into_iter().collect());
+        assert_eq!(retained.len(), 3);
+    }
+
+    #[gpui::test]
+    async fn panel_restores_exact_selected_root_after_multi_repo_discovery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-multi-repo-restore-{}", uuid::Uuid::new_v4()));
+        let first = base.join("first");
+        let selected = base.join("selected");
+        std::fs::create_dir_all(first.join(".git")).unwrap();
+        std::fs::create_dir_all(selected.join(".git")).unwrap();
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorkspacesPanel>(cx)
+                .expect("workspaces panel should be installed")
+        });
+        panel.update(cx, |panel, cx| {
+            panel._context_refresh_task = Task::ready(());
+            panel.entries.push(WorkspaceEntry {
+                id: 2,
+                manual_name: None,
+                automatic_name: "Restored".into(),
+                context: WorkspaceContext::default(),
+                default_directory: None,
+                selected_git_root: Some(selected.clone()),
+                git_discovery: GitDiscoveryState::Restoring,
+                git: MetadataState::NotRequested,
+                metadata_root: None,
+                metadata_refreshed_at: None,
+                restore: Some(LayoutSnapshot {
+                    root: LayoutNodeSnapshot::Leaf {
+                        tabs: vec![
+                            TerminalSnapshot::fresh_shell(Some(first.clone())),
+                            TerminalSnapshot::fresh_shell(Some(selected.clone())),
+                        ],
+                        active_tab: 1,
+                        focused: true,
+                    },
+                }),
+                stored: None,
+            });
+            panel.next_id = 3;
+            // This is the periodic pass that used to erase an inactive
+            // restored workspace's selection before it was ever activated.
+            panel.reconcile_git_context(cx);
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.entries[1].selected_git_root.clone()),
+            Some(selected.clone())
+        );
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| panel.activate_workspace(2, window, cx));
+            })
+            .expect("window should remain open");
+        assert_eq!(
+            panel.read_with(cx, |panel, _| {
+                let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
+                (entry.git_discovery, entry.selected_git_root.clone())
+            }),
+            (GitDiscoveryState::Restoring, Some(selected.clone()))
+        );
+
+        for _ in 0..200 {
+            cx.run_until_parked();
+            panel.update(cx, |panel, cx| panel.refresh_workspace_contexts(cx));
+            let restored = panel.read_with(cx, |panel, _| {
+                let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
+                entry.git_discovery == GitDiscoveryState::Authoritative
+                    && entry.context.git_roots == vec![first.clone(), selected.clone()]
+            });
+            if restored {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        let live_directories = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace_context_for_active_workspace(workspace, cx).working_directories
+        });
+        panel.read_with(cx, |panel, _| {
+            let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
+            assert_eq!(entry.git_discovery, GitDiscoveryState::Authoritative);
+            assert_eq!(
+                entry.context.git_roots,
+                vec![first.clone(), selected.clone()],
+                "shell_count={}, working_directories={:?}, live_directories={live_directories:?}",
+                entry.context.shell_count,
+                entry.context.working_directories,
+            );
+            assert_eq!(entry.selected_git_root, Some(selected.clone()));
+        });
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
+    async fn empty_restored_snapshot_becomes_authoritative_on_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-empty-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let stale_selection = base.join("stale");
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorkspacesPanel>(cx).unwrap()
+        });
+        panel.update(cx, |panel, _| {
+            panel._context_refresh_task = Task::ready(());
+            panel.entries.push(WorkspaceEntry {
+                id: 2,
+                manual_name: None,
+                automatic_name: "Empty restore".into(),
+                context: WorkspaceContext::default(),
+                default_directory: None,
+                selected_git_root: Some(stale_selection),
+                git_discovery: GitDiscoveryState::Restoring,
+                git: MetadataState::NotRequested,
+                metadata_root: None,
+                metadata_refreshed_at: None,
+                restore: Some(LayoutSnapshot {
+                    root: LayoutNodeSnapshot::Leaf {
+                        tabs: Vec::new(),
+                        active_tab: 0,
+                        focused: true,
+                    },
+                }),
+                stored: None,
+            });
+            panel.next_id = 3;
+        });
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| panel.activate_workspace(2, window, cx));
+            })
+            .expect("window should remain open");
+
+        panel.read_with(cx, |panel, _| {
+            let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
+            assert_eq!(entry.git_discovery, GitDiscoveryState::Authoritative);
+            assert_eq!(entry.selected_git_root, None);
+        });
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
+    async fn interrupted_restore_retries_full_snapshot_before_becoming_authoritative(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-interrupted-restore-{}", uuid::Uuid::new_v4()));
+        let selected = base.join("selected");
+        std::fs::create_dir_all(selected.join(".git")).unwrap();
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorkspacesPanel>(cx).unwrap()
+        });
+        panel.update(cx, |panel, _| {
+            panel._context_refresh_task = Task::ready(());
+            panel.entries.push(WorkspaceEntry {
+                id: 2,
+                manual_name: None,
+                automatic_name: "Interrupted restore".into(),
+                context: WorkspaceContext::default(),
+                default_directory: Some(selected.clone()),
+                selected_git_root: Some(selected.clone()),
+                git_discovery: GitDiscoveryState::Restoring,
+                git: MetadataState::NotRequested,
+                metadata_root: None,
+                metadata_refreshed_at: None,
+                restore: Some(LayoutSnapshot {
+                    root: LayoutNodeSnapshot::Leaf {
+                        tabs: vec![TerminalSnapshot::fresh_shell(Some(selected.clone()))],
+                        active_tab: 0,
+                        focused: true,
+                    },
+                }),
+                stored: None,
+            });
+            panel.next_id = 3;
+        });
+
+        // Switch away in the same foreground turn, before the restored shell
+        // can attach. The parked empty layout must not replace the full snapshot.
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.activate_workspace(2, window, cx);
+                    panel.activate_workspace(1, window, cx);
+                });
+            })
+            .expect("window should remain open");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
+            assert_eq!(entry.git_discovery, GitDiscoveryState::Restoring);
+            assert_eq!(entry.selected_git_root, Some(selected.clone()));
+        });
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| panel.activate_workspace(2, window, cx));
+            })
+            .expect("window should remain open");
+        for _ in 0..200 {
+            cx.run_until_parked();
+            panel.update(cx, |panel, cx| panel.refresh_workspace_contexts(cx));
+            if panel.read_with(cx, |panel, _| {
+                panel
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == 2)
+                    .is_some_and(|entry| entry.git_discovery == GitDiscoveryState::Authoritative)
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        panel.read_with(cx, |panel, _| {
+            let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
+            assert_eq!(entry.git_discovery, GitDiscoveryState::Authoritative);
+            assert_eq!(entry.selected_git_root, Some(selected.clone()));
+            assert_eq!(entry.context.git_roots, vec![selected.clone()]);
+        });
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
+    async fn closing_workspace_removes_only_its_project_worktree(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-worktree-ownership-{}", uuid::Uuid::new_v4()));
+        let shared = base.join("shared");
+        let unique = base.join("unique");
+        std::fs::create_dir_all(shared.join(".git")).unwrap();
+        std::fs::create_dir_all(unique.join(".git")).unwrap();
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorkspacesPanel>(cx)
+                .expect("workspaces panel should be installed")
+        });
+        panel.update(cx, |panel, cx| {
+            // Keep the test's synthetic terminal contexts stable instead of
+            // letting the periodic live-terminal refresh replace them.
+            panel._context_refresh_task = Task::ready(());
+            let active = panel
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == panel.active)
+                .unwrap();
+            active.context.git_roots = vec![shared.clone()];
+            active.selected_git_root = Some(shared.clone());
+            panel.entries.push(WorkspaceEntry {
+                id: 2,
+                manual_name: None,
+                automatic_name: "Second".into(),
+                context: WorkspaceContext {
+                    git_roots: vec![shared.clone(), unique.clone()],
+                    ..WorkspaceContext::default()
+                },
+                default_directory: None,
+                selected_git_root: Some(unique.clone()),
+                git_discovery: GitDiscoveryState::Authoritative,
+                git: MetadataState::NotRequested,
+                metadata_root: None,
+                metadata_refreshed_at: None,
+                restore: None,
+                stored: Some(StoredLayout::Leaf {
+                    items: Vec::new(),
+                    active: 0,
+                    focused: true,
+                }),
+            });
+            panel.next_id = 3;
+            panel.reconcile_git_context(cx);
+        });
+
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| panel.attached_worktrees.len()) == 2 {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.attached_worktrees.len()),
+            2
+        );
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| panel.close_workspace(2, window, cx));
+            })
+            .expect("window should remain open");
+
+        assert_eq!(
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .attached_worktrees
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            }),
+            BTreeSet::from([shared.clone()])
+        );
+        let project_roots = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<BTreeSet<_>>()
+        });
+        assert!(project_roots.contains(&shared));
+        assert!(!project_roots.contains(&unique));
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn leaf(x: f32, y: f32, w: f32, h: f32) -> (Bounds<Pixels>, StoredLayout) {
