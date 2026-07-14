@@ -82,9 +82,12 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     configure_terminal_fonts(cx);
 
     let app_state = init_app_state(cx);
+    crate::syntax::register_builtin_languages(&app_state.languages);
     Project::init(&app_state.client, cx);
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
+    command_palette::init(cx);
+    vim::init(cx);
     git_ui::init(cx);
     install_git_repository_scope(cx);
     tab_switcher::init(cx);

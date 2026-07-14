@@ -12,8 +12,9 @@ use terminal::terminal_settings::TerminalSettings;
 use theme_settings::ThemeSettings;
 use ui::{
     Color, ContextMenu, Divider, DividerColor, DropdownMenu, Headline, IconButton, IconName,
-    IntoElement, Label, LabelSize, h_flex, prelude::*, v_flex,
+    IntoElement, Label, LabelSize, Switch, ToggleState, h_flex, prelude::*, v_flex,
 };
+use vim_mode_setting::VimModeSetting;
 use workspace::AppState;
 use workspace::item::{Item, ItemEvent};
 
@@ -96,6 +97,21 @@ fn set_font_family(family: String, cx: &mut App) {
         content.theme.buffer_font_family = Some(family.clone().into());
         content.terminal.get_or_insert_default().font_family = Some(family.into());
     });
+}
+
+fn current_vim_mode(cx: &App) -> bool {
+    VimModeSetting::get_global(cx).0
+}
+
+fn apply_vim_mode(content: &mut SettingsContent, enabled: bool) {
+    content.vim_mode = Some(enabled);
+    if enabled && content.helix_mode == Some(true) {
+        content.helix_mode = Some(false);
+    }
+}
+
+fn set_vim_mode(enabled: bool, cx: &mut App) {
+    update_settings_file(cx, move |content, _| apply_vim_mode(content, enabled));
 }
 
 #[derive(IntoElement)]
@@ -189,6 +205,7 @@ impl Render for SettingsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_scale = current_ui_scale(cx);
         let terminal_font_size = current_terminal_font_size(cx);
+        let vim_mode = current_vim_mode(cx);
 
         let font_menu = ContextMenu::build(window, cx, |mut menu, _window, cx| {
             menu = menu.entry("Default (Lilex)", None, |_window, cx| {
@@ -277,6 +294,26 @@ impl Render for SettingsPage {
                                     font_menu,
                                 ),
                             )),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_full()
+                            .child(SectionHeader::new("Editing"))
+                            .child(setting_row(
+                                "Vim motions",
+                                "Use Vim modes and keybindings in diff and text editors",
+                                Switch::new(
+                                    "vim-mode",
+                                    if vim_mode {
+                                        ToggleState::Selected
+                                    } else {
+                                        ToggleState::Unselected
+                                    },
+                                )
+                                .on_click(|state, _, cx| {
+                                    set_vim_mode(*state == ToggleState::Selected, cx);
+                                }),
+                            )),
                     ),
             )
     }
@@ -329,5 +366,16 @@ mod tests {
             cx.dispatch_action(&zed_actions::DecreaseBufferFontSize { persist: false });
             assert_eq!(current_terminal_font_size(cx), 14.0);
         });
+    }
+
+    #[test]
+    fn enabling_vim_mode_disables_helix_mode() {
+        let mut content = SettingsContent::default();
+        content.helix_mode = Some(true);
+
+        apply_vim_mode(&mut content, true);
+
+        assert_eq!(content.vim_mode, Some(true));
+        assert_eq!(content.helix_mode, Some(false));
     }
 }

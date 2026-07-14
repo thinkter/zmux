@@ -8,6 +8,7 @@ askpass = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6
 buffer_diff = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 call = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 collections = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+command_palette = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 component = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 editor = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 file_icons = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -16,6 +17,7 @@ fuzzy_nucleo = { git = "https://github.com/zed-industries/zed", rev = "abbe85a33
 git = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+grammars = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 task = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 terminal = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -24,6 +26,8 @@ tab_switcher = { git = "https://github.com/zed-industries/zed", rev = "abbe85a33
 theme = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 theme_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 util = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+vim = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+vim_mode_setting = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 zed_actions = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 workspace = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 project = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -109,8 +113,10 @@ alacritty_terminal = { path = "vendor/alacritty_terminal" }
 anyhow = "1"
 async-channel = "2"
 collections = { workspace = true }
+command_palette = { workspace = true }
 editor = { workspace = true }
 gpui = { workspace = true }
+grammars = { workspace = true, features = ["load-grammars"] }
 hmac = "0.12"
 settings = { workspace = true }
 sha2 = "0.10"
@@ -121,6 +127,8 @@ tab_switcher = { workspace = true }
 theme = { workspace = true }
 theme_settings = { workspace = true }
 util = { workspace = true }
+vim = { workspace = true }
+vim_mode_setting = { workspace = true }
 zed_actions = { workspace = true }
 workspace = { workspace = true }
 project = { workspace = true }

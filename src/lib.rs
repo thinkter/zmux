@@ -12,6 +12,7 @@ mod notifications;
 mod osc;
 mod session;
 mod settings_page;
+mod syntax;
 mod theme;
 mod welcome;
 mod workspace_switcher;
@@ -43,6 +44,7 @@ pub use osc::{
     bridged_osc_payload, parse_osc_payload, try_parse_osc_payload,
 };
 pub use settings_page::SettingsPage;
+pub use syntax::register_builtin_languages;
 pub use theme::{
     DEFAULT_MONO_FONT, DEFAULT_THEME, configure_terminal_fonts, default_settings_json,
 };

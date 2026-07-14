@@ -35,6 +35,11 @@ pub fn configure_keybindings(cx: &mut App) {
     {
         cx.bind_keys(bindings);
     }
+    if let Ok(bindings) =
+        settings::KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)
+    {
+        cx.bind_keys(bindings);
+    }
 
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, None),
