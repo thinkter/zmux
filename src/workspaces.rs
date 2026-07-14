@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -27,6 +27,7 @@ use workspace::item::ItemHandle;
 use workspace::{Pane, SplitDirection, Workspace};
 
 use crate::app::{create_center_terminal_for_workspace, create_restored_terminals_for_workspace};
+use crate::metadata::{GitMetadata, MetadataState, collect_git_metadata};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{Notification, NotificationStore, WorkspaceId};
 use crate::session::{
@@ -51,6 +52,8 @@ const PANEL_MIN_WIDTH_REMS: f32 = 12.0;
 const NOTIFICATION_DRAWER_HEIGHT_REMS: f32 = 17.5;
 const MAX_WORKSPACE_NAME_CHARS: usize = 64;
 const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const ACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(5);
+const INACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(30);
 
 fn scaled_panel_size(rem_size: Pixels, rems: f32) -> Pixels {
     px(f32::from(rem_size) * rems)
@@ -78,6 +81,9 @@ struct WorkspaceEntry {
     manual_name: Option<String>,
     automatic_name: String,
     context: WorkspaceContext,
+    git: MetadataState<GitMetadata>,
+    metadata_root: Option<PathBuf>,
+    metadata_refreshed_at: Option<Instant>,
     /// A persisted layout that has not been materialized into fresh terminals yet.
     restore: Option<LayoutSnapshot>,
     /// `Some` while the workspace is parked in the background, `None` while it is
@@ -124,6 +130,8 @@ struct WorkspaceRow {
     name: String,
     uses_manual_name: bool,
     context: WorkspaceContext,
+    git: MetadataState<GitMetadata>,
+    latest_unread: Option<String>,
 }
 
 struct RenameState {
@@ -163,6 +171,7 @@ pub struct WorkspacesPanel {
     next_id: WorkspaceId,
     rename: Option<RenameState>,
     notifications_expanded: bool,
+    notification_filter: Option<WorkspaceId>,
     _notification_subscription: Subscription,
     _context_refresh_task: Task<()>,
     session_store: SessionStore,
@@ -207,6 +216,9 @@ impl WorkspacesPanel {
                         manual_name: workspace.manual_name.clone(),
                         automatic_name: "New workspace".to_string(),
                         context: WorkspaceContext::default(),
+                        git: MetadataState::NotRequested,
+                        metadata_root: None,
+                        metadata_refreshed_at: None,
                         restore: Some(workspace.layout.clone()),
                         stored: None,
                     })
@@ -221,6 +233,9 @@ impl WorkspacesPanel {
                     manual_name: None,
                     automatic_name: "New workspace".to_string(),
                     context: WorkspaceContext::default(),
+                    git: MetadataState::NotRequested,
+                    metadata_root: None,
+                    metadata_refreshed_at: None,
                     restore: None,
                     stored: None,
                 }],
@@ -238,6 +253,7 @@ impl WorkspacesPanel {
                 if this
                     .update(cx, |this, cx| {
                         this.refresh_workspace_contexts(cx);
+                        this.request_metadata_refreshes(cx);
                         this.persist_session(cx);
                     })
                     .is_err()
@@ -256,6 +272,7 @@ impl WorkspacesPanel {
             next_id,
             rename: None,
             notifications_expanded: false,
+            notification_filter: None,
             _notification_subscription: notification_subscription,
             _context_refresh_task: context_refresh_task,
             session_store,
@@ -306,6 +323,9 @@ impl WorkspacesPanel {
             manual_name: None,
             automatic_name: "New workspace".to_string(),
             context: WorkspaceContext::default(),
+            git: MetadataState::NotRequested,
+            metadata_root: None,
+            metadata_refreshed_at: None,
             restore: None,
             stored: None,
         });
@@ -449,6 +469,7 @@ impl WorkspacesPanel {
             });
         }
         self.refresh_workspace_contexts(cx);
+        self.request_metadata_refreshes(cx);
         self.persist_session(cx);
         cx.notify();
     }
@@ -499,6 +520,9 @@ impl WorkspacesPanel {
 
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
+        if self.notification_filter == Some(id) {
+            self.notification_filter = None;
+        }
         NotificationRuntime::clear_workspace(cx.entity_id(), id, cx);
         self.persist_session(cx);
         cx.notify();
@@ -555,6 +579,53 @@ impl WorkspacesPanel {
 
         if changed {
             cx.notify();
+        }
+    }
+
+    fn request_metadata_refreshes(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut requests = Vec::new();
+        for entry in &mut self.entries {
+            let root = entry.context.git_root.clone();
+            if entry.metadata_root != root {
+                entry.metadata_root = root.clone();
+                entry.metadata_refreshed_at = None;
+                entry.git = MetadataState::NotRequested;
+            }
+            let Some(root) = root else {
+                continue;
+            };
+            let interval = if entry.id == self.active {
+                ACTIVE_METADATA_INTERVAL
+            } else {
+                INACTIVE_METADATA_INTERVAL
+            };
+            let is_due = entry
+                .metadata_refreshed_at
+                .is_none_or(|refreshed| now.duration_since(refreshed) >= interval);
+            if is_due && !matches!(entry.git, MetadataState::Pending) {
+                entry.git = MetadataState::Pending;
+                entry.metadata_refreshed_at = Some(now);
+                requests.push((entry.id, root));
+            }
+        }
+
+        for (id, root) in requests {
+            let requested_root = root.clone();
+            let collection = cx.background_spawn(async move { collect_git_metadata(&root) });
+            cx.spawn(async move |this, cx| {
+                let git = collection.await;
+                this.update(cx, |this, cx| {
+                    if let Some(entry) = this.entries.iter_mut().find(|entry| entry.id == id)
+                        && entry.metadata_root.as_ref() == Some(&requested_root)
+                    {
+                        entry.git = git;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
@@ -733,9 +804,16 @@ impl WorkspacesPanel {
             .when(unread_count > 0, |this| {
                 this.child(
                     div()
+                        .id(("ws-unread", id as usize))
                         .px_1()
                         .rounded_md()
                         .bg(cx.theme().colors().element_selected)
+                        .cursor_pointer()
+                        .tooltip(Tooltip::text("Show this workspace's notifications"))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            cx.stop_propagation();
+                            this.show_workspace_notifications(id, cx);
+                        }))
                         .child(
                             Label::new(unread_count.to_string())
                                 .size(LabelSize::XSmall)
@@ -749,6 +827,15 @@ impl WorkspacesPanel {
             0 => "No shells".to_string(),
             1 => "1 shell".to_string(),
             count => format!("{count} shells"),
+        };
+        let cwd_label = workspace_cwd_label(&context);
+        let git_label = match &entry.git {
+            MetadataState::Ready(git) => Some(git.compact_label()),
+            MetadataState::Pending => Some("git refreshing".to_string()),
+            MetadataState::Unavailable(_) | MetadataState::Error(_) => {
+                Some("git unavailable".to_string())
+            }
+            MetadataState::NotRequested => None,
         };
         let name_area = v_flex()
             .flex_1()
@@ -765,6 +852,28 @@ impl WorkspacesPanel {
                             .color(Color::Muted)
                             .single_line(),
                     )
+                    .when_some(cwd_label, |this, cwd| {
+                        this.child(
+                            Label::new(cwd)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        )
+                    })
+                    .when_some(git_label, |this, git| {
+                        this.child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(cx.theme().colors().element_background)
+                                .child(
+                                    Label::new(git)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                ),
+                        )
+                    })
                     .children(context.foreground_processes.iter().take(3).map(|process| {
                         div()
                             .px_1()
@@ -777,7 +886,15 @@ impl WorkspacesPanel {
                                     .single_line(),
                             )
                     })),
-            );
+            )
+            .when_some(entry.latest_unread.clone(), |this, latest| {
+                this.child(
+                    Label::new(latest)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent)
+                        .single_line(),
+                )
+            });
 
         let drag_ix = self
             .entries
@@ -867,7 +984,18 @@ impl WorkspacesPanel {
     }
 
     fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
-        self.notifications_expanded = !self.notifications_expanded;
+        if self.notifications_expanded && self.notification_filter.is_none() {
+            self.notifications_expanded = false;
+        } else {
+            self.notifications_expanded = true;
+            self.notification_filter = None;
+        }
+        cx.notify();
+    }
+
+    fn show_workspace_notifications(&mut self, id: WorkspaceId, cx: &mut Context<Self>) {
+        self.notification_filter = Some(id);
+        self.notifications_expanded = true;
         cx.notify();
     }
 
@@ -879,14 +1007,22 @@ impl WorkspacesPanel {
         NotificationRuntime::dismiss_notification(id, cx);
     }
 
-    fn mark_scope_read(&mut self, cx: &mut Context<Self>) {
+    fn mark_visible_read(&mut self, cx: &mut Context<Self>) {
         let scope_id = cx.entity_id();
-        NotificationRuntime::mark_scope_read(scope_id, cx);
+        if let Some(workspace_id) = self.notification_filter {
+            NotificationRuntime::mark_workspace_read(scope_id, workspace_id, cx);
+        } else {
+            NotificationRuntime::mark_scope_read(scope_id, cx);
+        }
     }
 
-    fn clear_scope_notifications(&mut self, cx: &mut Context<Self>) {
+    fn clear_visible_notifications(&mut self, cx: &mut Context<Self>) {
         let scope_id = cx.entity_id();
-        NotificationRuntime::clear_scope_notifications(scope_id, cx);
+        if let Some(workspace_id) = self.notification_filter {
+            NotificationRuntime::clear_workspace(scope_id, workspace_id, cx);
+        } else {
+            NotificationRuntime::clear_scope_notifications(scope_id, cx);
+        }
     }
 
     fn render_notification(
@@ -978,35 +1114,62 @@ impl EventEmitter<PanelEvent> for WorkspacesPanel {}
 
 impl Render for WorkspacesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
-            .entries
-            .iter()
-            // Clone the lightweight metadata so we no longer borrow `self.entries`
-            // while `render_entry` borrows `self`.
-            .map(|entry| WorkspaceRow {
-                id: entry.id,
-                name: entry.display_name().to_string(),
-                uses_manual_name: entry.manual_name.is_some(),
-                context: entry.context.clone(),
-            })
-            .collect();
-
         let scope_id = cx.entity_id();
-        let (latest, unread_count, notifications) = {
+        let notification_filter = self.notification_filter;
+        let (rows, latest, unread_count, notifications) = {
             let store = NotificationStore::global(cx);
             let store = store.read(cx);
+            let rows = self
+                .entries
+                .iter()
+                .map(|entry| WorkspaceRow {
+                    id: entry.id,
+                    name: entry.display_name().to_string(),
+                    uses_manual_name: entry.manual_name.is_some(),
+                    context: entry.context.clone(),
+                    git: entry.git.clone(),
+                    latest_unread: store
+                        .notifications()
+                        .find(|notification| {
+                            notification.target.scope_id == scope_id
+                                && notification.target.workspace_id == entry.id
+                                && !notification.read
+                        })
+                        .map(|notification| notification.title.clone()),
+                })
+                .collect::<Vec<_>>();
             let latest = store
                 .notifications()
-                .find(|notification| notification.target.scope_id == scope_id && !notification.read)
+                .find(|notification| {
+                    notification.target.scope_id == scope_id
+                        && notification_filter.is_none_or(|workspace_id| {
+                            notification.target.workspace_id == workspace_id
+                        })
+                        && !notification.read
+                })
                 .cloned();
-            let unread_count = store.scope_unread_count(scope_id);
+            let unread_count = notification_filter.map_or_else(
+                || store.scope_unread_count(scope_id),
+                |workspace_id| store.workspace_unread_count(scope_id, workspace_id),
+            );
             let notifications = store
                 .notifications()
-                .filter(|notification| notification.target.scope_id == scope_id)
+                .filter(|notification| {
+                    notification.target.scope_id == scope_id
+                        && notification_filter.is_none_or(|workspace_id| {
+                            notification.target.workspace_id == workspace_id
+                        })
+                })
                 .cloned()
                 .collect::<Vec<_>>();
-            (latest, unread_count, notifications)
+            (rows, latest, unread_count, notifications)
         };
+        let notification_heading = notification_filter
+            .and_then(|workspace_id| rows.iter().find(|row| row.id == workspace_id))
+            .map_or_else(
+                || format!("Notifications · {unread_count} unread"),
+                |row| format!("{} · {unread_count} unread", row.name),
+            );
 
         v_flex()
             .key_context("WorkspacesPanel")
@@ -1071,10 +1234,7 @@ impl Render for WorkspacesPanel {
                                 .px_2()
                                 .py_1()
                                 .justify_between()
-                                .child(
-                                    Label::new(format!("Notifications · {unread_count} unread"))
-                                        .size(LabelSize::Small),
-                                )
+                                .child(Label::new(notification_heading).size(LabelSize::Small))
                                 .child(
                                     h_flex()
                                         .gap_0p5()
@@ -1084,7 +1244,7 @@ impl Render for WorkspacesPanel {
                                                 .icon_size(IconSize::XSmall)
                                                 .tooltip(Tooltip::text("Mark all read"))
                                                 .on_click(cx.listener(|this, _, _window, cx| {
-                                                    this.mark_scope_read(cx)
+                                                    this.mark_visible_read(cx)
                                                 })),
                                         )
                                         .child(
@@ -1093,7 +1253,7 @@ impl Render for WorkspacesPanel {
                                                 .icon_size(IconSize::XSmall)
                                                 .tooltip(Tooltip::text("Clear notifications"))
                                                 .on_click(cx.listener(|this, _, _window, cx| {
-                                                    this.clear_scope_notifications(cx)
+                                                    this.clear_visible_notifications(cx)
                                                 })),
                                         ),
                                 ),
@@ -1339,6 +1499,41 @@ fn automatic_workspace_name(context: &WorkspaceContext) -> String {
         1 => "Shell".to_string(),
         _ => "Mixed shells".to_string(),
     }
+}
+
+fn workspace_cwd_label(context: &WorkspaceContext) -> Option<String> {
+    let directory = common_ancestor(&context.working_directories)?;
+    let mut label = if let Some(repository) = &context.git_root
+        && let Ok(relative) = directory.strip_prefix(repository)
+    {
+        let repository = repository.file_name()?.to_string_lossy();
+        if relative.as_os_str().is_empty() {
+            repository.to_string()
+        } else {
+            format!("{repository}/{}", relative.display())
+        }
+    } else if let Ok(relative) = directory.strip_prefix(paths::home_dir().as_path()) {
+        if relative.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", relative.display())
+        }
+    } else {
+        directory.display().to_string()
+    };
+    label.retain(|character| !character.is_control());
+    if label.chars().count() > 40 {
+        let tail = label
+            .chars()
+            .rev()
+            .take(37)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        label = format!("…{tail}");
+    }
+    (!label.is_empty()).then_some(label)
 }
 
 fn path_display_name(path: &Path) -> Option<String> {

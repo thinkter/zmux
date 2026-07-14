@@ -5,6 +5,7 @@ mod desktop_notifications;
 mod env;
 mod fonts;
 mod keymap;
+mod metadata;
 mod notification_runtime;
 mod notifications;
 mod osc;

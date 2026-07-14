@@ -1508,6 +1508,36 @@ impl NotificationRuntime {
         changed
     }
 
+    pub fn mark_workspace_read(
+        scope_id: EntityId,
+        workspace_id: WorkspaceId,
+        cx: &mut App,
+    ) -> usize {
+        let ids = crate::notifications::NotificationStore::global(cx)
+            .read(cx)
+            .notifications()
+            .filter(|notification| {
+                notification.target.scope_id == scope_id
+                    && notification.target.workspace_id == workspace_id
+                    && !notification.read
+            })
+            .map(|notification| (notification.id, notification.sequence))
+            .collect::<Vec<_>>();
+        let changed =
+            crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
+                let changed = ids.iter().filter(|(id, _)| store.mark_read(*id)).count();
+                if changed > 0 {
+                    store_cx.notify();
+                }
+                changed
+            });
+        for (id, sequence) in ids {
+            DesktopNotificationService::retract(id, cx);
+            Self::report_kitty_closed(id, sequence, cx);
+        }
+        changed
+    }
+
     pub fn clear_scope_notifications(scope_id: EntityId, cx: &mut App) -> usize {
         let removed = crate::notifications::NotificationStore::global(cx)
             .read(cx)
