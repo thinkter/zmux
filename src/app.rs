@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use client::{Client, UserStore};
 use db::kvp::KeyValueStore;
@@ -41,6 +41,8 @@ use crate::workspaces::{
     ToggleNotificationCenter, ToggleWorkspacesPanel, WorkspacesPanel, install_git_repository_scope,
     register_git_repository_scope, restore_startup_layout,
 };
+
+const MAX_RESTORED_TERMINAL_ATTEMPTS: u32 = 3;
 
 actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
 
@@ -435,7 +437,7 @@ fn open_zmux_workspace_for_paths(
                 };
                 NotificationRuntime::jump_to_latest_unread(panel.entity_id(), cx);
             });
-            let startup_restore = panel.update(cx, |panel, _| panel.take_initial_restore());
+            let startup_restore = panel.read(cx).initial_restore();
             if let Some(layout) = startup_restore {
                 let workspace_id = panel.read(cx).active_workspace_id();
                 let generation = panel.read(cx).active_workspace_generation();
@@ -581,53 +583,127 @@ pub(crate) fn create_restored_terminals_for_workspace(
     let database_id = workspace.database_id();
 
     cx.spawn_in(window, async move |workspace, cx| {
-        for restored in terminals {
-            let terminal = project
-                .update(cx, |project, cx| {
-                    create_terminal_with_cli_route(project, restored.working_directory.clone(), cx)
-                })?
-                .await?;
-            let project_for_view = project.clone();
-            let workspace_for_view = workspace_handle.clone();
-            let panel = panel.clone();
-            let attached = workspace.update_in(cx, move |workspace, window, cx| {
-                let destination_is_current =
-                    panel.upgrade().is_some_and(|panel| {
-                        let panel = panel.read(cx);
-                        panel.active_workspace_id() == owning_workspace_id
-                            && panel.active_workspace_generation() == activation_generation
-                    }) && workspace.panes().iter().any(|pane| pane == &restored.pane);
-                if !destination_is_current {
-                    return false;
-                }
+        let mut pending = terminals;
+        let mut attempt: u32 = 0;
+        loop {
+            let destination_is_current = panel
+                .update(cx, |panel, _| {
+                    panel.active_workspace_id() == owning_workspace_id
+                        && panel.active_workspace_generation() == activation_generation
+                })
+                .unwrap_or(false);
+            if !destination_is_current {
+                // Switching away preserves the complete restore snapshot; the
+                // next activation retries it from scratch.
+                return Ok(());
+            }
 
-                let terminal_view = cx.new(|cx| {
-                    TerminalView::new(
-                        terminal,
-                        workspace_for_view,
-                        database_id,
-                        project_for_view,
+            let mut failed = Vec::new();
+            let mut last_error = None;
+            for restored in pending {
+                let terminal = match project
+                    .update(cx, |project, cx| {
+                        create_terminal_with_cli_route(
+                            project,
+                            restored.working_directory.clone(),
+                            cx,
+                        )
+                    })?
+                    .await
+                {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        last_error = Some(error);
+                        failed.push(restored);
+                        continue;
+                    }
+                };
+                let project_for_view = project.clone();
+                let workspace_for_view = workspace_handle.clone();
+                let panel = panel.clone();
+                let attached = workspace.update_in(cx, move |workspace, window, cx| {
+                    let destination_is_current =
+                        panel.upgrade().is_some_and(|panel| {
+                            let panel = panel.read(cx);
+                            panel.active_workspace_id() == owning_workspace_id
+                                && panel.active_workspace_generation() == activation_generation
+                        }) && workspace.panes().iter().any(|pane| pane == &restored.pane);
+                    if !destination_is_current {
+                        return false;
+                    }
+
+                    let terminal_view = cx.new(|cx| {
+                        TerminalView::new(
+                            terminal,
+                            workspace_for_view,
+                            database_id,
+                            project_for_view,
+                            window,
+                            cx,
+                        )
+                    });
+                    workspace.add_item(
+                        restored.pane,
+                        Box::new(terminal_view),
+                        None,
+                        false,
+                        restored.activate,
                         window,
                         cx,
-                    )
-                });
-                workspace.add_item(
-                    restored.pane,
-                    Box::new(terminal_view),
-                    None,
-                    false,
-                    restored.activate,
-                    window,
-                    cx,
-                );
-                true
-            })?;
-            if !attached {
-                break;
+                    );
+                    true
+                })?;
+                if !attached {
+                    return Ok(());
+                }
             }
+
+            if failed.is_empty() {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.finish_restored_git_discovery(owning_workspace_id, cx);
+                    })
+                    .ok();
+                return Ok(());
+            }
+
+            attempt = attempt.saturating_add(1);
+            if attempt >= MAX_RESTORED_TERMINAL_ATTEMPTS {
+                let failed_slots = failed
+                    .iter()
+                    .map(|terminal| terminal.failed_slot.clone())
+                    .collect();
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.finish_restored_git_discovery_with_failures(
+                            owning_workspace_id,
+                            failed_slots,
+                            cx,
+                        );
+                    })
+                    .ok();
+                eprintln!(
+                    "failed to restore {} terminal(s) after {attempt} attempts; preserving them for the next session: {:#}",
+                    failed.len(),
+                    last_error.expect("a failed terminal has an error")
+                );
+                return Ok(());
+            }
+            let delay = restored_terminal_retry_delay(attempt);
+            eprintln!(
+                "failed to restore {} terminal(s); retrying in {}s: {:#}",
+                failed.len(),
+                delay.as_secs(),
+                last_error.expect("a failed terminal has an error")
+            );
+            pending = failed;
+            cx.background_executor().timer(delay).await;
         }
-        Ok(())
     })
+}
+
+fn restored_terminal_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(5))
 }
 
 fn create_split_terminal(
@@ -709,8 +785,7 @@ fn source_terminal_working_directory(workspace: &Workspace, cx: &App) -> Option<
     let item = workspace.active_pane().read(cx).active_item()?;
     let terminal_view = item.act_as::<TerminalView>(cx)?;
     let terminal = terminal_view.read(cx).terminal().clone();
-    let working_directory = terminal.read(cx).working_directory();
-    working_directory
+    terminal.read(cx).working_directory()
 }
 
 /// Zed's pane-number action creates a clone when the requested index does not
@@ -893,5 +968,20 @@ fn build_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOpt
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RESTORED_TERMINAL_ATTEMPTS, restored_terminal_retry_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn restored_terminal_retries_back_off_with_a_strict_cap() {
+        assert_eq!(MAX_RESTORED_TERMINAL_ATTEMPTS, 3);
+        assert_eq!(restored_terminal_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(restored_terminal_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(restored_terminal_retry_delay(6), Duration::from_secs(32));
+        assert_eq!(restored_terminal_retry_delay(100), Duration::from_secs(32));
     }
 }

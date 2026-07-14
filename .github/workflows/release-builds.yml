@@ -2,6 +2,7 @@ name: Release builds
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
       - main
@@ -48,6 +49,41 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Verify vendored source integrity
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          broken=0
+          while IFS= read -r -d '' entry; do
+            mode="${entry%% *}"
+            path="${entry#*$'\t'}"
+            if [[ "$mode" == 120000 && ! -e "$path" ]]; then
+              printf 'Broken tracked symbolic link: %s -> %s\n' "$path" "$(readlink "$path")" >&2
+              broken=1
+            fi
+          done < <(git ls-files --stage -z)
+          if ((broken)); then
+            exit 1
+          fi
+
+          shopt -s nullglob
+          for manifest in vendor/*/Cargo.toml; do
+            crate_dir="${manifest%/Cargo.toml}"
+            licenses=("$crate_dir"/LICENSE* "$crate_dir"/COPYING*)
+            readable_license=false
+            for license in "${licenses[@]}"; do
+              if [[ -f "$license" && -r "$license" ]]; then
+                readable_license=true
+                break
+              fi
+            done
+            if ! $readable_license; then
+              printf 'Vendored crate has no readable license: %s\n' "$crate_dir" >&2
+              exit 1
+            fi
+          done
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -90,6 +126,10 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup show
+
+      - name: Verify pinned Rust version
+        shell: bash
+        run: rustc --version | grep -E '^rustc 1\.95\.0 '
 
       - name: Verify release tag matches the package version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -231,7 +271,7 @@ jobs:
           plutil -lint "$app_bundle/Contents/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_bundle/Contents/Info.plist")" = "$bundle_id"
 
-          release_signing_available=true
+          missing_signing_credentials=()
           for value in \
             APPLE_APP_PASSWORD \
             APPLE_CERTIFICATE_BASE64 \
@@ -240,11 +280,17 @@ jobs:
             APPLE_SIGNING_IDENTITY \
             APPLE_TEAM_ID; do
             if test -z "${!value}"; then
-              release_signing_available=false
+              missing_signing_credentials+=("$value")
             fi
           done
 
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]] && $release_signing_available; then
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]] && ((${#missing_signing_credentials[@]})); then
+            printf 'Tagged macOS releases require signing credentials; missing: %s\n' \
+              "${missing_signing_credentials[*]}" >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             keychain="$RUNNER_TEMP/zmux-signing.keychain-db"
             certificate="$RUNNER_TEMP/zmux-signing.p12"
             keychain_password="$(openssl rand -hex 24)"
@@ -287,11 +333,8 @@ jobs:
             archive="dist/zmux-macos-aarch64.zip"
           else
             # Ad-hoc signing keeps bundle APIs testable when release signing
-            # credentials are unavailable. The filename remains explicit so
-            # users are not led to believe Gatekeeper notarization occurred.
-            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-              echo "::warning::Apple signing secrets are unavailable; publishing an unsigned macOS artifact"
-            fi
+            # in non-release CI. The filename remains explicit so users are
+            # not led to believe Gatekeeper notarization occurred.
             codesign --force --sign - --identifier "$bundle_id" --timestamp=none "$app_bundle"
             codesign --verify --deep --strict "$app_bundle"
             archive="dist/zmux-macos-aarch64-unsigned.zip"
@@ -349,7 +392,10 @@ jobs:
           $releaseSigningAvailable = `
             $env:WINDOWS_CERTIFICATE_BASE64 -and `
             $env:WINDOWS_CERTIFICATE_PASSWORD
-          $shouldSign = $isTagRelease -and $releaseSigningAvailable
+          if ($isTagRelease -and -not $releaseSigningAvailable) {
+            throw 'Tagged Windows releases require WINDOWS_CERTIFICATE_BASE64 and WINDOWS_CERTIFICATE_PASSWORD'
+          }
+          $shouldSign = $isTagRelease
           if ($shouldSign) {
             $certificate = Join-Path $env:RUNNER_TEMP 'zmux-signing.pfx'
             [IO.File]::WriteAllBytes(
@@ -378,9 +424,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Verifying zmux-gui.exe failed' }
             $msiName = 'zmux-windows-x86_64.msi'
           } else {
-            if ($isTagRelease) {
-              Write-Warning 'Windows signing secrets are unavailable; publishing an unsigned installer'
-            }
             $msiName = 'zmux-windows-x86_64-unsigned.msi'
           }
 
@@ -512,14 +555,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mapfile -t assets < <(find release-assets -maxdepth 1 -type f \
-            \( -name '*.deb' -o -name '*.zip' -o -name '*.msi' \) \
-            -print | sort)
-          test "${#assets[@]}" -eq 3 || {
-            printf 'Expected three release assets, found %s\n' "${#assets[@]}" >&2
-            printf '%s\n' "${assets[@]}" >&2
+          if find release-assets -maxdepth 1 -type f -name '*-unsigned*' -print -quit | grep -q .; then
+            echo 'Unsigned artifacts cannot be published in a tagged release:' >&2
+            find release-assets -maxdepth 1 -type f -name '*-unsigned*' -print >&2
             exit 1
-          }
+          fi
+
+          expected=(
+            zmux-linux-x86_64.deb
+            zmux-macos-aarch64.zip
+            zmux-windows-x86_64.msi
+          )
+          mapfile -t actual < <(find release-assets -maxdepth 1 -type f \
+            \( -name '*.deb' -o -name '*.zip' -o -name '*.msi' \) \
+            -printf '%f\n' | sort)
+          if [[ "${actual[*]}" != "${expected[*]}" ]]; then
+            echo 'Tagged release artifacts do not match the required platform filenames.' >&2
+            printf 'Expected: %s\n' "${expected[*]}" >&2
+            printf 'Actual:   %s\n' "${actual[*]}" >&2
+            exit 1
+          fi
+
+          assets=()
+          for name in "${expected[@]}"; do
+            asset="release-assets/$name"
+            test -s "$asset" || {
+              printf 'Release artifact is missing or empty: %s\n' "$asset" >&2
+              exit 1
+            }
+            assets+=("$asset")
+          done
           gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \

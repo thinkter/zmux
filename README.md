@@ -38,6 +38,22 @@ process keeps going in the background while you work elsewhere.
 - Workspaces with unread agent notifications show a dot; the latest notification appears at the bottom of the sidebar.
 - Use the trash button to close a workspace; the last one can't be closed.
 
+### Trusting terminal-discovered repositories
+
+Terminal working directories and the Git repositories containing them are
+treated as untrusted input. zmux periodically invokes the `git` executable from
+its trusted host environment to populate workspace-rail metadata, but those
+automatic commands do not inherit `GIT_*` overrides. They also disable optional
+index writes and repository-local filesystem monitors; diff statistics disable
+external diff drivers and text conversion helpers.
+
+This hardening applies to zmux's automatic branch, status, and line-count
+collection. It is not a general Git sandbox: standard configuration and
+repository data are still parsed, and Git commands that you explicitly run in
+a terminal retain their normal environment and behavior. The executable search
+path and other non-Git host environment are part of the trusted application
+launch context.
+
 ## Notifications
 
 zmux accepts the terminal notification protocols used by contemporary terminal
@@ -76,14 +92,17 @@ installs `zmux` on `PATH` together with its XDG desktop identity, macOS is a
 Developer ID-signed and Apple-notarized app bundle, and Windows is an
 Authenticode-signed MSI whose shortcut shares zmux's AppUserModelID. Install
 the Linux package with `sudo apt install ./zmux-linux-x86_64.deb`; use the app
-bundle or MSI normally on macOS and Windows. Pull-request artifacts whose names
+bundle or MSI normally on macOS and Windows. Non-tag CI artifacts whose names
 end in `-unsigned` are macOS/Windows packaging smoke-test outputs, not end-user
-releases. The Linux package requires a Vulkan-capable driver and declares the
-Vulkan loader dependency explicitly.
+releases. Tagged builds fail closed unless all Apple notarization or Windows
+Authenticode credentials are available, and the release job accepts only the
+three exact signed platform artifact names. The Linux package requires a
+Vulkan-capable driver and declares the Vulkan loader dependency explicitly.
 
 Build notes:
 
 - `zmux` wraps Zed's GPUI terminal view, which pulls in substantial editor/workspace/UI code. The required Zed crates are fetched from `https://github.com/zed-industries/zed` at the pinned revision recorded in `Cargo.toml` and `Cargo.lock`
+- On the first run after moving away from Zed's data directory, legacy databases are copied into a private staging directory and atomically installed without changing the Zed copy. Each live WAL-mode `db.sqlite` is captured with SQLite's online backup API; raw WAL, shared-memory, and rollback-journal sidecars are not copied.
 - Release builds strip symbols and use `panic = "abort"` to reduce artifact size without enabling slower size optimizations such as LTO by default.
 - Linux and FreeBSD builds enable `gpui_platform`'s `font-kit`, `wayland`, and `x11` backends. macOS and Windows avoid those Linux display features in this crate's target-specific dependency configuration.
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.

@@ -1,4 +1,4 @@
-# Vendored terminal integration patches
+# Vendored Zed integration patches
 
 These crates are narrow, source-pinned patches used to surface terminal
 notification escape sequences through Zed's existing title-change event path
@@ -21,7 +21,16 @@ notification capability before the terminal is mounted.
   `abbe85a3321bf6cb7f5b241e623d9c2e16c29187`. It adds one application-owned
   terminal factory hook and uses it for direct split cloning and persisted
   terminal deserialization, closing creation paths that otherwise bypass the
-  exact-pane CLI capability setup.
+  exact-pane CLI capability setup. Its standalone manifest repeats the same
+  release-relevant Zed lint policy as `git_ui/`; preserve that block when
+  refreshing either vendored snapshot.
+- `git_ui/` is Zed commit
+  `abbe85a3321bf6cb7f5b241e623d9c2e16c29187`, copied from `crates/git_ui`.
+  Its local `zmux-core` feature hides Zed-only worktree/window actions and adds
+  a host repository-scope policy used by zmux's logical workspaces. The local
+  manifest also reproduces Zed's Git UI lint policy explicitly so the vendored
+  crate keeps correctness lints enabled without turning upstream style lints
+  into release failures.
 
 The marker prefix is `U+001F + "zmux-osc-notification-v1:"`. Keep it identical
 to `OSC_NOTIFICATION_TITLE_PREFIX` in `src/osc.rs`. The application consumes
@@ -31,7 +40,8 @@ watermark. Ordinary title events continue through Zed's normal title path once
 the replay queue is empty.
 
 The original VTE and Alacritty licenses and upstream README files are retained
-inside their crate directories. The terminal-view snapshot is GPL-3.0-or-later
-and is covered by the repository's root `LICENSE`. Local modifications are
-limited to the notification bridge/factory hook, their tests, and standalone
-Cargo metadata needed for path patches.
+inside their crate directories. The terminal-view and Git UI snapshots are
+GPL-3.0-or-later and their vendored license paths resolve to the repository's
+root `LICENSE`. Local modifications are limited to the notification
+bridge/factory hook, Git UI repository scoping and feature gates, their tests,
+and standalone Cargo metadata needed for path patches.
