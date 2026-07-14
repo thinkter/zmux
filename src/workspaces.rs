@@ -33,7 +33,7 @@ use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{Notification, NotificationStore, WorkspaceId};
 use crate::session::{
     LayoutAxis, LayoutNodeSnapshot, LayoutSnapshot, SESSION_VERSION, SessionSnapshot, SessionStore,
-    TerminalSnapshot, WorkspaceSnapshot,
+    SessionWriteOutcome, TerminalSnapshot, WorkspaceSnapshot,
 };
 use crate::welcome::ZmuxWelcome;
 
@@ -194,9 +194,60 @@ pub struct WorkspacesPanel {
     _context_refresh_task: Task<()>,
     session_store: SessionStore,
     owns_session: bool,
-    last_session_snapshot: Option<SessionSnapshot>,
+    session_persistence: SessionPersistence,
     attached_worktrees: HashMap<PathBuf, Entity<project::Worktree>>,
     pending_worktrees: BTreeSet<PathBuf>,
+}
+
+#[derive(Debug)]
+struct SessionPersistence {
+    persisted: Option<SessionSnapshot>,
+    desired: Option<SessionSnapshot>,
+    in_flight: Option<SessionSnapshot>,
+}
+
+impl SessionPersistence {
+    fn new(restored: Option<SessionSnapshot>) -> Self {
+        Self {
+            persisted: restored.clone(),
+            desired: restored,
+            in_flight: None,
+        }
+    }
+
+    fn request(&mut self, snapshot: SessionSnapshot) {
+        if self.desired.as_ref() != Some(&snapshot) {
+            self.desired = Some(snapshot);
+        }
+    }
+
+    fn start_next(&mut self) -> Option<SessionSnapshot> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let desired = self.desired.clone()?;
+        if self.persisted.as_ref() == Some(&desired) {
+            return None;
+        }
+        self.in_flight = Some(desired.clone());
+        Some(desired)
+    }
+
+    fn complete(&mut self, snapshot: &SessionSnapshot, installed: bool) -> bool {
+        if self.in_flight.as_ref() != Some(snapshot) {
+            return false;
+        }
+        self.in_flight = None;
+        if installed {
+            self.persisted = Some(snapshot.clone());
+            self.desired != self.persisted
+        } else {
+            // Keep the failed snapshot desired and retry it only on the next
+            // persistence trigger. If something newer was coalesced while it
+            // was in flight, that newer state can be drained immediately.
+            self.desired.as_ref() != Some(snapshot)
+        }
+    }
 }
 
 /// Bridges the vendored Zed Git panel to zmux's logical workspaces.
@@ -401,7 +452,7 @@ impl WorkspacesPanel {
             _context_refresh_task: context_refresh_task,
             session_store,
             owns_session,
-            last_session_snapshot: restored,
+            session_persistence: SessionPersistence::new(restored),
             attached_worktrees: HashMap::new(),
             pending_worktrees: BTreeSet::new(),
         }
@@ -979,15 +1030,49 @@ impl WorkspacesPanel {
             active_workspace_id: self.active,
             workspaces,
         };
-        if snapshot.validate().is_err() || self.last_session_snapshot.as_ref() == Some(&snapshot) {
+        if snapshot.validate().is_err() {
             return;
         }
-        self.last_session_snapshot = Some(snapshot.clone());
+        self.session_persistence.request(snapshot);
+        self.start_session_write(cx);
+    }
+
+    fn start_session_write(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.session_persistence.start_next() else {
+            return;
+        };
+
         let store = self.session_store.clone();
-        cx.background_spawn(async move {
-            if let Err(error) = store.save(&snapshot) {
-                eprintln!("failed to persist zmux session: {error:#}");
+        let write = match store.prepare_save(&snapshot) {
+            Ok(write) => write,
+            Err(error) => {
+                self.session_persistence.complete(&snapshot, false);
+                eprintln!("failed to prepare zmux session persistence: {error:#}");
+                return;
             }
+        };
+        let save = cx.background_spawn(async move { store.commit(&write) });
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            this.update(cx, |this, cx| {
+                let installed = match result {
+                    Ok(SessionWriteOutcome::Installed) => true,
+                    Ok(SessionWriteOutcome::Superseded) => false,
+                    Err(error) => {
+                        eprintln!("failed to persist zmux session: {error:#}");
+                        false
+                    }
+                };
+
+                // Successful writes immediately drain a coalesced newer
+                // snapshot. Failed current writes remain desired and are
+                // retried by the next persistence trigger, avoiding a tight
+                // failure loop while keeping the persisted watermark honest.
+                if this.session_persistence.complete(&snapshot, installed) {
+                    this.start_session_write(cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2479,6 +2564,63 @@ fn schedule_ratio_restores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persistence_snapshot(name: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            version: SESSION_VERSION,
+            next_workspace_id: 2,
+            active_workspace_id: 1,
+            workspaces: vec![WorkspaceSnapshot {
+                id: 1,
+                manual_name: Some(name.into()),
+                default_directory: None,
+                selected_git_root: None,
+                layout: LayoutSnapshot {
+                    root: LayoutNodeSnapshot::Leaf {
+                        tabs: Vec::new(),
+                        active_tab: 0,
+                        focused: true,
+                    },
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn session_persistence_serializes_coalesces_and_retries() {
+        let restored = persistence_snapshot("restored");
+        let first = persistence_snapshot("first");
+        let newest = persistence_snapshot("newest");
+        let mut persistence = SessionPersistence::new(Some(restored.clone()));
+
+        persistence.request(first.clone());
+        assert_eq!(persistence.start_next(), Some(first.clone()));
+        persistence.request(persistence_snapshot("intermediate"));
+        persistence.request(newest.clone());
+        assert_eq!(persistence.start_next(), None);
+
+        assert!(persistence.complete(&first, true));
+        assert_eq!(persistence.persisted, Some(first.clone()));
+        assert_eq!(persistence.start_next(), Some(newest.clone()));
+        assert!(!persistence.complete(&newest, true));
+        assert_eq!(persistence.persisted, Some(newest.clone()));
+        assert_eq!(persistence.start_next(), None);
+
+        // Even an unexpected stale completion is ignored once a newer
+        // snapshot has been installed.
+        assert!(!persistence.complete(&first, true));
+        assert_eq!(persistence.persisted, Some(newest.clone()));
+
+        let retry = persistence_snapshot("retry");
+        persistence.request(retry.clone());
+        assert_eq!(persistence.start_next(), Some(retry.clone()));
+        assert!(!persistence.complete(&retry, false));
+        assert_eq!(persistence.persisted, Some(newest));
+        assert_eq!(persistence.desired, Some(retry.clone()));
+        assert_eq!(persistence.start_next(), Some(retry.clone()));
+        assert!(!persistence.complete(&retry, true));
+        assert_eq!(persistence.persisted, Some(retry));
+    }
 
     #[test]
     fn workspace_panel_dimensions_follow_ui_scale() {
