@@ -248,10 +248,13 @@ async fn test_kill_active_task_on_completed_task_is_noop(cx: &mut TestAppContext
     let (terminal, completion_rx) =
         build_command_terminal(cx, deterministic_output_shell("done")).await;
 
+    // Drive terminal output before awaiting the completion channel. On
+    // Windows the ConPTY completion callback can otherwise race the GPUI test
+    // scheduler into parking without a registered waker.
+    assert_content_eventually(&terminal, "done", cx).await;
+
     let exit_status = completion_rx.recv().await.unwrap();
     assert_eq!(exit_status, Some(ExitStatus::default()));
-
-    assert_content_eventually(&terminal, "done", cx).await;
 
     terminal.update(cx, |term, _cx| {
         term.kill_active_task();
