@@ -36,8 +36,8 @@ use crate::settings_page::SettingsPage;
 use crate::theme::configure_terminal_fonts;
 use crate::welcome::ZmuxWelcome;
 use crate::workspaces::{
-    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, ToggleNotificationCenter,
-    ToggleWorkspacesPanel, WorkspacesPanel,
+    ActivateNextWorkspace, ActivatePreviousWorkspace, NewWorkspace, RestoredTerminal,
+    ToggleNotificationCenter, ToggleWorkspacesPanel, WorkspacesPanel, restore_startup_layout,
 };
 
 actions!(zmux, [NotifyCurrentPane, JumpToLatestNotification]);
@@ -177,7 +177,7 @@ pub fn open_zmux_workspace(
     let initial_dir = crate::env::current_working_directory()
         .map(|path| vec![path])
         .unwrap_or_default();
-    open_zmux_workspace_for_paths(requesting_window, initial_dir, cx)
+    open_zmux_workspace_for_paths(requesting_window, initial_dir, true, cx)
 }
 
 /// Open a zmux window rooted at an explicit directory.
@@ -189,12 +189,13 @@ pub fn open_zmux_workspace_at(
     initial_dir: PathBuf,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
-    open_zmux_workspace_for_paths(requesting_window, vec![initial_dir], cx)
+    open_zmux_workspace_for_paths(requesting_window, vec![initial_dir], false, cx)
 }
 
 fn open_zmux_workspace_for_paths(
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
     initial_dirs: Vec<PathBuf>,
+    session_enabled: bool,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
     let app_state = AppState::global(cx);
@@ -206,7 +207,7 @@ fn open_zmux_workspace_for_paths(
         // Route capabilities are per terminal and must never enter the
         // project-wide environment inherited by every shell.
         Some(terminal_env()),
-        Some(Box::new(|workspace, window, cx| {
+        Some(Box::new(move |workspace, window, cx| {
             let welcome = cx.new(ZmuxWelcome::new);
             let center_pane = workspace.active_pane().clone();
             center_pane.update(cx, |pane, cx| {
@@ -217,7 +218,9 @@ fn open_zmux_workspace_for_paths(
                 .bottom_dock()
                 .update(cx, |dock, cx| dock.set_open(false, window, cx));
 
-            let panel = cx.new(|cx| WorkspacesPanel::new(workspace.weak_handle(), window, cx));
+            let panel = cx.new(|cx| {
+                WorkspacesPanel::new(workspace.weak_handle(), session_enabled, window, cx)
+            });
             workspace.add_panel(panel.clone(), window, cx);
             workspace.open_panel::<WorkspacesPanel>(window, cx);
             NotificationRuntime::attach_workspace(cx.entity(), panel.clone(), window, cx);
@@ -412,7 +415,23 @@ fn open_zmux_workspace_for_paths(
                 };
                 NotificationRuntime::jump_to_latest_unread(panel.entity_id(), cx);
             });
-            create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+            let startup_restore = panel.update(cx, |panel, _| panel.take_initial_restore());
+            if let Some(layout) = startup_restore {
+                let workspace_id = panel.read(cx).active_workspace_id();
+                let generation = panel.read(cx).active_workspace_generation();
+                let terminals = restore_startup_layout(workspace, &layout, window, cx);
+                create_restored_terminals_for_workspace(
+                    workspace,
+                    workspace_id,
+                    generation,
+                    terminals,
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+            } else {
+                create_center_terminal(workspace, window, cx).detach_and_log_err(cx);
+            }
         })),
         OpenMode::NewWindow,
         cx,
@@ -512,6 +531,78 @@ pub(crate) fn create_center_terminal_for_workspace(
             );
         })?;
         Ok(terminal_weak)
+    })
+}
+
+/// Recreate persisted terminal tabs as fresh shells, serially, so tab order is
+/// deterministic. The destination panes are exact entities from the restored
+/// split tree; a workspace switch invalidates the remaining work instead of
+/// leaking shells into whichever workspace became active.
+pub(crate) fn create_restored_terminals_for_workspace(
+    workspace: &mut Workspace,
+    owning_workspace_id: WorkspaceId,
+    activation_generation: u64,
+    terminals: Vec<RestoredTerminal>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "the zmux workspace panel is unavailable"
+        )));
+    };
+    let panel = panel.downgrade();
+    let project = workspace.project().downgrade();
+    let workspace_handle = workspace.weak_handle();
+    let database_id = workspace.database_id();
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        for restored in terminals {
+            let terminal = project
+                .update(cx, |project, cx| {
+                    create_terminal_with_cli_route(project, restored.working_directory.clone(), cx)
+                })?
+                .await?;
+            let project_for_view = project.clone();
+            let workspace_for_view = workspace_handle.clone();
+            let panel = panel.clone();
+            let attached = workspace.update_in(cx, move |workspace, window, cx| {
+                let destination_is_current =
+                    panel.upgrade().is_some_and(|panel| {
+                        let panel = panel.read(cx);
+                        panel.active_workspace_id() == owning_workspace_id
+                            && panel.active_workspace_generation() == activation_generation
+                    }) && workspace.panes().iter().any(|pane| pane == &restored.pane);
+                if !destination_is_current {
+                    return false;
+                }
+
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace_for_view,
+                        database_id,
+                        project_for_view,
+                        window,
+                        cx,
+                    )
+                });
+                workspace.add_item(
+                    restored.pane,
+                    Box::new(terminal_view),
+                    None,
+                    false,
+                    restored.activate,
+                    window,
+                    cx,
+                );
+                true
+            })?;
+            if !attached {
+                break;
+            }
+        }
+        Ok(())
     })
 }
 

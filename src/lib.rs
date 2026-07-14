@@ -8,6 +8,7 @@ mod keymap;
 mod notification_runtime;
 mod notifications;
 mod osc;
+mod session;
 mod settings_page;
 mod theme;
 mod welcome;
