@@ -706,8 +706,7 @@ fn source_terminal_working_directory(workspace: &Workspace, cx: &App) -> Option<
     let item = workspace.active_pane().read(cx).active_item()?;
     let terminal_view = item.act_as::<TerminalView>(cx)?;
     let terminal = terminal_view.read(cx).terminal().clone();
-    let working_directory = terminal.read(cx).working_directory();
-    working_directory
+    terminal.read(cx).working_directory()
 }
 
 /// Zed's pane-number action creates a clone when the requested index does not

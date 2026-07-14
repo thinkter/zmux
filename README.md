@@ -76,10 +76,12 @@ installs `zmux` on `PATH` together with its XDG desktop identity, macOS is a
 Developer ID-signed and Apple-notarized app bundle, and Windows is an
 Authenticode-signed MSI whose shortcut shares zmux's AppUserModelID. Install
 the Linux package with `sudo apt install ./zmux-linux-x86_64.deb`; use the app
-bundle or MSI normally on macOS and Windows. Pull-request artifacts whose names
+bundle or MSI normally on macOS and Windows. Non-tag CI artifacts whose names
 end in `-unsigned` are macOS/Windows packaging smoke-test outputs, not end-user
-releases. The Linux package requires a Vulkan-capable driver and declares the
-Vulkan loader dependency explicitly.
+releases. Tagged builds fail closed unless all Apple notarization or Windows
+Authenticode credentials are available, and the release job accepts only the
+three exact signed platform artifact names. The Linux package requires a
+Vulkan-capable driver and declares the Vulkan loader dependency explicitly.
 
 Build notes:
 

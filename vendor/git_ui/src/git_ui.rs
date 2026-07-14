@@ -70,7 +70,7 @@ pub trait RepositoryScope: Send + Sync + 'static {
     -> Vec<Entity<Repository>>;
 
     fn display_name(&self, repository: &Entity<Repository>, cx: &App) -> SharedString {
-        repository.read(cx).display_name().into()
+        repository.read(cx).display_name()
     }
 
     fn select(
