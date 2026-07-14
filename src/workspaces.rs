@@ -9,12 +9,15 @@
 //! stays snappy regardless of how many terminals are open.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Axis, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, TaskExt, WeakEntity,
-    Window, actions, div, point, px, size,
+    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
+    WeakEntity, Window, actions, div, point, px, size,
 };
 use terminal_view::TerminalView;
 use ui::prelude::*;
@@ -42,6 +45,8 @@ actions!(
 const PANEL_WIDTH_REMS: f32 = 15.0;
 const PANEL_MIN_WIDTH_REMS: f32 = 12.0;
 const NOTIFICATION_DRAWER_HEIGHT_REMS: f32 = 17.5;
+const MAX_WORKSPACE_NAME_CHARS: usize = 64;
+const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 fn scaled_panel_size(rem_size: Pixels, rems: f32) -> Pixels {
     px(f32::from(rem_size) * rems)
@@ -64,10 +69,36 @@ enum StoredLayout {
 
 struct WorkspaceEntry {
     id: WorkspaceId,
-    name: String,
+    manual_name: Option<String>,
+    automatic_name: String,
+    context: WorkspaceContext,
     /// `Some` while the workspace is parked in the background, `None` while it is
     /// the active workspace displayed in the center.
     stored: Option<StoredLayout>,
+}
+
+impl WorkspaceEntry {
+    fn display_name(&self) -> &str {
+        self.manual_name
+            .as_deref()
+            .unwrap_or(self.automatic_name.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorkspaceContext {
+    working_directories: Vec<PathBuf>,
+    git_root: Option<PathBuf>,
+    foreground_processes: Vec<String>,
+    shell_count: usize,
+}
+
+#[derive(Clone)]
+struct WorkspaceRow {
+    id: WorkspaceId,
+    name: String,
+    uses_manual_name: bool,
+    context: WorkspaceContext,
 }
 
 struct RenameState {
@@ -108,6 +139,7 @@ pub struct WorkspacesPanel {
     rename: Option<RenameState>,
     notifications_expanded: bool,
     _notification_subscription: Subscription,
+    _context_refresh_task: Task<()>,
 }
 
 impl WorkspacesPanel {
@@ -119,11 +151,26 @@ impl WorkspacesPanel {
         let focus_handle = cx.focus_handle();
         let entries = vec![WorkspaceEntry {
             id: 1,
-            name: "Workspace 1".to_string(),
+            manual_name: None,
+            automatic_name: "New workspace".to_string(),
+            context: WorkspaceContext::default(),
             stored: None,
         }];
         let notification_store = NotificationStore::global(cx);
         let notification_subscription = cx.observe(&notification_store, |_, _, cx| cx.notify());
+        let context_refresh_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(CONTEXT_REFRESH_INTERVAL)
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.refresh_workspace_contexts(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             scope_id: cx.entity_id(),
             workspace,
@@ -135,6 +182,7 @@ impl WorkspacesPanel {
             rename: None,
             notifications_expanded: false,
             _notification_subscription: notification_subscription,
+            _context_refresh_task: context_refresh_task,
         }
     }
 
@@ -168,10 +216,11 @@ impl WorkspacesPanel {
             .next_id
             .checked_add(1)
             .expect("workspace ID space exhausted");
-        let name = format!("Workspace {id}");
         self.entries.push(WorkspaceEntry {
             id,
-            name,
+            manual_name: None,
+            automatic_name: "New workspace".to_string(),
+            context: WorkspaceContext::default(),
             stored: None,
         });
 
@@ -266,6 +315,7 @@ impl WorkspacesPanel {
             entry.stored = Some(captured);
         }
         self.active = id;
+        self.refresh_workspace_contexts(cx);
         cx.notify();
     }
 
@@ -342,11 +392,41 @@ impl WorkspacesPanel {
         cx.notify();
     }
 
+    fn refresh_workspace_contexts(&mut self, cx: &mut Context<Self>) {
+        let active_context = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace_context_for_active_workspace(workspace.read(cx), cx));
+        let mut changed = false;
+
+        for entry in &mut self.entries {
+            let context = if entry.id == self.active {
+                active_context.clone().unwrap_or_default()
+            } else {
+                entry
+                    .stored
+                    .as_ref()
+                    .map(|layout| workspace_context_for_stored_layout(layout, cx))
+                    .unwrap_or_default()
+            };
+            let automatic_name = automatic_workspace_name(&context);
+            if entry.context != context || entry.automatic_name != automatic_name {
+                entry.context = context;
+                entry.automatic_name = automatic_name;
+                changed = true;
+            }
+        }
+
+        if changed {
+            cx.notify();
+        }
+    }
+
     fn start_rename(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.iter().find(|entry| entry.id == id) else {
             return;
         };
-        let name = entry.name.clone();
+        let name = entry.display_name().to_string();
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_text(name, window, cx);
@@ -371,13 +451,19 @@ impl WorkspacesPanel {
             return;
         };
         let text = rename.editor.read(cx).text(cx);
-        let trimmed = text.trim();
-        if !trimmed.is_empty()
+        if let Some(name) = sanitize_workspace_name(&text)
             && let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == rename.id)
         {
-            entry.name = trimmed.to_string();
+            entry.manual_name = Some(name);
         }
         cx.notify();
+    }
+
+    fn use_automatic_name(&mut self, id: WorkspaceId, cx: &mut Context<Self>) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.manual_name = None;
+            cx.notify();
+        }
     }
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
@@ -388,14 +474,14 @@ impl WorkspacesPanel {
 
     fn render_entry(
         &self,
-        entry: &WorkspaceEntry,
+        entry: &WorkspaceRow,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = entry.id;
         let is_active = id == self.active;
-        let has_unread = NotificationStore::global(cx)
+        let unread_count = NotificationStore::global(cx)
             .read(cx)
-            .workspace_has_unread(cx.entity_id(), id);
+            .workspace_unread_count(cx.entity_id(), id);
         let renaming = self
             .rename
             .as_ref()
@@ -406,7 +492,7 @@ impl WorkspacesPanel {
 
         let editor = renaming.clone();
         let is_renaming = renaming.is_some();
-        let name_area = h_flex()
+        let name_row = h_flex()
             .id(("ws-name", id as usize))
             .flex_1()
             .gap_2()
@@ -455,9 +541,54 @@ impl WorkspacesPanel {
                     },
                 ))
             })
-            .when(has_unread, |this| {
-                this.child(Indicator::dot().color(Color::Accent))
+            .when(unread_count > 0, |this| {
+                this.child(
+                    div()
+                        .px_1()
+                        .rounded_md()
+                        .bg(cx.theme().colors().element_selected)
+                        .child(
+                            Label::new(unread_count.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent),
+                        ),
+                )
             });
+
+        let context = entry.context.clone();
+        let shell_label = match context.shell_count {
+            0 => "No shells".to_string(),
+            1 => "1 shell".to_string(),
+            count => format!("{count} shells"),
+        };
+        let name_area = v_flex()
+            .flex_1()
+            .gap_0p5()
+            .overflow_hidden()
+            .child(name_row)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(shell_label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    )
+                    .children(context.foreground_processes.iter().take(3).map(|process| {
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(cx.theme().colors().element_background)
+                            .child(
+                                Label::new(process.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            )
+                    })),
+            );
 
         let drag_ix = self
             .entries
@@ -509,6 +640,18 @@ impl WorkspacesPanel {
                 h_flex()
                     .gap_0p5()
                     .visible_on_hover(group)
+                    .when(entry.uses_manual_name, |this| {
+                        this.child(
+                            IconButton::new(("ws-auto-name", id as usize), IconName::RotateCcw)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Use automatic name"))
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.use_automatic_name(id, cx);
+                                })),
+                        )
+                    })
                     .child(
                         IconButton::new(("ws-rename", id as usize), IconName::Pencil)
                             .shape(IconButtonShape::Square)
@@ -651,10 +794,11 @@ impl Render for WorkspacesPanel {
             .iter()
             // Clone the lightweight metadata so we no longer borrow `self.entries`
             // while `render_entry` borrows `self`.
-            .map(|entry| WorkspaceEntry {
+            .map(|entry| WorkspaceRow {
                 id: entry.id,
-                name: entry.name.clone(),
-                stored: None,
+                name: entry.display_name().to_string(),
+                uses_manual_name: entry.manual_name.is_some(),
+                context: entry.context.clone(),
             })
             .collect();
 
@@ -890,6 +1034,169 @@ impl Panel for WorkspacesPanel {
     }
 }
 
+fn workspace_context_for_active_workspace(workspace: &Workspace, cx: &App) -> WorkspaceContext {
+    let mut context = WorkspaceContext::default();
+    for pane in workspace.panes() {
+        for item in pane.read(cx).items() {
+            add_item_to_workspace_context(item.as_ref(), &mut context, cx);
+        }
+    }
+    finalize_workspace_context(context)
+}
+
+fn workspace_context_for_stored_layout(layout: &StoredLayout, cx: &App) -> WorkspaceContext {
+    fn visit(layout: &StoredLayout, context: &mut WorkspaceContext, cx: &App) {
+        match layout {
+            StoredLayout::Leaf { items, .. } => {
+                for item in items {
+                    add_item_to_workspace_context(item.as_ref(), context, cx);
+                }
+            }
+            StoredLayout::Split { first, second, .. } => {
+                visit(first, context, cx);
+                visit(second, context, cx);
+            }
+        }
+    }
+
+    let mut context = WorkspaceContext::default();
+    visit(layout, &mut context, cx);
+    finalize_workspace_context(context)
+}
+
+fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceContext, cx: &App) {
+    let Some(terminal_view) = item.act_as::<TerminalView>(cx) else {
+        return;
+    };
+    let terminal = terminal_view.read(cx).terminal().clone();
+    let terminal = terminal.read(cx);
+    context.shell_count += 1;
+    if let Some(directory) = terminal.working_directory() {
+        context.working_directories.push(directory);
+    }
+    if let Some(process) = terminal.foreground_process_command_name()
+        && !is_shell_process(&process)
+        && let Some(process) = sanitize_process_label(&process)
+    {
+        context.foreground_processes.push(process);
+    }
+}
+
+fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext {
+    context.working_directories.sort();
+    context.working_directories.dedup();
+
+    let processes = context
+        .foreground_processes
+        .drain(..)
+        .collect::<BTreeSet<_>>();
+    context.foreground_processes = processes.into_iter().take(8).collect();
+
+    let git_roots = context
+        .working_directories
+        .iter()
+        .map(|directory| nearest_git_root(directory))
+        .collect::<Option<Vec<_>>>();
+    if let Some(git_roots) = git_roots {
+        let git_roots = git_roots.into_iter().collect::<BTreeSet<_>>();
+        if git_roots.len() == 1 {
+            context.git_root = git_roots.into_iter().next();
+        }
+    }
+    context
+}
+
+fn nearest_git_root(directory: &Path) -> Option<PathBuf> {
+    directory
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first = paths.first()?;
+    let mut common = first.clone();
+    for path in &paths[1..] {
+        while !path.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    Some(common)
+}
+
+fn automatic_workspace_name(context: &WorkspaceContext) -> String {
+    if let Some(git_root) = &context.git_root
+        && let Some(name) = path_display_name(git_root)
+    {
+        return name;
+    }
+
+    if let Some(common) = common_ancestor(&context.working_directories) {
+        if common == paths::home_dir().as_path() {
+            if context.working_directories.len() == 1 {
+                return "Home".to_string();
+            }
+        } else if common.starts_with(paths::home_dir().as_path())
+            && let Some(name) = path_display_name(&common)
+        {
+            return name;
+        }
+    }
+
+    match context.shell_count {
+        0 => "New workspace".to_string(),
+        1 => "Shell".to_string(),
+        _ => "Mixed shells".to_string(),
+    }
+}
+
+fn path_display_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy())
+        .and_then(|name| sanitize_workspace_name(&name))
+}
+
+fn sanitize_workspace_name(name: &str) -> Option<String> {
+    let normalized = name
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized
+        .chars()
+        .take(MAX_WORKSPACE_NAME_CHARS)
+        .collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn sanitize_process_label(process: &str) -> Option<String> {
+    sanitize_workspace_name(process).map(|process| process.chars().take(24).collect())
+}
+
+fn is_shell_process(process: &str) -> bool {
+    matches!(
+        process
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(process)
+            .to_ascii_lowercase()
+            .as_str(),
+        "bash"
+            | "zsh"
+            | "fish"
+            | "sh"
+            | "dash"
+            | "nu"
+            | "xonsh"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "cmd.exe"
+    )
+}
+
 /// Snapshot the current center into a [`StoredLayout`], cloning each item handle
 /// so the terminals stay alive after the originals are detached.
 fn capture_layout(workspace: &Workspace, cx: &App) -> StoredLayout {
@@ -1093,6 +1400,53 @@ mod tests {
         assert_eq!(scaled_panel_size(px(16.0), PANEL_WIDTH_REMS), px(240.0));
         assert_eq!(scaled_panel_size(px(22.4), PANEL_WIDTH_REMS), px(336.0));
         assert_eq!(scaled_panel_size(px(22.4), PANEL_MIN_WIDTH_REMS), px(268.8));
+    }
+
+    #[test]
+    fn automatic_names_prioritize_a_shared_git_project() {
+        let context = WorkspaceContext {
+            working_directories: vec![
+                PathBuf::from("/tmp/zmux/src"),
+                PathBuf::from("/tmp/zmux/tests"),
+            ],
+            git_root: Some(PathBuf::from("/tmp/zmux")),
+            foreground_processes: vec!["cargo".into()],
+            shell_count: 2,
+        };
+
+        assert_eq!(automatic_workspace_name(&context), "zmux");
+    }
+
+    #[test]
+    fn automatic_names_use_the_common_project_directory() {
+        let context = WorkspaceContext {
+            working_directories: vec![
+                paths::home_dir().join("Documents/project/api"),
+                paths::home_dir().join("Documents/project/web"),
+            ],
+            shell_count: 2,
+            ..WorkspaceContext::default()
+        };
+
+        assert_eq!(automatic_workspace_name(&context), "project");
+    }
+
+    #[test]
+    fn manual_workspace_names_are_sanitized_and_bounded() {
+        let long = format!("  hello\nworld {}  ", "x".repeat(100));
+        let sanitized = sanitize_workspace_name(&long).unwrap();
+
+        assert_eq!(sanitized.chars().count(), MAX_WORKSPACE_NAME_CHARS);
+        assert!(sanitized.starts_with("helloworld "));
+        assert!(!sanitized.chars().any(char::is_control));
+        assert_eq!(sanitize_workspace_name("\n\t"), None);
+    }
+
+    #[test]
+    fn shell_processes_are_not_rendered_as_activity_pills() {
+        assert!(is_shell_process("/usr/bin/bash"));
+        assert!(is_shell_process("pwsh"));
+        assert!(!is_shell_process("cargo"));
     }
 
     fn leaf(x: f32, y: f32, w: f32, h: f32) -> (Bounds<Pixels>, StoredLayout) {
