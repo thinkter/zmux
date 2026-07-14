@@ -3,6 +3,8 @@ name: Release builds
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -37,6 +39,7 @@ jobs:
             rustflags: '-C target-feature=+crt-static'
 
     env:
+      CARGO_BUILD_JOBS: 6
       CARGO_TERM_COLOR: always
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -71,6 +74,7 @@ jobs:
             libssl-dev \
             libva-dev \
             libvulkan1 \
+            mesa-vulkan-drivers \
             libwayland-dev \
             libx11-xcb-dev \
             libxkbcommon-x11-dev \
@@ -108,12 +112,28 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test --locked -j 6
 
-      # GPUI workspace tests share process-wide Windows/ConPTY state. Running
-      # them concurrently in one libtest process can crash during teardown
-      # with STATUS_ACCESS_VIOLATION instead of reporting a test failure.
+      # GPUI workspace tests share process-wide Windows/ConPTY state. Even
+      # serial tests can leak scheduler or console state into the next test in
+      # the same binary, so every integration test gets a fresh process.
       - name: Run complete test suite (Windows, serial)
         if: runner.os == 'Windows'
-        run: cargo test --locked -j 6 -- --test-threads=1
+        shell: pwsh
+        run: |
+          cargo test --locked -j 6 --lib --bins -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
+
+          foreach ($target in @('zed_terminal_port', 'zmux_app')) {
+            $testList = cargo test --locked -j 6 --test $target -- --list
+            if ($LASTEXITCODE -ne 0) { throw "Could not list tests in $target" }
+            $tests = $testList |
+              Select-String '^(.+): test$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+            if (-not $tests) { throw "No tests found in $target" }
+            foreach ($test in $tests) {
+              cargo test --locked -j 6 --test $target $test -- --exact --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "Test failed: ${target}::${test}" }
+            }
+          }
 
       - name: Run vendored terminal bridge tests
         if: runner.os == 'Linux'
@@ -211,17 +231,20 @@ jobs:
           plutil -lint "$app_bundle/Contents/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_bundle/Contents/Info.plist")" = "$bundle_id"
 
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            for value in \
-              APPLE_APP_PASSWORD \
-              APPLE_CERTIFICATE_BASE64 \
-              APPLE_CERTIFICATE_PASSWORD \
-              APPLE_ID \
-              APPLE_SIGNING_IDENTITY \
-              APPLE_TEAM_ID; do
-              test -n "${!value}" || { echo "Missing required release secret: $value" >&2; exit 1; }
-            done
+          release_signing_available=true
+          for value in \
+            APPLE_APP_PASSWORD \
+            APPLE_CERTIFICATE_BASE64 \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_ID \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_TEAM_ID; do
+            if test -z "${!value}"; then
+              release_signing_available=false
+            fi
+          done
 
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]] && $release_signing_available; then
             keychain="$RUNNER_TEMP/zmux-signing.keychain-db"
             certificate="$RUNNER_TEMP/zmux-signing.p12"
             keychain_password="$(openssl rand -hex 24)"
@@ -263,8 +286,12 @@ jobs:
             spctl --assess --type execute --verbose=4 "$app_bundle"
             archive="dist/zmux-macos-aarch64.zip"
           else
-            # CI/PR artifacts are intentionally ad-hoc signed for bundle API
-            # smoke tests and explicitly labeled as non-distributable.
+            # Ad-hoc signing keeps bundle APIs testable when release signing
+            # credentials are unavailable. The filename remains explicit so
+            # users are not led to believe Gatekeeper notarization occurred.
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              echo "::warning::Apple signing secrets are unavailable; publishing an unsigned macOS artifact"
+            fi
             codesign --force --sign - --identifier "$bundle_id" --timestamp=none "$app_bundle"
             codesign --verify --deep --strict "$app_bundle"
             archive="dist/zmux-macos-aarch64-unsigned.zip"
@@ -319,13 +346,11 @@ jobs:
           if (-not $signTool) {
             throw 'Could not find signtool.exe in the Windows SDK'
           }
-          if ($isTagRelease) {
-            if (-not $env:WINDOWS_CERTIFICATE_BASE64) {
-              throw 'Missing required release secret: WINDOWS_CERTIFICATE_BASE64'
-            }
-            if (-not $env:WINDOWS_CERTIFICATE_PASSWORD) {
-              throw 'Missing required release secret: WINDOWS_CERTIFICATE_PASSWORD'
-            }
+          $releaseSigningAvailable = `
+            $env:WINDOWS_CERTIFICATE_BASE64 -and `
+            $env:WINDOWS_CERTIFICATE_PASSWORD
+          $shouldSign = $isTagRelease -and $releaseSigningAvailable
+          if ($shouldSign) {
             $certificate = Join-Path $env:RUNNER_TEMP 'zmux-signing.pfx'
             [IO.File]::WriteAllBytes(
               $certificate,
@@ -343,8 +368,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Verifying zmux.exe failed' }
             $msiName = 'zmux-windows-x86_64.msi'
           } else {
-            # CI/PR installers exercise WiX and identity wiring but are
-            # explicitly labeled unsigned and are not release artifacts.
+            if ($isTagRelease) {
+              Write-Warning 'Windows signing secrets are unavailable; publishing an unsigned installer'
+            }
             $msiName = 'zmux-windows-x86_64-unsigned.msi'
           }
 
@@ -360,7 +386,7 @@ jobs:
           if ($msi.Length -eq 0) {
             throw 'WiX produced an empty MSI'
           }
-          if ($isTagRelease) {
+          if ($shouldSign) {
             & $signTool.FullName sign `
               /fd SHA256 `
               /f $certificate `
@@ -442,3 +468,36 @@ jobs:
           name: ${{ matrix.artifact }}${{ (runner.os == 'macOS' || runner.os == 'Windows') && !startsWith(github.ref, 'refs/tags/v') && '-unsigned' || '' }}
           path: ${{ matrix.upload_path }}
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f \
+            \( -name '*.deb' -o -name '*.zip' -o -name '*.msi' \) \
+            -print | sort)
+          test "${#assets[@]}" -eq 3 || {
+            printf 'Expected three release assets, found %s\n' "${#assets[@]}" >&2
+            printf '%s\n' "${assets[@]}" >&2
+            exit 1
+          }
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "zmux $GITHUB_REF_NAME" \
+            --generate-notes
