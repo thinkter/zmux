@@ -1,3 +1,4 @@
+mod agent_detection;
 mod app;
 mod assets;
 mod cli_server;

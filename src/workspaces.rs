@@ -26,6 +26,9 @@ use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::item::ItemHandle;
 use workspace::{Member, Pane, SplitDirection, Workspace};
 
+use crate::agent_detection::{
+    AgentKind, AgentSnapshot, DetectionSignal, detect_agent, sanitized_osc_title, submitted_prompt,
+};
 use crate::app::{
     create_center_terminal_at_for_workspace, create_center_terminal_for_workspace,
     create_restored_terminals_for_workspace,
@@ -56,10 +59,12 @@ const WORKSPACES_FONT_FAMILY: &str = "Lilex";
 const NOTIFICATION_DRAWER_HEIGHT_REMS: f32 = 17.5;
 const MAX_WORKSPACE_NAME_CHARS: usize = 64;
 const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const AGENT_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
+const AGENT_DETECTION_TAIL_LINES: usize = 80;
 const MAX_INCOMPLETE_CONTEXT_REFRESHES: u8 = 3;
 const ACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(5);
 const INACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(30);
-const AGENT_COMPLETION_MISSES: u8 = 2;
+const AGENT_STATE_CONFIRMATIONS: u8 = 2;
 
 fn scaled_panel_size(rem_size: Pixels, rems: f32) -> Pixels {
     px(f32::from(rem_size) * rems)
@@ -241,61 +246,11 @@ struct WorkspaceContext {
     git_roots: Vec<PathBuf>,
     git_root: Option<PathBuf>,
     foreground_processes: Vec<String>,
-    agents: Vec<AgentInstance>,
-    terminal_item_ids: Vec<EntityId>,
     shell_count: usize,
     reported_directories: usize,
 }
 
-/// AI agent CLIs surfaced in the panel's bottom footer, unlike the generic
-/// activity pills which show any non-shell foreground process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum AgentKind {
-    Claude,
-    Codex,
-    OpenCode,
-    Pi,
-    Amp,
-    Gemini,
-    Aider,
-    Goose,
-}
-
 impl AgentKind {
-    fn from_process(process: &str) -> Option<Self> {
-        let executable = process
-            .trim()
-            .rsplit(['/', '\\'])
-            .next()?
-            .to_ascii_lowercase();
-        let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
-
-        match executable {
-            "claude" | "claude-code" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "opencode" => Some(Self::OpenCode),
-            "pi" => Some(Self::Pi),
-            "amp" => Some(Self::Amp),
-            "gemini" => Some(Self::Gemini),
-            "aider" => Some(Self::Aider),
-            "goose" => Some(Self::Goose),
-            _ => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "Claude",
-            Self::Codex => "Codex",
-            Self::OpenCode => "opencode",
-            Self::Pi => "Pi",
-            Self::Amp => "Amp",
-            Self::Gemini => "Gemini",
-            Self::Aider => "Aider",
-            Self::Goose => "Goose",
-        }
-    }
-
     fn icon(self) -> Option<ForegroundProcessIcon> {
         match self {
             Self::Claude => Some(ForegroundProcessIcon::Named(IconName::AiClaude)),
@@ -308,49 +263,74 @@ impl AgentKind {
     }
 }
 
-/// One running agent process, tied to the terminal item hosting it so the
-/// footer can focus that tab on click.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AgentInstance {
+struct AgentObservation {
     kind: AgentKind,
     item_id: EntityId,
-    title: SharedString,
+    custom_title: Option<String>,
+    osc_title: String,
+    recent: String,
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AgentWorkspaceObservation {
+    agents: Vec<AgentObservation>,
+    terminal_item_ids: Vec<EntityId>,
+    active_item_id: Option<EntityId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentChatStatus {
-    Running,
-    Completed,
+enum AgentChatState {
+    NeedsInput,
+    Working,
+    Idle,
+    Quiet,
+    Open,
 }
 
-impl AgentChatStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "done",
+impl AgentChatState {
+    fn label(self, seen: bool) -> &'static str {
+        match (self, seen) {
+            (Self::NeedsInput, _) => "needs input",
+            (Self::Working, _) => "working",
+            (Self::Idle, false) => "done",
+            (Self::Idle, true) => "idle",
+            (Self::Quiet, _) => "quiet",
+            (Self::Open, _) => "open",
         }
     }
 
-    fn color(self) -> Color {
-        match self {
-            Self::Running => Color::Success,
-            Self::Completed => Color::Muted,
+    fn color(self, seen: bool) -> Color {
+        match (self, seen) {
+            (Self::NeedsInput, _) => Color::Error,
+            (Self::Working, _) => Color::Warning,
+            (Self::Idle, false) => Color::Accent,
+            (Self::Idle, true) => Color::Success,
+            (Self::Quiet | Self::Open, _) => Color::Muted,
         }
     }
 }
 
-/// A chat remembered for as long as its terminal tab exists. Foreground
-/// process sampling can briefly miss a live CLI, so two consecutive misses are
-/// required before an open chat is moved into the completed recency order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentChat {
     workspace_id: WorkspaceId,
     kind: AgentKind,
     item_id: EntityId,
-    title: SharedString,
-    status: AgentChatStatus,
+    custom_title: Option<String>,
+    osc_title: Option<String>,
+    prompt_snippet: Option<String>,
+    cwd: Option<PathBuf>,
+    state: AgentChatState,
+    seen: bool,
+    focused: bool,
+    had_active_turn: bool,
+    process_exited: bool,
+    creation_sequence: u64,
     activity_sequence: u64,
     missing_refreshes: u8,
+    pending_state: Option<AgentChatState>,
+    pending_confirmations: u8,
 }
 
 impl WorkspaceContext {
@@ -549,6 +529,7 @@ pub struct WorkspacesPanel {
     notification_filter: Option<WorkspaceId>,
     _notification_subscription: Subscription,
     _context_refresh_task: Task<()>,
+    _agent_refresh_task: Task<()>,
     session_store: SessionStore,
     owns_session: bool,
     session_persistence: SessionPersistence,
@@ -842,6 +823,17 @@ impl WorkspacesPanel {
                 }
             }
         });
+        let agent_refresh_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AGENT_REFRESH_INTERVAL).await;
+                if this
+                    .update(cx, |this, cx| this.refresh_agent_chats(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             scope_id: cx.entity_id(),
             workspace,
@@ -855,6 +847,7 @@ impl WorkspacesPanel {
             notification_filter: None,
             _notification_subscription: notification_subscription,
             _context_refresh_task: context_refresh_task,
+            _agent_refresh_task: agent_refresh_task,
             session_store,
             owns_session,
             session_persistence: SessionPersistence::new(restored),
@@ -1397,12 +1390,6 @@ impl WorkspacesPanel {
                     .map(|layout| workspace_context_for_stored_layout(layout, cx))
                     .unwrap_or_default()
             };
-            changed |= reconcile_agent_chats_for_workspace(
-                &mut self.agent_chats,
-                &mut self.next_agent_activity_sequence,
-                entry.id,
-                &observed,
-            );
             let previous_context = entry.context.clone();
             let previous_authoritative = entry.context_authoritative;
             entry.observe_context(observed);
@@ -1424,6 +1411,42 @@ impl WorkspacesPanel {
             cx.notify();
         }
         self.reconcile_git_context(cx);
+    }
+
+    fn refresh_agent_chats(&mut self, cx: &mut Context<Self>) {
+        let active_observation = self
+            .workspace
+            .upgrade()
+            .map(|workspace| agent_observation_for_active_workspace(workspace.read(cx), cx));
+        let observations = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let observed = if entry.id == self.active {
+                    active_observation.clone().unwrap_or_default()
+                } else {
+                    entry
+                        .stored
+                        .as_ref()
+                        .map(|layout| agent_observation_for_stored_layout(layout, cx))
+                        .unwrap_or_default()
+                };
+                (entry.id, observed)
+            })
+            .collect::<Vec<_>>();
+
+        let mut changed = false;
+        for (workspace_id, observed) in observations {
+            changed |= reconcile_agent_chats_for_workspace(
+                &mut self.agent_chats,
+                &mut self.next_agent_activity_sequence,
+                workspace_id,
+                &observed,
+            );
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     fn promote_restored_git_discovery(&mut self) -> bool {
@@ -1818,6 +1841,12 @@ impl WorkspacesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(chat) = self.agent_chats.get_mut(&(self.active, item_id)) {
+            chat.focused = true;
+            if chat.state == AgentChatState::Idle {
+                chat.seen = true;
+            }
+        }
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1835,21 +1864,19 @@ impl WorkspacesPanel {
     }
 
     fn render_agent_chats(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let workspace_name = self
-            .entries
-            .iter()
-            .find(|entry| entry.id == self.active)?
-            .display_name()
-            .to_owned();
         let chats = agent_chats_for_workspace(&self.agent_chats, self.active);
         if chats.is_empty() {
             return None;
         }
 
         let total = chats.len();
-        let running = chats
+        let active = chats
             .iter()
-            .filter(|chat| chat.status == AgentChatStatus::Running)
+            .filter(|chat| chat.state != AgentChatState::Idle)
+            .count();
+        let done = chats
+            .iter()
+            .filter(|chat| chat.state == AgentChatState::Idle && !chat.seen)
             .count();
 
         Some(
@@ -1867,7 +1894,7 @@ impl WorkspacesPanel {
                                 .weight(FontWeight::SEMIBOLD),
                         )
                         .child(
-                            Label::new(format!("{running} running · {total}"))
+                            Label::new(format!("{active} active · {done} done · {total}"))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         ),
@@ -1882,8 +1909,10 @@ impl WorkspacesPanel {
                         .overflow_y_scroll()
                         .children(chats.into_iter().map(|chat| {
                             let item_id = chat.item_id;
-                            let title = agent_chat_display_title(&chat, &workspace_name);
-                            let detail = format!("{} · {}", chat.status.label(), chat.kind.label());
+                            let title = agent_chat_display_title(&chat);
+                            let detail = agent_chat_detail(&chat);
+                            let tooltip = agent_chat_tooltip(&chat, &title);
+                            let focused = chat.focused;
 
                             h_flex()
                                 .id(("agent-chat-row", item_id))
@@ -1893,17 +1922,16 @@ impl WorkspacesPanel {
                                 .py_1()
                                 .gap_1()
                                 .rounded_sm()
+                                .when(focused, |this| {
+                                    this.bg(cx.theme().colors().element_selected)
+                                })
                                 .hover(|this| this.bg(cx.theme().colors().element_hover))
                                 .cursor_pointer()
-                                .tooltip(Tooltip::text(format!(
-                                    "Open {} chat in {}",
-                                    chat.kind.label(),
-                                    workspace_name
-                                )))
+                                .tooltip(Tooltip::text(tooltip))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.focus_terminal_item(item_id, window, cx);
                                 }))
-                                .child(Indicator::dot().color(chat.status.color()))
+                                .child(Indicator::dot().color(chat.state.color(chat.seen)))
                                 .child(match chat.kind.icon() {
                                     Some(ForegroundProcessIcon::Named(icon)) => Icon::new(icon)
                                         .size(IconSize::Small)
@@ -2810,19 +2838,11 @@ fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceC
     let terminal = terminal_view.read(cx).terminal().clone();
     let terminal = terminal.read(cx);
     context.shell_count += 1;
-    context.terminal_item_ids.push(item.item_id());
     if let Some(directory) = terminal.working_directory() {
         context.reported_directories += 1;
         context.working_directories.push(directory);
     }
     if let Some(process) = terminal.foreground_process_command_name() {
-        if let Some(kind) = AgentKind::from_process(&process) {
-            context.agents.push(AgentInstance {
-                kind,
-                item_id: item.item_id(),
-                title: item.tab_content_text(0, cx),
-            });
-        }
         if !is_shell_process(&process)
             && let Some(process) = sanitize_process_label(&process)
         {
@@ -2841,9 +2861,6 @@ fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext
         .collect::<BTreeSet<_>>();
     context.foreground_processes = processes.into_iter().take(8).collect();
 
-    context.agents.sort_by_key(|agent| agent.kind);
-    context.agents.truncate(8);
-
     context.git_roots = context
         .working_directories
         .iter()
@@ -2857,11 +2874,91 @@ fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext
     context
 }
 
+fn agent_observation_for_active_workspace(
+    workspace: &Workspace,
+    cx: &App,
+) -> AgentWorkspaceObservation {
+    let mut observed = AgentWorkspaceObservation {
+        active_item_id: workspace.active_item(cx).map(|item| item.item_id()),
+        ..AgentWorkspaceObservation::default()
+    };
+    for pane in workspace.panes() {
+        for item in pane.read(cx).items() {
+            add_item_to_agent_observation(item.as_ref(), &mut observed, cx);
+        }
+    }
+    observed
+}
+
+fn agent_observation_for_stored_layout(
+    layout: &StoredLayout,
+    cx: &App,
+) -> AgentWorkspaceObservation {
+    fn visit(layout: &StoredLayout, observed: &mut AgentWorkspaceObservation, cx: &App) {
+        match layout {
+            StoredLayout::Leaf { items, .. } => {
+                for item in items {
+                    add_item_to_agent_observation(item.as_ref(), observed, cx);
+                }
+            }
+            StoredLayout::Split { first, second, .. } => {
+                visit(first, observed, cx);
+                visit(second, observed, cx);
+            }
+        }
+    }
+
+    let mut observed = AgentWorkspaceObservation::default();
+    visit(layout, &mut observed, cx);
+    observed
+}
+
+fn add_item_to_agent_observation(
+    item: &dyn ItemHandle,
+    observed: &mut AgentWorkspaceObservation,
+    cx: &App,
+) {
+    let Some(terminal_view) = item.act_as::<TerminalView>(cx) else {
+        return;
+    };
+    observed.terminal_item_ids.push(item.item_id());
+    let (custom_title, terminal) = {
+        let terminal_view = terminal_view.read(cx);
+        (
+            terminal_view.custom_title().map(str::to_owned),
+            terminal_view.terminal().clone(),
+        )
+    };
+    let terminal = terminal.read(cx);
+    let Some(process) = terminal.foreground_process_command_name() else {
+        return;
+    };
+    let Some(kind) = AgentKind::from_process(&process) else {
+        return;
+    };
+    let recent = kind
+        .has_detailed_detection()
+        .then(|| {
+            terminal
+                .last_n_non_empty_lines(AGENT_DETECTION_TAIL_LINES)
+                .join("\n")
+        })
+        .unwrap_or_default();
+    observed.agents.push(AgentObservation {
+        kind,
+        item_id: item.item_id(),
+        custom_title,
+        osc_title: terminal.breadcrumb_text.clone(),
+        recent,
+        cwd: terminal.working_directory(),
+    });
+}
+
 fn reconcile_agent_chats_for_workspace(
     chats: &mut HashMap<(WorkspaceId, EntityId), AgentChat>,
     next_activity_sequence: &mut u64,
     workspace_id: WorkspaceId,
-    observed: &WorkspaceContext,
+    observed: &AgentWorkspaceObservation,
 ) -> bool {
     let live_items = observed
         .terminal_item_ids
@@ -2882,31 +2979,92 @@ fn reconcile_agent_chats_for_workspace(
     for agent in &observed.agents {
         let key = (workspace_id, agent.item_id);
         if let Some(chat) = chats.get_mut(&key) {
-            if chat.kind != agent.kind || chat.title != agent.title {
+            let restarted = chat.process_exited || chat.kind != agent.kind;
+            if chat.kind != agent.kind {
                 chat.kind = agent.kind;
-                chat.title = agent.title.clone();
+                chat.prompt_snippet = None;
                 changed = true;
             }
-            if chat.status != AgentChatStatus::Running {
-                chat.status = AgentChatStatus::Running;
+            if restarted {
+                chat.state = if agent.kind.has_detailed_detection() {
+                    AgentChatState::Quiet
+                } else {
+                    AgentChatState::Open
+                };
+                chat.seen = true;
+                chat.had_active_turn = false;
+                chat.process_exited = false;
+                chat.pending_state = None;
+                chat.pending_confirmations = 0;
                 chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+                changed = true;
+            }
+            if chat.custom_title != agent.custom_title {
+                chat.custom_title.clone_from(&agent.custom_title);
+                changed = true;
+            }
+            let osc_title = sanitized_osc_title(agent.kind, &agent.osc_title);
+            if chat.osc_title != osc_title {
+                chat.osc_title = osc_title;
+                changed = true;
+            }
+            if chat.cwd != agent.cwd {
+                chat.cwd.clone_from(&agent.cwd);
+                changed = true;
+            }
+            let focused = observed.active_item_id == Some(agent.item_id);
+            if chat.focused != focused {
+                chat.focused = focused;
+                changed = true;
+            }
+            if focused && chat.state == AgentChatState::Idle && !chat.seen {
+                chat.seen = true;
                 changed = true;
             }
             if chat.missing_refreshes != 0 {
                 chat.missing_refreshes = 0;
                 changed = true;
             }
+            changed |= apply_agent_observation(chat, agent, next_activity_sequence);
         } else {
+            let sequence = next_agent_activity_sequence(next_activity_sequence);
+            let outcome = agent.kind.has_detailed_detection().then(|| {
+                detect_agent(
+                    agent.kind,
+                    AgentSnapshot {
+                        recent: &agent.recent,
+                        osc_title: &agent.osc_title,
+                    },
+                )
+            });
+            let state = outcome.map_or(AgentChatState::Open, |outcome| {
+                chat_state_for_signal(outcome.signal).unwrap_or(AgentChatState::Quiet)
+            });
             chats.insert(
                 key,
                 AgentChat {
                     workspace_id,
                     kind: agent.kind,
                     item_id: agent.item_id,
-                    title: agent.title.clone(),
-                    status: AgentChatStatus::Running,
-                    activity_sequence: next_agent_activity_sequence(next_activity_sequence),
+                    custom_title: agent.custom_title.clone(),
+                    osc_title: sanitized_osc_title(agent.kind, &agent.osc_title),
+                    prompt_snippet: (state == AgentChatState::Working)
+                        .then(|| submitted_prompt(agent.kind, &agent.recent))
+                        .flatten(),
+                    cwd: agent.cwd.clone(),
+                    state,
+                    seen: true,
+                    focused: observed.active_item_id == Some(agent.item_id),
+                    had_active_turn: matches!(
+                        state,
+                        AgentChatState::Working | AgentChatState::NeedsInput
+                    ),
+                    process_exited: false,
+                    creation_sequence: sequence,
+                    activity_sequence: sequence,
                     missing_refreshes: 0,
+                    pending_state: None,
+                    pending_confirmations: 0,
                 },
             );
             changed = true;
@@ -2914,23 +3072,129 @@ fn reconcile_agent_chats_for_workspace(
     }
 
     for chat in chats.values_mut().filter(|chat| {
-        chat.workspace_id == workspace_id
-            && chat.status == AgentChatStatus::Running
-            && !running_items.contains_key(&chat.item_id)
+        chat.workspace_id == workspace_id && !running_items.contains_key(&chat.item_id)
     }) {
+        chat.focused = observed.active_item_id == Some(chat.item_id);
+        if chat.process_exited {
+            if chat.focused && chat.state == AgentChatState::Idle && !chat.seen {
+                chat.seen = true;
+                changed = true;
+            }
+            continue;
+        }
         let missing_refreshes = chat.missing_refreshes.saturating_add(1);
         if missing_refreshes != chat.missing_refreshes {
             chat.missing_refreshes = missing_refreshes;
             changed = true;
         }
-        if chat.missing_refreshes >= AGENT_COMPLETION_MISSES {
-            chat.status = AgentChatStatus::Completed;
-            chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+        if chat.missing_refreshes >= AGENT_STATE_CONFIRMATIONS {
+            chat.process_exited = true;
+            chat.pending_state = None;
+            chat.pending_confirmations = 0;
+            if chat.state != AgentChatState::Idle {
+                chat.state = AgentChatState::Idle;
+                chat.seen = chat.focused;
+                chat.had_active_turn = false;
+                chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+            }
             changed = true;
         }
     }
 
     changed
+}
+
+fn apply_agent_observation(
+    chat: &mut AgentChat,
+    agent: &AgentObservation,
+    next_activity_sequence: &mut u64,
+) -> bool {
+    if !agent.kind.has_detailed_detection() {
+        return publish_chat_state(chat, AgentChatState::Open, next_activity_sequence);
+    }
+
+    let outcome = detect_agent(
+        agent.kind,
+        AgentSnapshot {
+            recent: &agent.recent,
+            osc_title: &agent.osc_title,
+        },
+    );
+    let Some(next_state) = chat_state_for_signal(outcome.signal) else {
+        let changed = chat.pending_state.take().is_some() || chat.pending_confirmations != 0;
+        chat.pending_confirmations = 0;
+        return changed;
+    };
+
+    let mut metadata_changed = false;
+    if next_state == AgentChatState::Working {
+        if let Some(prompt) = submitted_prompt(agent.kind, &agent.recent)
+            && chat.prompt_snippet.as_deref() != Some(&prompt)
+        {
+            chat.prompt_snippet = Some(prompt);
+            metadata_changed = true;
+        }
+    }
+
+    if matches!(
+        next_state,
+        AgentChatState::Working | AgentChatState::NeedsInput
+    ) {
+        chat.had_active_turn = true;
+        chat.seen = true;
+        chat.pending_state = None;
+        chat.pending_confirmations = 0;
+        return publish_chat_state(chat, next_state, next_activity_sequence) || metadata_changed;
+    }
+
+    let needs_confirmation = chat.had_active_turn
+        && matches!(next_state, AgentChatState::Idle | AgentChatState::Quiet)
+        && chat.state != next_state;
+    if needs_confirmation {
+        if chat.pending_state == Some(next_state) {
+            chat.pending_confirmations = chat.pending_confirmations.saturating_add(1);
+        } else {
+            chat.pending_state = Some(next_state);
+            chat.pending_confirmations = 1;
+        }
+        if chat.pending_confirmations < AGENT_STATE_CONFIRMATIONS {
+            return metadata_changed;
+        }
+    }
+    chat.pending_state = None;
+    chat.pending_confirmations = 0;
+
+    let completion = next_state == AgentChatState::Idle && chat.had_active_turn;
+    let changed = publish_chat_state(chat, next_state, next_activity_sequence);
+    if completion {
+        chat.seen = chat.focused;
+        chat.had_active_turn = false;
+        return true;
+    }
+    changed || metadata_changed
+}
+
+fn chat_state_for_signal(signal: DetectionSignal) -> Option<AgentChatState> {
+    match signal {
+        DetectionSignal::Working => Some(AgentChatState::Working),
+        DetectionSignal::NeedsInput => Some(AgentChatState::NeedsInput),
+        DetectionSignal::Idle => Some(AgentChatState::Idle),
+        DetectionSignal::Quiet => Some(AgentChatState::Quiet),
+        DetectionSignal::Hold => None,
+    }
+}
+
+fn publish_chat_state(
+    chat: &mut AgentChat,
+    state: AgentChatState,
+    next_activity_sequence: &mut u64,
+) -> bool {
+    if chat.state == state {
+        return false;
+    }
+    chat.state = state;
+    chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+    true
 }
 
 fn next_agent_activity_sequence(sequence: &mut u64) -> u64 {
@@ -2940,21 +3204,58 @@ fn next_agent_activity_sequence(sequence: &mut u64) -> u64 {
     *sequence
 }
 
-fn agent_chat_display_title(chat: &AgentChat, workspace_name: &str) -> String {
-    let title = chat.title.trim();
-    if title.is_empty() || AgentKind::from_process(title) == Some(chat.kind) {
-        workspace_name.to_owned()
-    } else {
-        title.to_owned()
+fn agent_chat_display_title(chat: &AgentChat) -> String {
+    chat.custom_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| chat.prompt_snippet.clone())
+        .or_else(|| chat.osc_title.clone())
+        .unwrap_or_else(|| format!("{} chat #{}", chat.kind.label(), chat.creation_sequence))
+}
+
+fn agent_chat_detail(chat: &AgentChat) -> String {
+    let mut detail = format!("{} · {}", chat.state.label(chat.seen), chat.kind.label());
+    if let Some(cwd) = chat
+        .cwd
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+    {
+        detail.push_str(" · ");
+        detail.push_str(&cwd);
+    }
+    detail
+}
+
+fn agent_chat_tooltip(chat: &AgentChat, title: &str) -> String {
+    let mut tooltip = format!(
+        "Open {title}\n{} · {}",
+        chat.state.label(chat.seen),
+        chat.kind.label()
+    );
+    if let Some(cwd) = &chat.cwd {
+        tooltip.push('\n');
+        tooltip.push_str(&cwd.to_string_lossy());
+    }
+    tooltip
+}
+
+fn agent_chat_attention_priority(chat: &AgentChat) -> u8 {
+    match (chat.state, chat.seen) {
+        (AgentChatState::NeedsInput, _) => 5,
+        (AgentChatState::Idle, false) => 4,
+        (AgentChatState::Working, _) => 3,
+        (AgentChatState::Quiet | AgentChatState::Open, _) => 2,
+        (AgentChatState::Idle, true) => 1,
     }
 }
 
 fn sort_agent_chats(chats: &mut [AgentChat]) {
     chats.sort_by(|left, right| {
-        let left_completed = left.status == AgentChatStatus::Completed;
-        let right_completed = right.status == AgentChatStatus::Completed;
-        right_completed
-            .cmp(&left_completed)
+        agent_chat_attention_priority(right)
+            .cmp(&agent_chat_attention_priority(left))
             .then(right.activity_sequence.cmp(&left.activity_sequence))
             .then(left.workspace_id.cmp(&right.workspace_id))
             .then(left.item_id.as_u64().cmp(&right.item_id.as_u64()))
@@ -3679,8 +3980,6 @@ mod tests {
             git_roots: vec![PathBuf::from("/tmp/zmux")],
             git_root: Some(PathBuf::from("/tmp/zmux")),
             foreground_processes: vec!["cargo".into()],
-            agents: Vec::new(),
-            terminal_item_ids: Vec::new(),
             shell_count: 2,
             reported_directories: 2,
         };
@@ -3781,24 +4080,70 @@ mod tests {
         assert_eq!(AgentKind::Goose.icon(), None);
     }
 
+    fn observation(
+        item_id: EntityId,
+        kind: AgentKind,
+        recent: &str,
+        osc_title: &str,
+    ) -> AgentObservation {
+        AgentObservation {
+            kind,
+            item_id,
+            custom_title: None,
+            osc_title: osc_title.into(),
+            recent: recent.into(),
+            cwd: Some(PathBuf::from("/tmp/zmux")),
+        }
+    }
+
+    fn observed_workspace(
+        agent: Option<AgentObservation>,
+        item_id: EntityId,
+        active: bool,
+    ) -> AgentWorkspaceObservation {
+        AgentWorkspaceObservation {
+            agents: agent.into_iter().collect(),
+            terminal_item_ids: vec![item_id],
+            active_item_id: active.then_some(item_id),
+        }
+    }
+
+    fn chat(
+        item_id: EntityId,
+        state: AgentChatState,
+        seen: bool,
+        activity_sequence: u64,
+    ) -> AgentChat {
+        AgentChat {
+            workspace_id: 1,
+            kind: AgentKind::Claude,
+            item_id,
+            custom_title: None,
+            osc_title: None,
+            prompt_snippet: None,
+            cwd: None,
+            state,
+            seen,
+            focused: false,
+            had_active_turn: matches!(state, AgentChatState::Working | AgentChatState::NeedsInput),
+            process_exited: false,
+            creation_sequence: activity_sequence,
+            activity_sequence,
+            missing_refreshes: 0,
+            pending_state: None,
+            pending_confirmations: 0,
+        }
+    }
+
     #[test]
-    fn agent_chat_is_retained_and_transitions_to_done_after_two_misses() {
+    fn coarse_agent_chat_is_retained_and_transitions_to_done_after_two_misses() {
         let item_id = EntityId::from(41_u64);
-        let running = WorkspaceContext {
-            agents: vec![AgentInstance {
-                kind: AgentKind::Codex,
-                item_id,
-                title: "codex".into(),
-            }],
-            terminal_item_ids: vec![item_id],
-            shell_count: 1,
-            ..WorkspaceContext::default()
-        };
-        let shell = WorkspaceContext {
-            terminal_item_ids: vec![item_id],
-            shell_count: 1,
-            ..WorkspaceContext::default()
-        };
+        let running = observed_workspace(
+            Some(observation(item_id, AgentKind::OpenCode, "", "")),
+            item_id,
+            false,
+        );
+        let shell = observed_workspace(None, item_id, false);
         let mut chats = HashMap::new();
         let mut sequence = 0;
 
@@ -3809,7 +4154,7 @@ mod tests {
             &running,
         ));
         let chat = chats.get(&(7, item_id)).unwrap();
-        assert_eq!(chat.status, AgentChatStatus::Running);
+        assert_eq!(chat.state, AgentChatState::Open);
         assert_eq!(chat.activity_sequence, 1);
 
         assert!(reconcile_agent_chats_for_workspace(
@@ -3819,8 +4164,8 @@ mod tests {
             &shell,
         ));
         assert_eq!(
-            chats.get(&(7, item_id)).unwrap().status,
-            AgentChatStatus::Running,
+            chats.get(&(7, item_id)).unwrap().state,
+            AgentChatState::Open,
             "one missing process sample must not complete a live agent"
         );
 
@@ -3831,10 +4176,11 @@ mod tests {
             &shell,
         ));
         let chat = chats.get(&(7, item_id)).unwrap();
-        assert_eq!(chat.status, AgentChatStatus::Completed);
+        assert_eq!(chat.state, AgentChatState::Idle);
+        assert!(!chat.seen);
         assert_eq!(chat.activity_sequence, 2);
 
-        let closed = WorkspaceContext::default();
+        let closed = AgentWorkspaceObservation::default();
         assert!(reconcile_agent_chats_for_workspace(
             &mut chats,
             &mut sequence,
@@ -3848,30 +4194,84 @@ mod tests {
     }
 
     #[test]
-    fn most_recently_completed_chat_sorts_first() {
-        let running_id = EntityId::from(1_u64);
+    fn detailed_agent_requires_two_idle_samples_before_marking_done() {
+        let item_id = EntityId::from(42_u64);
+        let working = observed_workspace(
+            Some(observation(
+                item_id,
+                AgentKind::Codex,
+                "› implement the rail",
+                "⠋ implementing",
+            )),
+            item_id,
+            false,
+        );
+        let idle = observed_workspace(
+            Some(observation(
+                item_id,
+                AgentKind::Codex,
+                "› implement the rail",
+                "codex · zmux",
+            )),
+            item_id,
+            false,
+        );
+        let focused_idle = AgentWorkspaceObservation {
+            active_item_id: Some(item_id),
+            ..idle.clone()
+        };
+        let mut chats = HashMap::new();
+        let mut sequence = 0;
+
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &working);
+        let chat = chats.get(&(7, item_id)).unwrap();
+        assert_eq!(chat.state, AgentChatState::Working);
+        assert_eq!(chat.prompt_snippet.as_deref(), Some("implement the rail"));
+
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &idle);
+        assert_eq!(
+            chats.get(&(7, item_id)).unwrap().state,
+            AgentChatState::Working
+        );
+
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &idle);
+        let chat = chats.get(&(7, item_id)).unwrap();
+        assert_eq!(chat.state, AgentChatState::Idle);
+        assert!(!chat.seen);
+
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &focused_idle);
+        assert!(chats.get(&(7, item_id)).unwrap().seen);
+    }
+
+    #[test]
+    fn agent_chats_sort_by_attention_then_most_recent_activity() {
+        let needs_input_id = EntityId::from(1_u64);
         let older_completed_id = EntityId::from(2_u64);
         let newest_completed_id = EntityId::from(3_u64);
-        let chat = |item_id, status, activity_sequence| AgentChat {
-            workspace_id: 1,
-            kind: AgentKind::Claude,
-            item_id,
-            title: "claude".into(),
-            status,
-            activity_sequence,
-            missing_refreshes: 0,
-        };
+        let working_id = EntityId::from(4_u64);
+        let quiet_id = EntityId::from(5_u64);
+        let seen_idle_id = EntityId::from(6_u64);
         let mut chats = vec![
-            chat(running_id, AgentChatStatus::Running, 9),
-            chat(older_completed_id, AgentChatStatus::Completed, 4),
-            chat(newest_completed_id, AgentChatStatus::Completed, 8),
+            chat(working_id, AgentChatState::Working, true, 20),
+            chat(older_completed_id, AgentChatState::Idle, false, 4),
+            chat(newest_completed_id, AgentChatState::Idle, false, 8),
+            chat(needs_input_id, AgentChatState::NeedsInput, true, 2),
+            chat(quiet_id, AgentChatState::Quiet, true, 30),
+            chat(seen_idle_id, AgentChatState::Idle, true, 40),
         ];
 
         sort_agent_chats(&mut chats);
 
         assert_eq!(
             chats.iter().map(|chat| chat.item_id).collect::<Vec<_>>(),
-            vec![newest_completed_id, older_completed_id, running_id]
+            vec![
+                needs_input_id,
+                newest_completed_id,
+                older_completed_id,
+                working_id,
+                quiet_id,
+                seen_idle_id,
+            ]
         );
     }
 
@@ -3879,25 +4279,13 @@ mod tests {
     fn chat_list_contains_only_the_selected_workspace() {
         let first_item = EntityId::from(11_u64);
         let second_item = EntityId::from(12_u64);
+        let second_chat = AgentChat {
+            workspace_id: 2,
+            ..chat(second_item, AgentChatState::Idle, false, 2)
+        };
         let chats = [
-            AgentChat {
-                workspace_id: 1,
-                kind: AgentKind::Codex,
-                item_id: first_item,
-                title: "first".into(),
-                status: AgentChatStatus::Running,
-                activity_sequence: 1,
-                missing_refreshes: 0,
-            },
-            AgentChat {
-                workspace_id: 2,
-                kind: AgentKind::Claude,
-                item_id: second_item,
-                title: "second".into(),
-                status: AgentChatStatus::Completed,
-                activity_sequence: 2,
-                missing_refreshes: 0,
-            },
+            chat(first_item, AgentChatState::Working, true, 1),
+            second_chat,
         ]
         .into_iter()
         .map(|chat| ((chat.workspace_id, chat.item_id), chat))
@@ -3911,18 +4299,17 @@ mod tests {
     }
 
     #[test]
-    fn generic_agent_titles_fall_back_to_the_workspace_name() {
-        let chat = AgentChat {
-            workspace_id: 1,
-            kind: AgentKind::Codex,
-            item_id: EntityId::from(1_u64),
-            title: "codex".into(),
-            status: AgentChatStatus::Running,
-            activity_sequence: 1,
-            missing_refreshes: 0,
-        };
+    fn agent_chat_titles_prefer_custom_prompt_and_osc_metadata() {
+        let mut chat = chat(EntityId::from(1_u64), AgentChatState::Working, true, 1);
+        chat.kind = AgentKind::Codex;
+        assert_eq!(agent_chat_display_title(&chat), "Codex chat #1");
 
-        assert_eq!(agent_chat_display_title(&chat, "zmux"), "zmux");
+        chat.osc_title = Some("refactor workspace state".into());
+        assert_eq!(agent_chat_display_title(&chat), "refactor workspace state");
+        chat.prompt_snippet = Some("implement the agent rail".into());
+        assert_eq!(agent_chat_display_title(&chat), "implement the agent rail");
+        chat.custom_title = Some("primary chat".into());
+        assert_eq!(agent_chat_display_title(&chat), "primary chat");
     }
 
     #[test]
@@ -4215,6 +4602,7 @@ mod tests {
         });
         panel.update(cx, |panel, cx| {
             panel._context_refresh_task = Task::ready(());
+            panel._agent_refresh_task = Task::ready(());
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -4321,6 +4709,7 @@ mod tests {
         });
         panel.update(cx, |panel, _| {
             panel._context_refresh_task = Task::ready(());
+            panel._agent_refresh_task = Task::ready(());
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -4384,6 +4773,7 @@ mod tests {
         });
         panel.update(cx, |panel, _| {
             panel._context_refresh_task = Task::ready(());
+            panel._agent_refresh_task = Task::ready(());
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -4484,6 +4874,7 @@ mod tests {
         });
         panel.update(cx, |panel, _| {
             panel._context_refresh_task = Task::ready(());
+            panel._agent_refresh_task = Task::ready(());
         });
 
         opened
@@ -4556,6 +4947,7 @@ mod tests {
             // Keep the test's synthetic terminal contexts stable instead of
             // letting the periodic live-terminal refresh replace them.
             panel._context_refresh_task = Task::ready(());
+            panel._agent_refresh_task = Task::ready(());
             let active = panel
                 .entries
                 .iter_mut()
