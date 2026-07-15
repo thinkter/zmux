@@ -1711,12 +1711,22 @@ impl WorkspacesPanel {
                                 .rounded_sm()
                                 .bg(cx.theme().colors().element_background)
                                 .tooltip(Tooltip::text(format!("Running: {process}")))
-                                .child(
-                                    Label::new(process)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .single_line(),
-                                )
+                                .map(|this| match foreground_process_icon(&process) {
+                                    Some(ForegroundProcessIcon::Named(icon)) => this.child(
+                                        Icon::new(icon).size(IconSize::XSmall).color(Color::Muted),
+                                    ),
+                                    Some(ForegroundProcessIcon::Embedded(path)) => this.child(
+                                        Icon::from_path(path)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                    None => this.child(
+                                        Label::new(process)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .single_line(),
+                                    ),
+                                })
                         })),
                 )
             });
@@ -2434,6 +2444,29 @@ fn is_shell_process(process: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForegroundProcessIcon {
+    Named(IconName),
+    Embedded(&'static str),
+}
+
+fn foreground_process_icon(process: &str) -> Option<ForegroundProcessIcon> {
+    let executable = process
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+
+    match executable {
+        "codex" => Some(ForegroundProcessIcon::Named(IconName::AiOpenAi)),
+        "claude" | "claude-code" => Some(ForegroundProcessIcon::Named(IconName::AiClaude)),
+        "git" => Some(ForegroundProcessIcon::Named(IconName::GitBranch)),
+        "nvim" | "neovim" => Some(ForegroundProcessIcon::Embedded("icons/neovim.svg")),
+        _ => None,
+    }
+}
+
 /// Snapshot the current center into a [`StoredLayout`], cloning each item handle
 /// so the terminals stay alive after the originals are detached.
 ///
@@ -3029,6 +3062,35 @@ mod tests {
         assert!(is_shell_process("/usr/bin/bash"));
         assert!(is_shell_process("pwsh"));
         assert!(!is_shell_process("cargo"));
+    }
+
+    #[test]
+    fn known_workspace_processes_use_only_their_product_icons() {
+        assert_eq!(
+            foreground_process_icon("codex"),
+            Some(ForegroundProcessIcon::Named(IconName::AiOpenAi))
+        );
+        assert_eq!(
+            foreground_process_icon("/usr/local/bin/claude"),
+            Some(ForegroundProcessIcon::Named(IconName::AiClaude))
+        );
+        assert_eq!(
+            foreground_process_icon(r"C:\\tools\\claude-code.exe"),
+            Some(ForegroundProcessIcon::Named(IconName::AiClaude))
+        );
+        assert_eq!(
+            foreground_process_icon("/usr/bin/git"),
+            Some(ForegroundProcessIcon::Named(IconName::GitBranch))
+        );
+        assert_eq!(
+            foreground_process_icon("nvim"),
+            Some(ForegroundProcessIcon::Embedded("icons/neovim.svg"))
+        );
+        assert_eq!(
+            foreground_process_icon(r"C:\\tools\\Neovim\\bin\\nvim.exe"),
+            Some(ForegroundProcessIcon::Embedded("icons/neovim.svg"))
+        );
+        assert_eq!(foreground_process_icon("cargo"), None);
     }
 
     #[test]
