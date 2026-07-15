@@ -746,6 +746,64 @@ async fn every_custom_or_generic_new_terminal_is_centered_and_credentialed(
 }
 
 #[gpui::test]
+async fn tab_bar_plus_creates_a_terminal_without_opening_a_menu(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
+    });
+    let opened = open_task.await.expect("workspace should open");
+
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if opened.workspace.read_with(cx, center_terminal_count) == 1 {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    assert_eq!(opened.workspace.read_with(cx, center_terminal_count), 1);
+
+    let workspace = opened.workspace.clone();
+    let mut cx = VisualTestContext::from_window(opened.window.into(), cx);
+    let mut plus_bounds = None;
+    for _ in 0..50 {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        plus_bounds = cx.debug_bounds("NEW_TERMINAL_BUTTON");
+        if plus_bounds.is_some() {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    let plus_bounds = plus_bounds.expect("new terminal button should be rendered");
+    assert!(
+        cx.debug_bounds("ICON-ArrowLeft").is_none(),
+        "tab bar should not render a back button"
+    );
+    assert!(
+        cx.debug_bounds("ICON-ArrowRight").is_none(),
+        "tab bar should not render a forward button"
+    );
+    cx.simulate_click(plus_bounds.center(), gpui::Modifiers::none());
+
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if workspace.read_with(&cx, center_terminal_count) == 2 {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    assert_eq!(workspace.read_with(&cx, center_terminal_count), 2);
+}
+
+#[gpui::test]
 async fn missing_workspace_pane_action_creates_a_credentialed_split(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();

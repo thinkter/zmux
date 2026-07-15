@@ -1,6 +1,6 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
+    CloseWindow, NewTerminal, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible,
+    SplitDirection, ToggleZoom,
     Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
@@ -3499,20 +3499,12 @@ impl Pane {
     fn configure_tab_bar_start(
         &mut self,
         tab_bar: TabBar,
-        navigate_backward: IconButton,
-        navigate_forward: IconButton,
+        _navigate_backward: IconButton,
+        _navigate_forward: IconButton,
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> TabBar {
         tab_bar
-            .when(
-                self.display_nav_history_buttons.unwrap_or_default(),
-                |tab_bar| {
-                    tab_bar
-                        .start_child(navigate_backward)
-                        .start_child(navigate_forward)
-                },
-            )
             .map(|tab_bar| {
                 if self.show_tab_bar_buttons {
                     let render_tab_buttons = self.render_tab_bar_buttons.clone();
@@ -4209,28 +4201,16 @@ fn default_render_tab_bar_buttons(
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
         .child(
-            PopoverMenu::new("pane-tab-bar-popover-menu")
-                .trigger_with_tooltip(
-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
-                    Tooltip::text("New..."),
-                )
-                .anchor(Anchor::TopRight)
-                .with_handle(pane.new_item_context_menu_handle.clone())
-                .menu(move |window, cx| {
-                    Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New File", NewFile.boxed_clone())
-                            .action("Open File", ToggleFileFinder::default().boxed_clone())
-                            .separator()
-                            .action("Search Project", DeploySearch::default().boxed_clone())
-                            .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
-                            .separator()
-                            .action("New Terminal", NewTerminal::default().boxed_clone())
-                            .action(
-                                "New Center Terminal",
-                                NewCenterTerminal::default().boxed_clone(),
-                            )
-                    }))
-                }),
+            div()
+                .debug_selector(|| "NEW_TERMINAL_BUTTON".to_owned())
+                .child(
+                    IconButton::new("new-terminal", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("New Terminal"))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(NewTerminal::default().boxed_clone(), cx);
+                        }),
+                ),
         )
         .child(
             PopoverMenu::new("pane-tab-bar-split")
@@ -7010,7 +6990,7 @@ mod tests {
         let new_file_dispatched = Rc::new(Cell::new(false));
         cx.update(|_, cx| {
             let new_file_dispatched = new_file_dispatched.clone();
-            cx.on_action(move |_: &NewFile, _cx| {
+            cx.on_action(move |_: &crate::NewFile, _cx| {
                 new_file_dispatched.set(true);
             });
         });
