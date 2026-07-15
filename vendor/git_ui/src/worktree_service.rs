@@ -377,6 +377,7 @@ fn start_worktree_creations(
         futures::channel::oneshot::Receiver<anyhow::Result<()>>,
     )>,
     Vec<(PathBuf, PathBuf)>,
+    String,
 )> {
     let mut creation_infos = Vec::new();
     let mut path_remapping = Vec::new();
@@ -416,7 +417,7 @@ fn start_worktree_creations(
         }
     }
 
-    Ok((creation_infos, path_remapping))
+    Ok((creation_infos, path_remapping, worktree_name))
 }
 
 /// Waits for every in-flight worktree creation to complete. If any
@@ -604,6 +605,137 @@ pub fn handle_create_worktree(
         cx,
     );
     task.detach_and_log_err(cx);
+}
+
+/// Result of creating linked worktrees without opening a Zed workspace.
+///
+/// This is the reusable mutation half of Zed's worktree service for hosts such
+/// as zmux that represent workspaces themselves. It retains Zed's naming,
+/// configured worktree directory, remote fetch/askpass flow, collision checks,
+/// deduplication, and rollback-on-partial-failure behavior.
+pub struct CreatedWorktreePaths {
+    pub paths: Vec<PathBuf>,
+    pub name: String,
+}
+
+pub fn create_worktree_paths(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreePaths>> {
+    let project = workspace.project().clone();
+    if project.read(cx).is_via_collab() {
+        return Task::ready(Err(anyhow!(
+            "create_worktree: not supported in collab projects"
+        )));
+    }
+    if workspace.active_worktree_creation().label.is_some() {
+        return Task::ready(Err(anyhow!("A worktree creation is already in progress")));
+    }
+
+    let git_repos = crate::repository_scope(cx).repositories(&project, cx);
+    if git_repos.is_empty() {
+        return Task::ready(Err(anyhow!(
+            "create_worktree: no git repository in the active zmux workspace"
+        )));
+    }
+
+    let workspace_handle = workspace.weak_handle();
+    let worktree_name = action.worktree_name.clone();
+    let branch_target = action.branch_target.clone();
+    let fetch_askpass_delegates = remote_branch_to_fetch(&branch_target)
+        .map(|(remote_name, _)| {
+            git_repos
+                .iter()
+                .map(|_| {
+                    create_worktree_askpass_delegate(
+                        workspace_handle.clone(),
+                        format!("git fetch {remote_name}"),
+                        window,
+                        cx,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let display_name: SharedString = worktree_name
+        .as_deref()
+        .unwrap_or("worktree")
+        .to_string()
+        .into();
+    workspace.set_active_worktree_creation(Some(display_name), false, cx);
+
+    cx.spawn_in(window, async move |workspace, mut cx| {
+        let result = async {
+            let worktree_receivers = cx.update(|_, cx| {
+                git_repos
+                    .iter()
+                    .map(|repo| repo.update(cx, |repo, _| repo.worktrees()))
+                    .collect::<Vec<_>>()
+            })?;
+            let worktree_directory_setting = cx.update(|_, cx| {
+                ProjectSettings::get_global(cx)
+                    .git
+                    .worktree_directory
+                    .clone()
+            })?;
+
+            let mut existing_worktree_names = Vec::new();
+            let mut existing_worktree_paths = HashSet::default();
+            for response in futures::future::join_all(worktree_receivers).await {
+                let worktrees = response??;
+                for worktree in worktrees {
+                    if let Some(name) = worktree
+                        .path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                    {
+                        existing_worktree_names.push(name.to_string());
+                    }
+                    existing_worktree_paths.insert(worktree.path);
+                }
+            }
+
+            if let Some((remote_name, _)) = remote_branch_to_fetch(&branch_target) {
+                fetch_remote_for_worktree_base(
+                    &git_repos,
+                    remote_name.to_string(),
+                    fetch_askpass_delegates,
+                    &mut cx,
+                )
+                .await?;
+            }
+
+            let mut rng = rand::rng();
+            let base_ref = resolve_worktree_branch_target(&branch_target);
+            let (creation_infos, _, name) = cx.update(|_, cx| {
+                start_worktree_creations(
+                    &git_repos,
+                    worktree_name,
+                    &existing_worktree_names,
+                    &existing_worktree_paths,
+                    base_ref,
+                    &worktree_directory_setting,
+                    &mut rng,
+                    cx,
+                )
+            })??;
+            let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
+            let paths = await_and_rollback_on_failure(creation_infos, fs, &mut cx).await?;
+            anyhow::Ok(CreatedWorktreePaths { paths, name })
+        }
+        .await;
+
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.set_active_worktree_creation(None, false, cx)
+            })
+            .ok();
+        result
+    })
 }
 
 /// Outcome of [`create_worktree_workspace`].
@@ -943,7 +1075,7 @@ async fn do_create_worktree(
 
     let base_ref = resolve_worktree_branch_target(&branch_target);
 
-    let (creation_infos, path_remapping) = cx.update(|_, cx| {
+    let (creation_infos, path_remapping, _worktree_name) = cx.update(|_, cx| {
         start_worktree_creations(
             &git_repos,
             worktree_name,
@@ -1368,6 +1500,59 @@ mod tests {
                     .expect("should inject create_worktree hook tasks for linked worktree");
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_create_worktree_paths_reuses_creation_without_opening_a_zed_workspace(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+
+        let project_root = PathBuf::from(path!("/root/project"));
+        let project = Project::test(fs.clone(), [project_root.as_path()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        let task = workspace.update_in(cx, |workspace, window, cx| {
+            create_worktree_paths(
+                workspace,
+                &zed_actions::CreateWorktree {
+                    worktree_name: Some("feature".into()),
+                    branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                },
+                window,
+                cx,
+            )
+        });
+        let created = task.await.expect("worktree creation should succeed");
+
+        assert_eq!(created.name, "feature");
+        assert_eq!(created.paths.len(), 1);
+        assert!(fs.is_dir(&created.paths[0]).await);
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspaces().count()
+            }),
+            1,
+            "the host adapter must decide how to represent the new worktree"
+        );
     }
 
     #[gpui::test]

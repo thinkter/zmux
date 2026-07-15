@@ -8,7 +8,7 @@ use ui::{
 };
 use workspace::{Toast, notifications::NotificationId};
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 mod blame_ui;
 pub mod clone;
@@ -80,6 +80,38 @@ pub trait RepositoryScope: Send + Sync + 'static {
         cx: &mut App,
     ) {
         repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+    }
+
+    /// Returns the linked worktree paths represented by the host's active
+    /// workspace. Zed's default workspace model maps these directly to the
+    /// project's visible worktrees; embedders can override this for their own
+    /// logical workspace model.
+    fn active_worktree_paths(&self, project: &Entity<project::Project>, cx: &App) -> Vec<PathBuf> {
+        project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect()
+    }
+
+    /// Returns every worktree path currently open in this host window. This is
+    /// used to protect live worktrees from deletion and to mark them in the
+    /// picker even when the host does not represent them as Zed Workspaces.
+    fn open_worktree_paths(&self, project: &Entity<project::Project>, cx: &App) -> Vec<PathBuf> {
+        self.active_worktree_paths(project, cx)
+    }
+
+    /// Close a non-active host workspace backed by `path`. The default Zed
+    /// implementation returns false so the picker falls back to
+    /// `MultiWorkspace`; embedders can handle the close directly.
+    fn close_open_worktree(
+        &self,
+        _project: &Entity<project::Project>,
+        _path: &std::path::Path,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
+        false
     }
 }
 

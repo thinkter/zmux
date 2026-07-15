@@ -56,6 +56,12 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-t", NewTerminal, None),
         KeyBinding::new("ctrl-shift-n", NewTerminal, None),
         KeyBinding::new("ctrl-shift-e", NewWorkspace, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-ctrl-w", zed_actions::git::Worktree, None),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new("alt-ctrl-shift-w", zed_actions::git::Worktree, None),
+        #[cfg(target_os = "windows")]
+        KeyBinding::new("shift-alt-w", zed_actions::git::Worktree, None),
         KeyBinding::new("ctrl-shift-b", ToggleWorkspacesPanel, None),
         KeyBinding::new("ctrl-}", ActivateNextWorkspace, None),
         KeyBinding::new("ctrl-{", ActivatePreviousWorkspace, None),

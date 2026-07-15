@@ -7499,7 +7499,7 @@ pub(crate) fn open_output(
     workspace.add_item_to_center(Box::new(editor), window, cx);
 }
 
-pub(crate) fn show_error_toast(
+pub fn show_error_toast(
     workspace: Entity<Workspace>,
     action: impl Into<SharedString>,
     e: anyhow::Error,

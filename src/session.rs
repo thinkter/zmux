@@ -60,12 +60,15 @@ impl SessionSnapshot {
             if workspace.id == 0 || !ids.insert(workspace.id) {
                 bail!("session contains duplicate or zero workspace IDs");
             }
-            if workspace
-                .manual_name
-                .as_ref()
-                .is_some_and(|name| name.len() > MAX_NAME_BYTES)
+            if [
+                workspace.manual_name.as_ref(),
+                workspace.worktree_name.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|name| name.len() > MAX_NAME_BYTES)
             {
-                bail!("workspace name exceeds {MAX_NAME_BYTES} bytes");
+                bail!("workspace or worktree name exceeds {MAX_NAME_BYTES} bytes");
             }
             for path in [
                 workspace.default_directory.as_ref(),
@@ -76,6 +79,11 @@ impl SessionSnapshot {
             {
                 if path.as_os_str().len() > MAX_PATH_BYTES {
                     bail!("workspace path exceeds {MAX_PATH_BYTES} bytes");
+                }
+            }
+            for path in &workspace.worktree_paths {
+                if path.as_os_str().len() > MAX_PATH_BYTES {
+                    bail!("workspace worktree path exceeds {MAX_PATH_BYTES} bytes");
                 }
             }
             workspace.layout.validate()?;
@@ -96,6 +104,12 @@ impl SessionSnapshot {
 pub struct WorkspaceSnapshot {
     pub id: WorkspaceId,
     pub manual_name: Option<String>,
+    /// Friendly linked-worktree name shown independently of the repository's
+    /// directory name. Absent for ordinary folder-backed workspaces.
+    #[serde(default)]
+    pub worktree_name: Option<String>,
+    #[serde(default)]
+    pub worktree_paths: Vec<PathBuf>,
     #[serde(default)]
     pub default_directory: Option<PathBuf>,
     #[serde(default)]
@@ -500,6 +514,8 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: 1,
                 manual_name: Some("API".into()),
+                worktree_name: Some("feature-api".into()),
+                worktree_paths: vec!["/tmp/api".into()],
                 default_directory: Some("/tmp/api".into()),
                 selected_git_root: Some("/tmp/api".into()),
                 layout: LayoutSnapshot {

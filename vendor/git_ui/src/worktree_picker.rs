@@ -23,7 +23,7 @@ use workspace::{
     ModalView, MultiWorkspace, Workspace, dock::DockPosition, notifications::DetachAndPromptErr,
 };
 
-use crate::git_panel::show_error_toast;
+use crate::{git_panel::show_error_toast, repository_scope};
 use zed_actions::{
     CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree,
 };
@@ -77,15 +77,24 @@ impl WorktreePicker {
     ) -> Self {
         let project_ref = project.read(cx);
 
-        let active_worktree_paths: HashSet<PathBuf> = project_ref
-            .visible_worktrees(cx)
-            .map(|wt| wt.read(cx).abs_path().to_path_buf())
+        let scope = repository_scope(cx);
+        let active_worktree_paths: HashSet<PathBuf> = scope
+            .active_worktree_paths(&project, cx)
+            .into_iter()
             .collect();
 
-        let project_worktree_paths = active_worktree_paths.clone();
+        let project_worktree_paths = scope
+            .open_worktree_paths(&project, cx)
+            .into_iter()
+            .collect();
 
-        let has_multiple_repositories = project_ref.repositories(cx).len() > 1;
-        let repository = project_ref.active_repository(cx);
+        let scoped_repositories = scope.repositories(&project, cx);
+        let has_repositories = !scoped_repositories.is_empty();
+        let has_multiple_repositories = scoped_repositories.len() > 1;
+        let repository = project_ref
+            .active_repository(cx)
+            .filter(|active| scoped_repositories.contains(active))
+            .or_else(|| scoped_repositories.first().cloned());
 
         let current_branch_name = repository.as_ref().and_then(|repo| {
             repo.read(cx)
@@ -114,6 +123,7 @@ impl WorktreePicker {
             focused_dock,
             current_branch_name,
             default_branch: None,
+            has_repositories,
             has_multiple_repositories,
             focus_handle: cx.focus_handle(),
             show_footer,
@@ -313,9 +323,11 @@ struct WorktreePickerDelegate {
     selected_index: usize,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    #[allow(dead_code)]
     focused_dock: Option<DockPosition>,
     current_branch_name: Option<String>,
     default_branch: Option<RemoteBranchName>,
+    has_repositories: bool,
     has_multiple_repositories: bool,
     focus_handle: FocusHandle,
     show_footer: bool,
@@ -457,7 +469,7 @@ impl WorktreePickerDelegate {
         let project = self.project.read(cx);
         if project.is_via_collab() {
             Some("Worktree creation is not supported in collaborative projects".into())
-        } else if project.repositories(cx).is_empty() {
+        } else if !self.has_repositories {
             Some("Requires a Git repository in the project".into())
         } else {
             None
@@ -469,7 +481,10 @@ impl WorktreePickerDelegate {
     }
 
     fn refresh_project_worktree_paths(&mut self, window: &mut Window, cx: &mut App) {
-        let mut paths = self.active_worktree_paths.clone();
+        let mut paths: HashSet<PathBuf> = repository_scope(cx)
+            .open_worktree_paths(&self.project, cx)
+            .into_iter()
+            .collect();
 
         if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten()
             && let Some(workspace) = self.workspace.upgrade()
@@ -709,6 +724,11 @@ impl WorktreePickerDelegate {
         let Some(WorktreeEntry::Worktree { worktree, .. }) = self.matches.get(ix) else {
             return;
         };
+        if repository_scope(cx).close_open_worktree(&self.project, &worktree.path, window, cx) {
+            self.refresh_project_worktree_paths(window, cx);
+            cx.notify();
+            return;
+        }
         let Some(workspace_to_remove) =
             self.workspace_for_open_worktree(&worktree.path, window, cx)
         else {
@@ -966,6 +986,16 @@ impl PickerDelegate for WorktreePickerDelegate {
                 if self.creation_blocked_reason(cx).is_some() {
                     return;
                 }
+                #[cfg(feature = "zmux-core")]
+                window.dispatch_action(
+                    CreateWorktree {
+                        worktree_name: None,
+                        branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                    }
+                    .boxed_clone(),
+                    cx,
+                );
+                #[cfg(not(feature = "zmux-core"))]
                 if let Some(workspace) = self.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         crate::worktree_service::handle_create_worktree(
@@ -985,6 +1015,19 @@ impl PickerDelegate for WorktreePickerDelegate {
                 if self.creation_blocked_reason(cx).is_some() {
                     return;
                 }
+                #[cfg(feature = "zmux-core")]
+                window.dispatch_action(
+                    CreateWorktree {
+                        worktree_name: None,
+                        branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                            remote_name: default_branch.remote_name.clone(),
+                            branch_name: default_branch.branch_name.clone(),
+                        },
+                    }
+                    .boxed_clone(),
+                    cx,
+                );
+                #[cfg(not(feature = "zmux-core"))]
                 if let Some(workspace) = self.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         crate::worktree_service::handle_create_worktree(
@@ -1024,6 +1067,16 @@ impl PickerDelegate for WorktreePickerDelegate {
                             .iter()
                             .find(|wt| wt.is_main)
                             .map(|wt| wt.path.as_path());
+                        #[cfg(feature = "zmux-core")]
+                        window.dispatch_action(
+                            SwitchWorktree {
+                                path: worktree.path.clone(),
+                                display_name: worktree.directory_name(main_worktree_path),
+                            }
+                            .boxed_clone(),
+                            cx,
+                        );
+                        #[cfg(not(feature = "zmux-core"))]
                         if let Some(workspace) = self.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
                                 crate::worktree_service::handle_switch_worktree(
@@ -1053,6 +1106,16 @@ impl PickerDelegate for WorktreePickerDelegate {
                     },
                     None => NewWorktreeBranchTarget::CurrentBranch,
                 };
+                #[cfg(feature = "zmux-core")]
+                window.dispatch_action(
+                    CreateWorktree {
+                        worktree_name: Some(name.clone()),
+                        branch_target,
+                    }
+                    .boxed_clone(),
+                    cx,
+                );
+                #[cfg(not(feature = "zmux-core"))]
                 if let Some(workspace) = self.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         crate::worktree_service::handle_create_worktree(

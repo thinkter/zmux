@@ -16,6 +16,8 @@ Shortcuts:
 - Paste: `Ctrl-Shift-V`, `Shift-Insert`, or `Cmd-V`.
 - New terminal tab: `Ctrl-Shift-T` or `Ctrl-Shift-N`.
 - New workspace: `Ctrl-Shift-E`. Toggle the workspaces sidebar: `Ctrl-Shift-B`.
+- Worktree picker: `Cmd-Ctrl-W` on macOS, `Alt-Ctrl-Shift-W` on Linux, or
+  `Shift-Alt-W` on Windows.
 - Notify the current terminal pane (manual test trigger): `Ctrl-Shift-M`.
 - Jump to the latest unread notification: `Ctrl-Shift-U`.
 - Toggle notification history: `Ctrl-Shift-I` or `Cmd-I`.
@@ -37,6 +39,27 @@ process keeps going in the background while you work elsewhere.
 - Drag a workspace up or down to reorder the list.
 - Workspaces with unread agent notifications show a dot; the latest notification appears at the bottom of the sidebar.
 - Use the trash button to close a workspace; the last one can't be closed.
+
+### Git branches and worktrees
+
+When the active workspace contains a Git repository, the top of the workspace
+sidebar shows Zed's worktree and branch selectors.
+
+- The branch selector searches local and remote branches, checks out an
+  existing branch, and creates a branch from a typed name using Zed's native
+  branch picker and Git error handling.
+- The worktree selector lists the main checkout and every linked worktree. Pick
+  an open worktree to jump to its existing zmux workspace, or pick a closed one
+  to open a fresh terminal workspace rooted there.
+- Choose a generated worktree based on the default/current branch, or type a
+  name to create one. Creation honors Zed's `git.worktree_directory` setting,
+  fetches remote branch bases with the normal credential prompt, and rolls back
+  partial multi-repository creation failures.
+- A worktree with live terminals cannot be deleted. Close its zmux workspace
+  first, then use the picker trash action; hold Alt for Zed's force-delete flow.
+- Secondary-open from the picker opens the selected worktree in another zmux
+  window. Worktree names, paths, terminal layouts, and the selected repository
+  survive session restore.
 
 ### Trusting terminal-discovered repositories
 

@@ -318,6 +318,89 @@ fn open_zmux_workspace_for_paths(
                 create_split_terminal(workspace, SplitDirection::Down, window, cx)
                     .detach_and_log_err(cx);
             });
+            workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
+                let focused_dock = workspace.focused_dock_position(window, cx);
+                let project = workspace.project().clone();
+                let workspace_handle = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    git_ui::worktree_picker::WorktreePicker::new_modal(
+                        project,
+                        workspace_handle,
+                        focused_dock,
+                        window,
+                        cx,
+                    )
+                });
+            });
+            workspace.register_action(
+                |workspace, action: &zed_actions::CreateWorktree, window, cx| {
+                    let task = git_ui::worktree_service::create_worktree_paths(
+                        workspace, action, window, cx,
+                    );
+                    let panel = workspace
+                        .panel::<WorkspacesPanel>(cx)
+                        .map(|panel| panel.downgrade());
+                    let workspace_handle = workspace.weak_handle();
+                    cx.spawn_in(window, async move |_, cx| {
+                        match task.await {
+                            Ok(created) => {
+                                if let Some(panel) = panel.and_then(|panel| panel.upgrade()) {
+                                    panel.update_in(cx, |panel, window, cx| {
+                                        panel.open_created_worktrees(
+                                            created.paths,
+                                            created.name,
+                                            window,
+                                            cx,
+                                        );
+                                    })?;
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(workspace) = workspace_handle.upgrade() {
+                                    cx.update(|_, cx| {
+                                        git_ui::git_panel::show_error_toast(
+                                            workspace,
+                                            "worktree create",
+                                            error,
+                                            cx,
+                                        );
+                                    })?;
+                                }
+                            }
+                        }
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+                },
+            );
+            workspace.register_action(
+                |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
+                    let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
+                        return;
+                    };
+                    let path = action.path.clone();
+                    let display_name = action.display_name.clone();
+                    let window_handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        window_handle
+                            .update(cx, |_, window, cx| {
+                                panel.update(cx, |panel, cx| {
+                                    panel.open_worktree(path, display_name, window, cx)
+                                });
+                            })
+                            .ok();
+                    });
+                },
+            );
+            workspace.register_action(
+                |_workspace, action: &zed_actions::OpenWorktreeInNewWindow, window, cx| {
+                    let path = action.path.clone();
+                    let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
+                    cx.defer(move |cx| {
+                        open_zmux_workspace_at(requesting_window, path, cx).detach_and_log_err(cx);
+                    });
+                },
+            );
             // Zed's built-in pane menus and user keymaps dispatch the generic
             // pane split actions. Capture clone splits before Pane handles
             // them so every newly spawned terminal receives a fresh route
@@ -528,15 +611,35 @@ pub(crate) fn create_center_terminal_for_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
+    let working_directory = source_terminal_working_directory(workspace, cx)
+        .or(default_directory)
+        .or_else(|| default_working_directory(workspace, cx));
+    create_center_terminal_at_for_workspace(
+        workspace,
+        owning_workspace_id,
+        activation_generation,
+        working_directory,
+        window,
+        cx,
+    )
+}
+
+/// Spawn a terminal in an exact directory for a logical workspace. Worktree
+/// creation uses this instead of inheriting the current terminal's cwd.
+pub(crate) fn create_center_terminal_at_for_workspace(
+    workspace: &mut Workspace,
+    owning_workspace_id: WorkspaceId,
+    activation_generation: u64,
+    working_directory: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<WeakEntity<terminal::Terminal>>> {
     let destination_pane = workspace.active_pane().clone();
     let Some(panel) = workspace.panel::<WorkspacesPanel>(cx) else {
         return Task::ready(Err(anyhow::anyhow!(
             "the zmux workspace panel is unavailable"
         )));
     };
-    let working_directory = source_terminal_working_directory(workspace, cx)
-        .or(default_directory)
-        .or_else(|| default_working_directory(workspace, cx));
     let panel = panel.downgrade();
     let project = workspace.project().downgrade();
 

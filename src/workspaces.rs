@@ -15,18 +15,21 @@ use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, Global,
-    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
+    Anchor, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
+    Global, IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
     WeakEntity, Window, actions, div, px,
 };
 use terminal_view::TerminalView;
 use ui::prelude::*;
-use ui::{IconButtonShape, Indicator, Tooltip};
+use ui::{Button, ButtonSize, IconButtonShape, Indicator, PopoverMenu, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::item::ItemHandle;
 use workspace::{Member, Pane, SplitDirection, Workspace};
 
-use crate::app::{create_center_terminal_for_workspace, create_restored_terminals_for_workspace};
+use crate::app::{
+    create_center_terminal_at_for_workspace, create_center_terminal_for_workspace,
+    create_restored_terminals_for_workspace,
+};
 use crate::metadata::{GitMetadata, MetadataState, collect_git_metadata};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{Notification, NotificationStore, WorkspaceId};
@@ -81,6 +84,8 @@ enum StoredLayout {
 struct WorkspaceEntry {
     id: WorkspaceId,
     manual_name: Option<String>,
+    worktree_name: Option<String>,
+    worktree_paths: Vec<PathBuf>,
     automatic_name: String,
     context: WorkspaceContext,
     context_authoritative: bool,
@@ -380,7 +385,6 @@ struct WorkspaceRow {
     uses_manual_name: bool,
     context: WorkspaceContext,
     git: MetadataState<GitMetadata>,
-    latest_unread: Option<String>,
 }
 
 #[derive(Clone)]
@@ -592,6 +596,37 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
         }
         repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
     }
+
+    fn active_worktree_paths(&self, project: &Entity<project::Project>, cx: &App) -> Vec<PathBuf> {
+        self.panel_for(project)
+            .and_then(|panel| panel.upgrade())
+            .and_then(|panel| panel.read(cx).active_git_root())
+            .into_iter()
+            .collect()
+    }
+
+    fn open_worktree_paths(&self, project: &Entity<project::Project>, cx: &App) -> Vec<PathBuf> {
+        self.panel_for(project)
+            .and_then(|panel| panel.upgrade())
+            .map(|panel| panel.read(cx).open_git_roots())
+            .unwrap_or_default()
+    }
+
+    fn close_open_worktree(
+        &self,
+        project: &Entity<project::Project>,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        self.panel_for(project)
+            .and_then(|panel| panel.upgrade())
+            .is_some_and(|panel| {
+                panel.update(cx, |panel, cx| {
+                    panel.close_workspace_for_git_root(path, window, cx)
+                })
+            })
+    }
 }
 
 impl WorkspacesPanel {
@@ -629,7 +664,12 @@ impl WorkspacesPanel {
                     .map(|workspace| WorkspaceEntry {
                         id: workspace.id,
                         manual_name: workspace.manual_name.clone(),
-                        automatic_name: "New workspace".to_string(),
+                        worktree_name: workspace.worktree_name.clone(),
+                        worktree_paths: workspace.worktree_paths.clone(),
+                        automatic_name: workspace
+                            .worktree_name
+                            .clone()
+                            .unwrap_or_else(|| "New workspace".to_string()),
                         context: WorkspaceContext::default(),
                         context_authoritative: false,
                         incomplete_context_refreshes: 0,
@@ -652,6 +692,8 @@ impl WorkspacesPanel {
                 vec![WorkspaceEntry {
                     id: 1,
                     manual_name: None,
+                    worktree_name: None,
+                    worktree_paths: Vec::new(),
                     automatic_name: "New workspace".to_string(),
                     context: WorkspaceContext::default(),
                     context_authoritative: true,
@@ -724,6 +766,40 @@ impl WorkspacesPanel {
             .find(|entry| entry.id == self.active)
             .map(|entry| entry.context.git_roots.as_slice())
             .unwrap_or_default()
+    }
+
+    fn active_git_root(&self) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == self.active)
+            .and_then(|entry| {
+                entry
+                    .selected_git_root
+                    .clone()
+                    .or_else(|| entry.context.git_root.clone())
+                    .or_else(|| {
+                        entry
+                            .default_directory
+                            .as_deref()
+                            .and_then(nearest_git_root)
+                    })
+            })
+    }
+
+    fn open_git_roots(&self) -> Vec<PathBuf> {
+        let mut roots = BTreeSet::new();
+        for entry in &self.entries {
+            roots.extend(entry.context.git_roots.iter().cloned());
+            roots.extend(entry.selected_git_root.iter().cloned());
+            roots.extend(entry.worktree_paths.iter().cloned());
+            roots.extend(
+                entry
+                    .default_directory
+                    .as_deref()
+                    .and_then(nearest_git_root),
+            );
+        }
+        roots.into_iter().collect()
     }
 
     fn select_git_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -805,7 +881,7 @@ impl WorkspacesPanel {
 
     /// Create a fresh, empty workspace and switch to it.
     pub fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_workspace_at(None, window, cx);
+        self.create_workspace_at(None, None, window, cx);
     }
 
     pub fn prompt_for_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -818,7 +894,7 @@ impl WorkspacesPanel {
         cx.spawn_in(window, async move |this, cx| {
             let directory = paths.await.ok().and_then(Result::ok).flatten()?.pop()?;
             this.update_in(cx, |this, window, cx| {
-                this.create_workspace_at(Some(directory), window, cx);
+                this.create_workspace_at(Some(directory), None, window, cx);
             })
             .ok();
             Some(())
@@ -829,6 +905,7 @@ impl WorkspacesPanel {
     fn create_workspace_at(
         &mut self,
         default_directory: Option<PathBuf>,
+        worktree_name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -840,7 +917,13 @@ impl WorkspacesPanel {
         self.entries.push(WorkspaceEntry {
             id,
             manual_name: None,
-            automatic_name: "New workspace".to_string(),
+            worktree_name: worktree_name.clone(),
+            worktree_paths: default_directory
+                .iter()
+                .filter(|_| worktree_name.is_some())
+                .cloned()
+                .collect(),
+            automatic_name: worktree_name.unwrap_or_else(|| "New workspace".to_string()),
             context: WorkspaceContext::default(),
             context_authoritative: true,
             incomplete_context_refreshes: 0,
@@ -856,6 +939,95 @@ impl WorkspacesPanel {
         });
 
         self.activate_workspace(id, window, cx);
+    }
+
+    /// Activate a logical workspace for an existing linked worktree, creating
+    /// one with a fresh terminal when the path is not already open.
+    pub fn open_worktree(
+        &mut self,
+        path: PathBuf,
+        display_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if let Some(id) = self.workspace_id_for_git_root(&path) {
+            self.activate_workspace(id, window, cx);
+            return;
+        }
+        self.create_workspace_at(Some(path), Some(display_name), window, cx);
+    }
+
+    /// Open all worktrees created by one Zed multi-repository operation in a
+    /// single zmux logical workspace. The first path becomes the initial shell;
+    /// additional repositories receive their own terminal tabs.
+    pub fn open_created_worktrees(
+        &mut self,
+        mut paths: Vec<PathBuf>,
+        display_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        paths.sort();
+        paths.dedup();
+        let all_paths = paths.clone();
+        let first = paths.remove(0);
+        self.create_workspace_at(Some(first), Some(display_name), window, cx);
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == self.active)
+        {
+            entry.worktree_paths = all_paths;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let id = self.active;
+        let generation = self.activation_generation;
+        for path in paths {
+            workspace.update(cx, |workspace, cx| {
+                create_center_terminal_at_for_workspace(
+                    workspace,
+                    id,
+                    generation,
+                    Some(path),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+            });
+        }
+    }
+
+    fn workspace_id_for_git_root(&self, path: &Path) -> Option<WorkspaceId> {
+        self.entries.iter().find_map(|entry| {
+            (entry.selected_git_root.as_deref() == Some(path)
+                || entry.default_directory.as_deref() == Some(path)
+                || entry.worktree_paths.iter().any(|root| root == path)
+                || entry.context.git_roots.iter().any(|root| root == path))
+            .then_some(entry.id)
+        })
+    }
+
+    fn close_workspace_for_git_root(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(id) = self.workspace_id_for_git_root(path) else {
+            return false;
+        };
+        if id == self.active || self.entries.len() <= 1 {
+            return false;
+        }
+        self.close_workspace(id, window, cx);
+        true
     }
 
     /// Switch the center to display the given workspace, parking the currently
@@ -1113,7 +1285,10 @@ impl WorkspacesPanel {
             let previous_context = entry.context.clone();
             let previous_authoritative = entry.context_authoritative;
             entry.observe_context(observed);
-            let automatic_name = automatic_workspace_name(&entry.context);
+            let automatic_name = entry
+                .worktree_name
+                .clone()
+                .unwrap_or_else(|| automatic_workspace_name(&entry.context));
             if entry.context != previous_context
                 || entry.context_authoritative != previous_authoritative
                 || entry.automatic_name != automatic_name
@@ -1402,6 +1577,8 @@ impl WorkspacesPanel {
             workspaces.push(WorkspaceSnapshot {
                 id: entry.id,
                 manual_name: entry.manual_name.clone(),
+                worktree_name: entry.worktree_name.clone(),
+                worktree_paths: entry.worktree_paths.clone(),
                 default_directory: entry.default_directory.clone(),
                 selected_git_root: entry.selected_git_root.clone(),
                 layout,
@@ -1539,6 +1716,20 @@ impl WorkspacesPanel {
             .flex_1()
             .gap_1()
             .overflow_hidden()
+            .when(unread_count > 0, |this| {
+                this.child(
+                    div()
+                        .id(("ws-unread", id as usize))
+                        .flex_none()
+                        .cursor_pointer()
+                        .tooltip(Tooltip::text("Show this workspace's notifications"))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            cx.stop_propagation();
+                            this.show_workspace_notifications(id, cx);
+                        }))
+                        .child(Indicator::dot().color(Color::Accent)),
+                )
+            })
             .map(|this| match &editor {
                 Some(editor) => this.child(
                     div()
@@ -1559,26 +1750,6 @@ impl WorkspacesPanel {
                         .color(Color::Default)
                         .single_line(),
                 ),
-            })
-            .when(unread_count > 0, |this| {
-                this.child(
-                    div()
-                        .id(("ws-unread", id as usize))
-                        .px_1()
-                        .rounded_md()
-                        .bg(cx.theme().colors().element_selected)
-                        .cursor_pointer()
-                        .tooltip(Tooltip::text("Show this workspace's notifications"))
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            cx.stop_propagation();
-                            this.show_workspace_notifications(id, cx);
-                        }))
-                        .child(
-                            Label::new(unread_count.to_string())
-                                .size(LabelSize::Small)
-                                .color(Color::Accent),
-                        ),
-                )
             });
 
         let context = entry.context.clone();
@@ -1737,14 +1908,6 @@ impl WorkspacesPanel {
             .overflow_hidden()
             .child(name_row)
             .child(metadata)
-            .when_some(entry.latest_unread.clone(), |this, latest| {
-                this.child(
-                    Label::new(latest)
-                        .size(LabelSize::Small)
-                        .color(Color::Accent)
-                        .single_line(),
-                )
-            })
             .when(!is_renaming, |this| {
                 this.cursor_pointer().on_click(cx.listener(
                     move |this, event: &gpui::ClickEvent, window, cx| {
@@ -1989,14 +2152,6 @@ impl Render for WorkspacesPanel {
                     uses_manual_name: entry.manual_name.is_some(),
                     context: entry.context.clone(),
                     git: entry.git.clone(),
-                    latest_unread: store
-                        .notifications()
-                        .find(|notification| {
-                            notification.target.scope_id == scope_id
-                                && notification.target.workspace_id == entry.id
-                                && !notification.read
-                        })
-                        .map(|notification| notification.title.clone()),
                 })
                 .collect::<Vec<_>>();
             let latest = store
@@ -2031,6 +2186,108 @@ impl Render for WorkspacesPanel {
                 || format!("Notifications · {unread_count} unread"),
                 |row| format!("{} · {unread_count} unread", row.name),
             );
+
+        let workspace_handle = self.workspace.clone();
+        let project = workspace_handle
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().clone());
+        let active_worktree_operation = workspace_handle
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_worktree_creation().label.clone());
+        let active_root = self.active_git_root();
+        let active_repository = project.as_ref().and_then(|project| {
+            project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repositories()
+                .values()
+                .find(|repository| {
+                    active_root.as_ref().is_some_and(|root| {
+                        repository
+                            .read(cx)
+                            .snapshot()
+                            .work_directory_abs_path
+                            .as_ref()
+                            == root
+                    })
+                })
+                .cloned()
+        });
+        let active_entry = self.entries.iter().find(|entry| entry.id == self.active);
+        let active_worktree_name = active_entry
+            .and_then(|entry| entry.worktree_name.clone())
+            .or_else(|| active_root.as_deref().and_then(path_display_name))
+            .unwrap_or_else(|| "Worktree".to_string());
+        let active_workspace_name = active_worktree_operation
+            .as_ref()
+            .map(|label| format!("Creating {label}…"))
+            .unwrap_or(active_worktree_name);
+        let active_branch_name = active_repository
+            .as_ref()
+            .and_then(|repository| {
+                repository
+                    .read(cx)
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.name().to_string())
+            })
+            .or_else(|| {
+                active_entry.and_then(|entry| match &entry.git {
+                    MetadataState::Ready(metadata) => Some(metadata.branch.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "HEAD".to_string());
+
+        let worktree_selector = active_repository
+            .as_ref()
+            .and(project.clone())
+            .map(|project| {
+                let workspace = workspace_handle.clone();
+                PopoverMenu::new("worktree-selector")
+                    .menu(move |window, cx| {
+                        Some(cx.new(|cx| {
+                            git_ui::worktree_picker::WorktreePicker::new(
+                                project.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            )
+                        }))
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("worktree-selector-button", active_workspace_name)
+                            .size(ButtonSize::None)
+                            .start_icon(Icon::new(IconName::GitWorktree).size(IconSize::Small))
+                            .disabled(active_worktree_operation.is_some())
+                            .truncate(true),
+                        |_, cx| Tooltip::simple("Switch or create a Git worktree", cx),
+                    )
+                    .anchor(Anchor::BottomLeft)
+            });
+
+        let branch_selector = active_repository.map(|repository| {
+            let workspace = workspace_handle.clone();
+            PopoverMenu::new("workspace-branch-selector")
+                .menu(move |window, cx| {
+                    Some(git_ui::branch_picker::popover(
+                        workspace.clone(),
+                        false,
+                        Some(repository.clone()),
+                        window,
+                        cx,
+                    ))
+                })
+                .trigger_with_tooltip(
+                    Button::new("workspace-branch-selector-button", active_branch_name)
+                        .size(ButtonSize::None)
+                        .start_icon(Icon::new(IconName::GitBranch).size(IconSize::Small))
+                        .truncate(true),
+                    |_, cx| Tooltip::simple("Switch or create a Git branch", cx),
+                )
+                .anchor(Anchor::BottomLeft)
+        });
 
         v_flex()
             .key_context("WorkspacesPanel")
@@ -2074,6 +2331,22 @@ impl Render for WorkspacesPanel {
                             ),
                     ),
             )
+            .when_some(worktree_selector, |this, worktree_selector| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(div().flex_1().min_w_0().child(worktree_selector))
+                        .when_some(branch_selector, |this, branch_selector| {
+                            this.child(div().flex_1().min_w_0().child(branch_selector))
+                        }),
+                )
+            })
             .child(
                 v_flex()
                     .id("workspaces-list")
@@ -2690,11 +2963,7 @@ fn snapshot_active_layout(workspace: &Workspace, cx: &App) -> LayoutSnapshot {
     LayoutSnapshot { root }
 }
 
-fn snapshot_member(
-    member: &Member,
-    workspace: &Workspace,
-    cx: &App,
-) -> Option<LayoutNodeSnapshot> {
+fn snapshot_member(member: &Member, workspace: &Workspace, cx: &App) -> Option<LayoutNodeSnapshot> {
     match member {
         Member::Pane(pane) => {
             let pane_ref = pane.read(cx);
@@ -2926,6 +3195,8 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: 1,
                 manual_name: Some(name.into()),
+                worktree_name: None,
+                worktree_paths: Vec::new(),
                 default_directory: None,
                 selected_git_root: None,
                 layout: LayoutSnapshot {
@@ -3216,6 +3487,8 @@ mod tests {
         let mut entry = WorkspaceEntry {
             id: 1,
             manual_name: None,
+            worktree_name: None,
+            worktree_paths: Vec::new(),
             automatic_name: "retained".into(),
             context: WorkspaceContext {
                 working_directories: vec![retained.clone()],
@@ -3355,6 +3628,8 @@ mod tests {
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
+                worktree_name: None,
+                worktree_paths: Vec::new(),
                 automatic_name: "Restored".into(),
                 context: WorkspaceContext::default(),
                 context_authoritative: false,
@@ -3459,6 +3734,8 @@ mod tests {
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
+                worktree_name: None,
+                worktree_paths: Vec::new(),
                 automatic_name: "Empty restore".into(),
                 context: WorkspaceContext::default(),
                 context_authoritative: false,
@@ -3520,6 +3797,8 @@ mod tests {
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
+                worktree_name: None,
+                worktree_paths: Vec::new(),
                 automatic_name: "Interrupted restore".into(),
                 context: WorkspaceContext::default(),
                 context_authoritative: false,
@@ -3594,6 +3873,76 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn worktree_paths_open_once_and_keep_their_logical_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-logical-worktree-{}", uuid::Uuid::new_v4()));
+        let first = base.join("feature").join("repo");
+        let second = base.join("feature").join("docs");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorkspacesPanel>(cx).unwrap()
+        });
+        panel.update(cx, |panel, _| {
+            panel._context_refresh_task = Task::ready(());
+        });
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.open_created_worktrees(
+                        vec![second.clone(), first.clone(), first.clone()],
+                        "feature".into(),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+
+        let worktree_id = panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.entries.len(), 2);
+            let entry = panel
+                .entries
+                .iter()
+                .find(|entry| entry.id == panel.active)
+                .unwrap();
+            assert_eq!(entry.worktree_name.as_deref(), Some("feature"));
+            assert_eq!(entry.display_name(), "feature");
+            assert_eq!(entry.worktree_paths, vec![second.clone(), first.clone()]);
+            entry.id
+        });
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.activate_workspace(1, window, cx);
+                    panel.open_worktree(first.clone(), "feature".into(), window, cx);
+                });
+            })
+            .unwrap();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.entries.len(), 2, "an open worktree was duplicated");
+            assert_eq!(panel.active, worktree_id);
+            assert_eq!(panel.open_git_roots(), vec![second.clone(), first.clone()]);
+        });
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
     async fn closing_workspace_removes_only_its_project_worktree(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
         let base =
@@ -3627,6 +3976,8 @@ mod tests {
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
+                worktree_name: None,
+                worktree_paths: Vec::new(),
                 automatic_name: "Second".into(),
                 context: WorkspaceContext {
                     git_roots: vec![shared.clone(), unique.clone()],
@@ -3705,7 +4056,12 @@ mod tests {
         }
     }
 
-    fn stored_split(axis: Axis, ratio: f32, first: StoredLayout, second: StoredLayout) -> StoredLayout {
+    fn stored_split(
+        axis: Axis,
+        ratio: f32,
+        first: StoredLayout,
+        second: StoredLayout,
+    ) -> StoredLayout {
         StoredLayout::Split {
             axis,
             ratio,
