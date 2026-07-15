@@ -8,7 +8,6 @@
 //! detach/reattach of live entities — no PTY restart, no serialization — so it
 //! stays snappy regardless of how many terminals are open.
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,16 +15,16 @@ use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Axis, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Global, IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
-    WeakEntity, Window, actions, div, point, px, size,
+    App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, Global,
+    IntoElement, KeyDownEvent, Pixels, Render, SharedString, Subscription, Task, TaskExt,
+    WeakEntity, Window, actions, div, px,
 };
 use terminal_view::TerminalView;
 use ui::prelude::*;
 use ui::{IconButtonShape, Indicator, Tooltip};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::item::ItemHandle;
-use workspace::{Pane, SplitDirection, Workspace};
+use workspace::{Member, Pane, SplitDirection, Workspace};
 
 use crate::app::{create_center_terminal_for_workspace, create_restored_terminals_for_workspace};
 use crate::metadata::{GitMetadata, MetadataState, collect_git_metadata};
@@ -133,10 +132,71 @@ pub(crate) struct FailedRestoreSlot {
     activate: bool,
 }
 
-struct PendingRatio {
-    first: Entity<Pane>,
-    axis: Axis,
-    ratio: f32,
+/// Axis-aligned rectangle in the unit square describing a pane's share of the
+/// center while a layout is being rebuilt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UnitRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl UnitRect {
+    const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+
+    fn split(self, axis: Axis, ratio: f32) -> (Self, Self) {
+        let ratio = ratio.clamp(0.001, 0.999);
+        match axis {
+            Axis::Horizontal => {
+                let first_w = self.w * ratio;
+                (
+                    Self { w: first_w, ..self },
+                    Self {
+                        x: self.x + first_w,
+                        w: self.w - first_w,
+                        ..self
+                    },
+                )
+            }
+            Axis::Vertical => {
+                let first_h = self.h * ratio;
+                (
+                    Self { h: first_h, ..self },
+                    Self {
+                        y: self.y + first_h,
+                        h: self.h - first_h,
+                        ..self
+                    },
+                )
+            }
+        }
+    }
+
+    fn span(&self, axis: Axis) -> f32 {
+        match axis {
+            Axis::Horizontal => self.w,
+            Axis::Vertical => self.h,
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Self {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        }
+    }
 }
 
 impl WorkspaceEntry {
@@ -857,7 +917,7 @@ impl WorkspacesPanel {
                         // midway through, discard that partial live layout and
                         // retry the complete persisted snapshot.
                         restored_snapshot = true;
-                        let mut pending_ratios = Vec::new();
+                        let mut rects = Vec::new();
                         let focused = restore_snapshot_layout(
                             workspace,
                             target_pane,
@@ -865,27 +925,28 @@ impl WorkspacesPanel {
                             window,
                             cx,
                             &mut restored_terminals,
-                            &mut pending_ratios,
+                            &mut rects,
                         );
+                        apply_restored_flexes(workspace, &rects, cx);
                         if let Some(focused) = focused {
                             window.focus(&focused.focus_handle(cx), cx);
                         }
-                        schedule_ratio_restores(workspace, pending_ratios, window, cx);
                     }
                     (None, Some(layout)) => {
-                        let mut pending_ratios = Vec::new();
+                        let mut rects = Vec::new();
                         let focused = restore_layout(
                             workspace,
                             target_pane,
                             layout,
+                            UnitRect::FULL,
                             window,
                             cx,
-                            &mut pending_ratios,
+                            &mut rects,
                         );
+                        apply_restored_flexes(workspace, &rects, cx);
                         if let Some(focused) = focused {
                             window.focus(&focused.focus_handle(cx), cx);
                         }
-                        schedule_ratio_restores(workspace, pending_ratios, window, cx);
                         // A new workspace can be parked while its asynchronous
                         // first shell is still spawning. Non-restored workspaces
                         // do not own a retry snapshot, so provision a replacement
@@ -2375,30 +2436,81 @@ fn is_shell_process(process: &str) -> bool {
 
 /// Snapshot the current center into a [`StoredLayout`], cloning each item handle
 /// so the terminals stay alive after the originals are detached.
+///
+/// The split structure and ratios are read directly from the live pane group's
+/// flex values rather than from paint-time bounding boxes: the boxes are only
+/// refreshed by a layout pass, so they are stale (or too short) whenever a
+/// capture runs between a structural change and the next frame.
 fn capture_layout(workspace: &Workspace, cx: &App) -> StoredLayout {
-    let mut nodes: Vec<(Bounds<Pixels>, StoredLayout)> = Vec::new();
-    for pane in workspace.panes() {
-        let pane_ref = pane.read(cx);
-        let items: Vec<Box<dyn ItemHandle>> =
-            pane_ref.items().map(|item| item.boxed_clone()).collect();
-        if items.is_empty() {
-            continue;
-        }
-        let active = pane_ref.active_item_index();
-        let bounds = workspace.bounding_box_for_pane(pane).unwrap_or(Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(0.0), px(0.0)),
-        });
-        nodes.push((
-            bounds,
-            StoredLayout::Leaf {
+    capture_member(&workspace.center_group().root, workspace, cx).unwrap_or(StoredLayout::Leaf {
+        items: Vec::new(),
+        active: 0,
+        focused: true,
+    })
+}
+
+fn capture_member(member: &Member, workspace: &Workspace, cx: &App) -> Option<StoredLayout> {
+    match member {
+        Member::Pane(pane) => {
+            let pane_ref = pane.read(cx);
+            let items: Vec<Box<dyn ItemHandle>> =
+                pane_ref.items().map(|item| item.boxed_clone()).collect();
+            if items.is_empty() {
+                return None;
+            }
+            Some(StoredLayout::Leaf {
                 items,
-                active,
+                active: pane_ref.active_item_index(),
                 focused: pane == workspace.active_pane(),
-            },
-        ));
+            })
+        }
+        Member::Axis(axis) => {
+            let weights = axis.flexes.lock().clone();
+            let children: Vec<(f32, StoredLayout)> = axis
+                .members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    let child = capture_member(child, workspace, cx)?;
+                    Some((weights.get(index).copied().unwrap_or(1.0).max(0.0), child))
+                })
+                .collect();
+            fold_axis_run(axis.axis, children, &mut |axis, ratio, first, second| {
+                StoredLayout::Split {
+                    axis,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }
+            })
+        }
     }
-    build_tree(nodes)
+}
+
+/// Fold an n-member axis run into right-nested binary splits whose ratios are
+/// derived from the run's flex weights, so weights `[1, 2, 1]` become
+/// `Split(0.25, a, Split(2/3, b, c))`.
+fn fold_axis_run<T>(
+    axis: Axis,
+    children: Vec<(f32, T)>,
+    split: &mut impl FnMut(Axis, f32, T, T) -> T,
+) -> Option<T> {
+    let mut result: Option<(f32, T)> = None;
+    for (weight, node) in children.into_iter().rev() {
+        result = Some(match result {
+            None => (weight, node),
+            Some((rest_weight, rest)) => {
+                let total = weight + rest_weight;
+                let ratio = if total > f32::EPSILON {
+                    weight / total
+                } else {
+                    0.5
+                };
+                (total, split(axis, ratio, node, rest))
+            }
+        });
+    }
+    result.map(|(_, node)| node)
 }
 
 fn stored_layout_contains_item(layout: &StoredLayout, item_id: EntityId) -> bool {
@@ -2419,142 +2531,6 @@ fn center_has_provisioned_terminal(workspace: &Workspace, cx: &App) -> bool {
     })
 }
 
-/// Reconstruct a binary split tree from the laid-out pane rectangles using a
-/// guillotine partition: repeatedly find a clean horizontal or vertical cut that
-/// separates the panes into two groups.
-fn build_tree(nodes: Vec<(Bounds<Pixels>, StoredLayout)>) -> StoredLayout {
-    if nodes.len() <= 1 {
-        return nodes
-            .into_iter()
-            .next()
-            .map(|(_, layout)| layout)
-            .unwrap_or(StoredLayout::Leaf {
-                items: Vec::new(),
-                active: 0,
-                focused: true,
-            });
-    }
-
-    // `horizontal == true` looks for a vertical cut line, producing side-by-side
-    // panes (a horizontal axis); `false` looks for a stacked split.
-    for horizontal in [true, false] {
-        if let Some(left_indices) = try_cut(&nodes, horizontal) {
-            let axis = if horizontal {
-                Axis::Horizontal
-            } else {
-                Axis::Vertical
-            };
-            let ratio = ratio_for_cut(&nodes, &left_indices, horizontal);
-            let mut first = Vec::new();
-            let mut second = Vec::new();
-            for (index, node) in nodes.into_iter().enumerate() {
-                if left_indices.contains(&index) {
-                    first.push(node);
-                } else {
-                    second.push(node);
-                }
-            }
-            return StoredLayout::Split {
-                axis,
-                ratio,
-                first: Box::new(build_tree(first)),
-                second: Box::new(build_tree(second)),
-            };
-        }
-    }
-
-    // No clean cut (shouldn't happen for guillotine layouts) — flatten the
-    // terminals into a single tab strip so nothing is lost.
-    let mut items = Vec::new();
-    for (_, layout) in nodes {
-        collect_items(layout, &mut items);
-    }
-    StoredLayout::Leaf {
-        items,
-        active: 0,
-        focused: true,
-    }
-}
-
-fn coord_lo(bounds: &Bounds<Pixels>, horizontal: bool) -> f32 {
-    if horizontal {
-        f32::from(bounds.origin.x)
-    } else {
-        f32::from(bounds.origin.y)
-    }
-}
-
-fn coord_hi(bounds: &Bounds<Pixels>, horizontal: bool) -> f32 {
-    if horizontal {
-        f32::from(bounds.origin.x + bounds.size.width)
-    } else {
-        f32::from(bounds.origin.y + bounds.size.height)
-    }
-}
-
-/// Find the leftmost/topmost clean cut and return the indices of the panes that
-/// fall before it. Returns `None` if no cut cleanly separates the panes.
-fn try_cut<T>(nodes: &[(Bounds<Pixels>, T)], horizontal: bool) -> Option<Vec<usize>> {
-    const EPS: f32 = 1.0;
-    let mut cuts: Vec<f32> = nodes
-        .iter()
-        .map(|(bounds, _)| coord_hi(bounds, horizontal))
-        .collect();
-    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-
-    for cut in cuts {
-        let mut before = Vec::new();
-        let mut straddles = false;
-        for (index, (bounds, _)) in nodes.iter().enumerate() {
-            if coord_hi(bounds, horizontal) <= cut + EPS {
-                before.push(index);
-            } else if coord_lo(bounds, horizontal) < cut - EPS {
-                straddles = true;
-                break;
-            }
-        }
-        if !straddles && !before.is_empty() && before.len() < nodes.len() {
-            return Some(before);
-        }
-    }
-    None
-}
-
-fn ratio_for_cut<T>(
-    nodes: &[(Bounds<Pixels>, T)],
-    first_indices: &[usize],
-    horizontal: bool,
-) -> f32 {
-    let lo = nodes
-        .iter()
-        .map(|(bounds, _)| coord_lo(bounds, horizontal))
-        .fold(f32::INFINITY, f32::min);
-    let hi = nodes
-        .iter()
-        .map(|(bounds, _)| coord_hi(bounds, horizontal))
-        .fold(f32::NEG_INFINITY, f32::max);
-    let first_hi = first_indices
-        .iter()
-        .map(|index| coord_hi(&nodes[*index].0, horizontal))
-        .fold(f32::NEG_INFINITY, f32::max);
-    let span = hi - lo;
-    if !span.is_finite() || span <= 0.0 {
-        0.5
-    } else {
-        ((first_hi - lo) / span).clamp(0.05, 0.95)
-    }
-}
-
-fn collect_items(layout: StoredLayout, out: &mut Vec<Box<dyn ItemHandle>>) {
-    match layout {
-        StoredLayout::Leaf { items, .. } => out.extend(items),
-        StoredLayout::Split { first, second, .. } => {
-            collect_items(*first, out);
-            collect_items(*second, out);
-        }
-    }
-}
-
 /// Detach every item from the center, keeping the terminals alive (the caller is
 /// expected to already hold cloned handles). Leaves a single empty pane.
 fn clear_center(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -2569,13 +2545,18 @@ fn clear_center(workspace: &mut Workspace, window: &mut Window, cx: &mut Context
 }
 
 /// Rebuild a [`StoredLayout`] into the center, starting from a single empty pane.
+///
+/// Each leaf's share of the unit square is recorded in `rects` so the caller
+/// can write the stored split ratios into the live pane group afterwards via
+/// [`apply_restored_flexes`].
 fn restore_layout(
     workspace: &mut Workspace,
     target: Entity<Pane>,
     layout: StoredLayout,
+    rect: UnitRect,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-    pending_ratios: &mut Vec<PendingRatio>,
+    rects: &mut Vec<(Entity<Pane>, UnitRect)>,
 ) -> Option<Entity<Pane>> {
     match layout {
         StoredLayout::Leaf {
@@ -2592,6 +2573,7 @@ fn restore_layout(
                     pane.activate_item(index, false, false, window, cx);
                 });
             }
+            rects.push((target.clone(), rect));
             focused.then_some(target)
         }
         StoredLayout::Split {
@@ -2606,22 +2588,53 @@ fn restore_layout(
                 SplitDirection::Down
             };
             let new_pane = workspace.split_pane(target.clone(), direction, window, cx);
-            let focused_first = restore_layout(
-                workspace,
-                target.clone(),
-                *first,
-                window,
-                cx,
-                pending_ratios,
-            );
+            let (first_rect, second_rect) = rect.split(axis, ratio);
+            let focused_first =
+                restore_layout(workspace, target, *first, first_rect, window, cx, rects);
             let focused_second =
-                restore_layout(workspace, new_pane, *second, window, cx, pending_ratios);
-            pending_ratios.push(PendingRatio {
-                first: target,
-                axis,
-                ratio,
-            });
+                restore_layout(workspace, new_pane, *second, second_rect, window, cx, rects);
             focused_first.or(focused_second)
+        }
+    }
+}
+
+/// Write the stored split ratios into the freshly rebuilt center tree as flex
+/// values. This runs synchronously after the splits are created: it does not
+/// touch paint-time bounding boxes, which stay stale until the next frame (the
+/// old resize-based approach either silently skipped the restore or indexed
+/// out of bounds on axes with three or more panes).
+fn apply_restored_flexes(
+    workspace: &Workspace,
+    rects: &[(Entity<Pane>, UnitRect)],
+    cx: &mut Context<Workspace>,
+) {
+    let by_pane: HashMap<EntityId, UnitRect> = rects
+        .iter()
+        .map(|(pane, rect)| (pane.entity_id(), *rect))
+        .collect();
+    apply_member_flexes(&workspace.center_group().root, &by_pane);
+    cx.notify();
+}
+
+fn apply_member_flexes(member: &Member, rects: &HashMap<EntityId, UnitRect>) -> Option<UnitRect> {
+    match member {
+        Member::Pane(pane) => rects.get(&pane.entity_id()).copied(),
+        Member::Axis(axis) => {
+            let child_rects = axis
+                .members
+                .iter()
+                .map(|child| apply_member_flexes(child, rects))
+                .collect::<Option<Vec<_>>>()?;
+            let spans: Vec<f32> = child_rects
+                .iter()
+                .map(|child| child.span(axis.axis))
+                .collect();
+            let total: f32 = spans.iter().sum();
+            if total > f32::EPSILON && spans.iter().all(|span| *span > f32::EPSILON) {
+                let count = spans.len() as f32;
+                *axis.flexes.lock() = spans.iter().map(|span| span / total * count).collect();
+            }
+            child_rects.into_iter().reduce(UnitRect::union)
         }
     }
 }
@@ -2634,34 +2647,60 @@ fn terminal_snapshot(item: &dyn ItemHandle, cx: &App) -> Option<TerminalSnapshot
 }
 
 fn snapshot_active_layout(workspace: &Workspace, cx: &App) -> LayoutSnapshot {
-    let mut nodes = Vec::new();
-    for pane in workspace.panes() {
-        let pane_ref = pane.read(cx);
-        let mut tabs = Vec::new();
-        let mut active_tab = 0;
-        for (index, item) in pane_ref.items().enumerate() {
-            if let Some(terminal) = terminal_snapshot(item.as_ref(), cx) {
-                if index == pane_ref.active_item_index() {
-                    active_tab = tabs.len();
+    let root = snapshot_member(&workspace.center_group().root, workspace, cx).unwrap_or(
+        LayoutNodeSnapshot::Leaf {
+            tabs: Vec::new(),
+            active_tab: 0,
+            focused: true,
+        },
+    );
+    LayoutSnapshot { root }
+}
+
+fn snapshot_member(
+    member: &Member,
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<LayoutNodeSnapshot> {
+    match member {
+        Member::Pane(pane) => {
+            let pane_ref = pane.read(cx);
+            let mut tabs = Vec::new();
+            let mut active_tab = 0;
+            for (index, item) in pane_ref.items().enumerate() {
+                if let Some(terminal) = terminal_snapshot(item.as_ref(), cx) {
+                    if index == pane_ref.active_item_index() {
+                        active_tab = tabs.len();
+                    }
+                    tabs.push(terminal);
                 }
-                tabs.push(terminal);
             }
-        }
-        let bounds = workspace.bounding_box_for_pane(pane).unwrap_or(Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(0.0), px(0.0)),
-        });
-        nodes.push((
-            bounds,
-            LayoutNodeSnapshot::Leaf {
+            Some(LayoutNodeSnapshot::Leaf {
                 tabs,
                 active_tab,
                 focused: pane == workspace.active_pane(),
-            },
-        ));
-    }
-    LayoutSnapshot {
-        root: build_snapshot_tree(nodes),
+            })
+        }
+        Member::Axis(axis) => {
+            let weights = axis.flexes.lock().clone();
+            let children: Vec<(f32, LayoutNodeSnapshot)> = axis
+                .members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    let child = snapshot_member(child, workspace, cx)?;
+                    Some((weights.get(index).copied().unwrap_or(1.0).max(0.0), child))
+                })
+                .collect();
+            fold_axis_run(axis.axis, children, &mut |axis, ratio, first, second| {
+                LayoutNodeSnapshot::Split {
+                    axis: axis_to_snapshot(axis),
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }
+            })
+        }
     }
 }
 
@@ -2708,72 +2747,6 @@ fn snapshot_stored_layout(layout: &StoredLayout, cx: &App) -> LayoutSnapshot {
     }
 }
 
-fn build_snapshot_tree(nodes: Vec<(Bounds<Pixels>, LayoutNodeSnapshot)>) -> LayoutNodeSnapshot {
-    if nodes.len() <= 1 {
-        return nodes.into_iter().next().map(|(_, node)| node).unwrap_or(
-            LayoutNodeSnapshot::Leaf {
-                tabs: Vec::new(),
-                active_tab: 0,
-                focused: true,
-            },
-        );
-    }
-    for horizontal in [true, false] {
-        if let Some(first_indices) = try_cut(&nodes, horizontal) {
-            let ratio = ratio_for_cut(&nodes, &first_indices, horizontal);
-            let mut first = Vec::new();
-            let mut second = Vec::new();
-            for (index, node) in nodes.into_iter().enumerate() {
-                if first_indices.contains(&index) {
-                    first.push(node);
-                } else {
-                    second.push(node);
-                }
-            }
-            return LayoutNodeSnapshot::Split {
-                axis: if horizontal {
-                    LayoutAxis::Horizontal
-                } else {
-                    LayoutAxis::Vertical
-                },
-                ratio,
-                first: Box::new(build_snapshot_tree(first)),
-                second: Box::new(build_snapshot_tree(second)),
-            };
-        }
-    }
-
-    let focused = nodes.iter().any(|(_, node)| snapshot_node_is_focused(node));
-    let mut tabs = Vec::new();
-    for (_, node) in nodes {
-        collect_snapshot_terminals(node, &mut tabs);
-    }
-    LayoutNodeSnapshot::Leaf {
-        tabs,
-        active_tab: 0,
-        focused,
-    }
-}
-
-fn snapshot_node_is_focused(node: &LayoutNodeSnapshot) -> bool {
-    match node {
-        LayoutNodeSnapshot::Leaf { focused, .. } => *focused,
-        LayoutNodeSnapshot::Split { first, second, .. } => {
-            snapshot_node_is_focused(first) || snapshot_node_is_focused(second)
-        }
-    }
-}
-
-fn collect_snapshot_terminals(node: LayoutNodeSnapshot, output: &mut Vec<TerminalSnapshot>) {
-    match node {
-        LayoutNodeSnapshot::Leaf { tabs, .. } => output.extend(tabs),
-        LayoutNodeSnapshot::Split { first, second, .. } => {
-            collect_snapshot_terminals(*first, output);
-            collect_snapshot_terminals(*second, output);
-        }
-    }
-}
-
 fn restore_snapshot_layout(
     workspace: &mut Workspace,
     target: Entity<Pane>,
@@ -2781,11 +2754,11 @@ fn restore_snapshot_layout(
     window: &mut Window,
     cx: &mut Context<Workspace>,
     terminals: &mut Vec<RestoredTerminal>,
-    pending_ratios: &mut Vec<PendingRatio>,
+    rects: &mut Vec<(Entity<Pane>, UnitRect)>,
 ) -> Option<Entity<Pane>> {
     struct RestoreState<'a> {
         terminals: &'a mut Vec<RestoredTerminal>,
-        pending_ratios: &'a mut Vec<PendingRatio>,
+        rects: &'a mut Vec<(Entity<Pane>, UnitRect)>,
         path: Vec<bool>,
     }
 
@@ -2793,6 +2766,7 @@ fn restore_snapshot_layout(
         workspace: &mut Workspace,
         target: Entity<Pane>,
         node: &LayoutNodeSnapshot,
+        rect: UnitRect,
         window: &mut Window,
         cx: &mut Context<Workspace>,
         state: &mut RestoreState<'_>,
@@ -2820,6 +2794,7 @@ fn restore_snapshot_layout(
                                 },
                             }),
                     );
+                state.rects.push((target.clone(), rect));
                 focused.then_some(target)
             }
             LayoutNodeSnapshot::Split {
@@ -2835,18 +2810,15 @@ fn restore_snapshot_layout(
                     SplitDirection::Down
                 };
                 let new_pane = workspace.split_pane(target.clone(), direction, window, cx);
+                let (first_rect, second_rect) = rect.split(axis, *ratio);
                 state.path.push(false);
                 let focused_first =
-                    restore_node(workspace, target.clone(), first, window, cx, state);
+                    restore_node(workspace, target, first, first_rect, window, cx, state);
                 state.path.pop();
                 state.path.push(true);
-                let focused_second = restore_node(workspace, new_pane, second, window, cx, state);
+                let focused_second =
+                    restore_node(workspace, new_pane, second, second_rect, window, cx, state);
                 state.path.pop();
-                state.pending_ratios.push(PendingRatio {
-                    first: target,
-                    axis,
-                    ratio: *ratio,
-                });
                 focused_first.or(focused_second)
             }
         }
@@ -2854,10 +2826,18 @@ fn restore_snapshot_layout(
 
     let mut state = RestoreState {
         terminals,
-        pending_ratios,
+        rects,
         path: Vec::new(),
     };
-    restore_node(workspace, target, &layout.root, window, cx, &mut state)
+    restore_node(
+        workspace,
+        target,
+        &layout.root,
+        UnitRect::FULL,
+        window,
+        cx,
+        &mut state,
+    )
 }
 
 pub(crate) fn restore_startup_layout(
@@ -2869,7 +2849,7 @@ pub(crate) fn restore_startup_layout(
     clear_center(workspace, window, cx);
     let target = workspace.active_pane().clone();
     let mut terminals = Vec::new();
-    let mut pending_ratios = Vec::new();
+    let mut rects = Vec::new();
     let focused = restore_snapshot_layout(
         workspace,
         target,
@@ -2877,12 +2857,12 @@ pub(crate) fn restore_startup_layout(
         window,
         cx,
         &mut terminals,
-        &mut pending_ratios,
+        &mut rects,
     );
+    apply_restored_flexes(workspace, &rects, cx);
     if let Some(focused) = focused {
         window.focus(&focused.focus_handle(cx), cx);
     }
-    schedule_ratio_restores(workspace, pending_ratios, window, cx);
     terminals
 }
 
@@ -2898,40 +2878,6 @@ fn axis_from_snapshot(axis: LayoutAxis) -> Axis {
     match axis {
         LayoutAxis::Horizontal => Axis::Horizontal,
         LayoutAxis::Vertical => Axis::Vertical,
-    }
-}
-
-fn schedule_ratio_restores(
-    workspace: &mut Workspace,
-    pending_ratios: Vec<PendingRatio>,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    let workspace = workspace.weak_handle();
-    for pending in pending_ratios {
-        let workspace = workspace.clone();
-        window.defer(cx, move |window, cx| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    let Some(bounds) = workspace.bounding_box_for_pane(&pending.first) else {
-                        return;
-                    };
-                    let current = match pending.axis {
-                        Axis::Horizontal => f32::from(bounds.size.width),
-                        Axis::Vertical => f32::from(bounds.size.height),
-                    };
-                    if current <= 0.0 {
-                        return;
-                    }
-                    let amount = current * (pending.ratio * 2.0 - 1.0);
-                    if amount.abs() < 1.0 {
-                        return;
-                    }
-                    window.focus(&pending.first.focus_handle(cx), cx);
-                    workspace.resize_pane(pending.axis, px(amount), window, cx);
-                })
-                .ok();
-        });
     }
 }
 
@@ -3689,22 +3635,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    fn leaf(x: f32, y: f32, w: f32, h: f32) -> (Bounds<Pixels>, StoredLayout) {
-        (
-            Bounds {
-                origin: point(px(x), px(y)),
-                size: size(px(w), px(h)),
-            },
-            StoredLayout::Leaf {
-                items: Vec::new(),
-                active: 0,
-                focused: true,
-            },
-        )
+    fn stored_leaf() -> StoredLayout {
+        StoredLayout::Leaf {
+            items: Vec::new(),
+            active: 0,
+            focused: false,
+        }
+    }
+
+    fn stored_split(axis: Axis, ratio: f32, first: StoredLayout, second: StoredLayout) -> StoredLayout {
+        StoredLayout::Split {
+            axis,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
     }
 
     /// Render the layout's shape, ignoring the (empty) item lists, so tests can
-    /// assert the reconstructed split tree.
+    /// assert the folded split tree.
     fn shape(layout: &StoredLayout) -> String {
         match layout {
             StoredLayout::Leaf { .. } => "·".to_string(),
@@ -3721,63 +3670,66 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_is_a_leaf() {
-        assert_eq!(shape(&build_tree(vec![leaf(0.0, 0.0, 100.0, 100.0)])), "·");
+    fn fold_axis_run_returns_single_child_directly() {
+        let folded = fold_axis_run(
+            Axis::Horizontal,
+            vec![(1.0, stored_leaf())],
+            &mut stored_split,
+        )
+        .expect("one child should fold to itself");
+        assert_eq!(shape(&folded), "·");
     }
 
     #[test]
-    fn empty_layout_is_an_empty_leaf() {
-        assert_eq!(shape(&build_tree(Vec::new())), "·");
+    fn fold_axis_run_of_nothing_is_none() {
+        assert!(fold_axis_run(Axis::Horizontal, Vec::new(), &mut stored_split).is_none());
     }
 
     #[test]
-    fn side_by_side_panes_become_a_horizontal_split() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 50.0, 100.0),
-            leaf(50.0, 0.0, 50.0, 100.0),
-        ]);
-        assert_eq!(shape(&tree), "H(·,·)");
-    }
-
-    #[test]
-    fn stacked_panes_become_a_vertical_split() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 100.0, 50.0),
-            leaf(0.0, 50.0, 100.0, 50.0),
-        ]);
-        assert_eq!(shape(&tree), "V(·,·)");
-    }
-
-    #[test]
-    fn nested_layout_is_reconstructed() {
-        // Left column, with the right side split into top/bottom.
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 50.0, 100.0),
-            leaf(50.0, 0.0, 50.0, 50.0),
-            leaf(50.0, 50.0, 50.0, 50.0),
-        ]);
-        assert_eq!(shape(&tree), "H(·,V(·,·))");
-    }
-
-    #[test]
-    fn non_equal_split_ratio_is_captured() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 30.0, 100.0),
-            leaf(30.0, 0.0, 70.0, 100.0),
-        ]);
-        let StoredLayout::Split { ratio, .. } = tree else {
+    fn fold_axis_run_nests_left_to_right_with_weighted_ratios() {
+        let folded = fold_axis_run(
+            Axis::Horizontal,
+            vec![
+                (1.0, stored_leaf()),
+                (2.0, stored_leaf()),
+                (1.0, stored_leaf()),
+            ],
+            &mut stored_split,
+        )
+        .expect("three children should fold into nested splits");
+        assert_eq!(shape(&folded), "H(·,H(·,·))");
+        let StoredLayout::Split { ratio, second, .. } = folded else {
             panic!("expected a split");
         };
-        assert!((ratio - 0.3).abs() < 0.01);
+        assert!((ratio - 0.25).abs() < 1e-4);
+        let StoredLayout::Split { ratio, .. } = *second else {
+            panic!("expected a nested split");
+        };
+        assert!((ratio - 2.0 / 3.0).abs() < 1e-4);
     }
 
     #[test]
-    fn three_columns_nest_left_to_right() {
-        let tree = build_tree(vec![
-            leaf(0.0, 0.0, 33.0, 100.0),
-            leaf(33.0, 0.0, 33.0, 100.0),
-            leaf(66.0, 0.0, 34.0, 100.0),
-        ]);
-        assert_eq!(shape(&tree), "H(·,H(·,·))");
+    fn unit_rect_split_partitions_the_axis_span() {
+        let (first, second) = UnitRect::FULL.split(Axis::Horizontal, 0.3);
+        assert!((first.w - 0.3).abs() < 1e-5);
+        assert!((second.x - 0.3).abs() < 1e-5);
+        assert!((second.w - 0.7).abs() < 1e-5);
+        assert!((first.h - 1.0).abs() < 1e-5 && (second.h - 1.0).abs() < 1e-5);
+
+        let (top, bottom) = UnitRect::FULL.split(Axis::Vertical, 0.25);
+        assert!((top.h - 0.25).abs() < 1e-5);
+        assert!((bottom.y - 0.25).abs() < 1e-5);
+        assert!((bottom.h - 0.75).abs() < 1e-5);
+
+        let reunited = first.union(second);
+        assert!((reunited.x - 0.0).abs() < 1e-5 && (reunited.w - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn unit_rect_split_spans_follow_the_split_axis() {
+        let (first, second) = UnitRect::FULL.split(Axis::Horizontal, 0.4);
+        assert!((first.span(Axis::Horizontal) - 0.4).abs() < 1e-5);
+        assert!((second.span(Axis::Horizontal) - 0.6).abs() < 1e-5);
+        assert!((first.span(Axis::Vertical) - 1.0).abs() < 1e-5);
     }
 }
