@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/alacritty_terminal", "vendor/terminal_view", "vendor/vte"]
+exclude = ["vendor/alacritty_terminal", "vendor/terminal_view", "vendor/vte", "vendor/workspace"]
 
 [workspace.dependencies]
 agent_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -99,6 +99,7 @@ alacritty_terminal = { path = "vendor/alacritty_terminal" }
 
 [patch."https://github.com/zed-industries/zed"]
 terminal_view = { path = "vendor/terminal_view" }
+workspace = { path = "vendor/workspace" }
 
 [package]
 name = "zmux"

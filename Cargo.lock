@@ -14318,7 +14318,6 @@ dependencies = [
 [[package]]
 name = "workspace"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
 dependencies = [
  "agent_settings",
  "any_vec",
@@ -14363,7 +14362,6 @@ dependencies = [
  "url",
  "util",
  "uuid",
- "windows 0.61.3",
  "zed_actions",
 ]
 
