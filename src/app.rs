@@ -12,6 +12,7 @@ use http_client::{BlockedHttpClient, HttpClientWithUrl};
 use project::Project;
 use settings::Settings;
 use terminal_view::{TerminalView, default_working_directory};
+use theme::ActiveTheme as _;
 use workspace::pane::{
     SplitDown as PaneSplitDown, SplitHorizontal as PaneSplitHorizontal, SplitLeft as PaneSplitLeft,
     SplitMode, SplitRight as PaneSplitRight, SplitUp as PaneSplitUp,
@@ -85,6 +86,14 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
 
     let app_state = init_app_state(cx);
     crate::syntax::register_builtin_languages(&app_state.languages);
+    // Grammars alone don't produce colors: the registry needs the active theme
+    // to build its highlight maps, and must rebuild them on theme changes.
+    app_state.languages.set_theme(cx.theme().clone());
+    cx.observe_global::<theme::GlobalTheme>({
+        let languages = app_state.languages.clone();
+        move |cx| languages.set_theme(cx.theme().clone())
+    })
+    .detach();
     Project::init(&app_state.client, cx);
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
