@@ -8,7 +8,7 @@
 //! detach/reattach of live entities — no PTY restart, no serialization — so it
 //! stays snappy regardless of how many terminals are open.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,6 +59,7 @@ const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_INCOMPLETE_CONTEXT_REFRESHES: u8 = 3;
 const ACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(5);
 const INACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(30);
+const AGENT_COMPLETION_MISSES: u8 = 2;
 
 fn scaled_panel_size(rem_size: Pixels, rems: f32) -> Pixels {
     px(f32::from(rem_size) * rems)
@@ -240,8 +241,116 @@ struct WorkspaceContext {
     git_roots: Vec<PathBuf>,
     git_root: Option<PathBuf>,
     foreground_processes: Vec<String>,
+    agents: Vec<AgentInstance>,
+    terminal_item_ids: Vec<EntityId>,
     shell_count: usize,
     reported_directories: usize,
+}
+
+/// AI agent CLIs surfaced in the panel's bottom footer, unlike the generic
+/// activity pills which show any non-shell foreground process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AgentKind {
+    Claude,
+    Codex,
+    OpenCode,
+    Pi,
+    Amp,
+    Gemini,
+    Aider,
+    Goose,
+}
+
+impl AgentKind {
+    fn from_process(process: &str) -> Option<Self> {
+        let executable = process
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()?
+            .to_ascii_lowercase();
+        let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+
+        match executable {
+            "claude" | "claude-code" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::OpenCode),
+            "pi" => Some(Self::Pi),
+            "amp" => Some(Self::Amp),
+            "gemini" => Some(Self::Gemini),
+            "aider" => Some(Self::Aider),
+            "goose" => Some(Self::Goose),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::OpenCode => "opencode",
+            Self::Pi => "Pi",
+            Self::Amp => "Amp",
+            Self::Gemini => "Gemini",
+            Self::Aider => "Aider",
+            Self::Goose => "Goose",
+        }
+    }
+
+    fn icon(self) -> Option<ForegroundProcessIcon> {
+        match self {
+            Self::Claude => Some(ForegroundProcessIcon::Named(IconName::AiClaude)),
+            Self::Codex => Some(ForegroundProcessIcon::Named(IconName::AiOpenAi)),
+            Self::OpenCode => Some(ForegroundProcessIcon::Named(IconName::AiOpenCode)),
+            Self::Gemini => Some(ForegroundProcessIcon::Named(IconName::AiGemini)),
+            Self::Pi => Some(ForegroundProcessIcon::Embedded("icons/ai_pi.svg")),
+            Self::Amp | Self::Aider | Self::Goose => None,
+        }
+    }
+}
+
+/// One running agent process, tied to the terminal item hosting it so the
+/// footer can focus that tab on click.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentInstance {
+    kind: AgentKind,
+    item_id: EntityId,
+    title: SharedString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentChatStatus {
+    Running,
+    Completed,
+}
+
+impl AgentChatStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "done",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Running => Color::Success,
+            Self::Completed => Color::Muted,
+        }
+    }
+}
+
+/// A chat remembered for as long as its terminal tab exists. Foreground
+/// process sampling can briefly miss a live CLI, so two consecutive misses are
+/// required before an open chat is moved into the completed recency order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentChat {
+    workspace_id: WorkspaceId,
+    kind: AgentKind,
+    item_id: EntityId,
+    title: SharedString,
+    status: AgentChatStatus,
+    activity_sequence: u64,
+    missing_refreshes: u8,
 }
 
 impl WorkspaceContext {
@@ -445,6 +554,8 @@ pub struct WorkspacesPanel {
     session_persistence: SessionPersistence,
     attached_worktrees: HashMap<PathBuf, Entity<project::Worktree>>,
     pending_worktrees: BTreeSet<PathBuf>,
+    agent_chats: HashMap<(WorkspaceId, EntityId), AgentChat>,
+    next_agent_activity_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -749,6 +860,8 @@ impl WorkspacesPanel {
             session_persistence: SessionPersistence::new(restored),
             attached_worktrees: HashMap::new(),
             pending_worktrees: BTreeSet::new(),
+            agent_chats: HashMap::new(),
+            next_agent_activity_sequence: 0,
         }
     }
 
@@ -1231,6 +1344,8 @@ impl WorkspacesPanel {
 
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
+        self.agent_chats
+            .retain(|(workspace_id, _), _| *workspace_id != id);
         self.reconcile_git_context(cx);
         self.request_metadata_refreshes(cx);
         if self.notification_filter == Some(id) {
@@ -1282,6 +1397,12 @@ impl WorkspacesPanel {
                     .map(|layout| workspace_context_for_stored_layout(layout, cx))
                     .unwrap_or_default()
             };
+            changed |= reconcile_agent_chats_for_workspace(
+                &mut self.agent_chats,
+                &mut self.next_agent_activity_sequence,
+                entry.id,
+                &observed,
+            );
             let previous_context = entry.context.clone();
             let previous_authoritative = entry.context_authoritative;
             entry.observe_context(observed);
@@ -1689,6 +1810,136 @@ impl WorkspacesPanel {
         if self.rename.take().is_some() {
             cx.notify();
         }
+    }
+
+    fn focus_terminal_item(
+        &mut self,
+        item_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let Some(pane) = workspace.pane_for_item_id(item_id) else {
+                return;
+            };
+            pane.update(cx, |pane, cx| {
+                let ix = pane.items().position(|item| item.item_id() == item_id);
+                if let Some(ix) = ix {
+                    pane.activate_item(ix, true, true, window, cx);
+                }
+            });
+        });
+    }
+
+    fn render_agent_chats(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let workspace_name = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.active)?
+            .display_name()
+            .to_owned();
+        let chats = agent_chats_for_workspace(&self.agent_chats, self.active);
+        if chats.is_empty() {
+            return None;
+        }
+
+        let total = chats.len();
+        let running = chats
+            .iter()
+            .filter(|chat| chat.status == AgentChatStatus::Running)
+            .count();
+
+        Some(
+            v_flex()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .justify_between()
+                        .child(
+                            Label::new("Chats")
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            Label::new(format!("{running} running · {total}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .id("agent-chats-list")
+                        .px_1()
+                        .pb_1()
+                        .gap_0p5()
+                        .max_h(rems(18.0))
+                        .overflow_y_scroll()
+                        .children(chats.into_iter().map(|chat| {
+                            let item_id = chat.item_id;
+                            let title = agent_chat_display_title(&chat, &workspace_name);
+                            let detail = format!("{} · {}", chat.status.label(), chat.kind.label());
+
+                            h_flex()
+                                .id(("agent-chat-row", item_id))
+                                .w_full()
+                                .min_w_0()
+                                .px_1()
+                                .py_1()
+                                .gap_1()
+                                .rounded_sm()
+                                .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                .cursor_pointer()
+                                .tooltip(Tooltip::text(format!(
+                                    "Open {} chat in {}",
+                                    chat.kind.label(),
+                                    workspace_name
+                                )))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.focus_terminal_item(item_id, window, cx);
+                                }))
+                                .child(Indicator::dot().color(chat.status.color()))
+                                .child(match chat.kind.icon() {
+                                    Some(ForegroundProcessIcon::Named(icon)) => Icon::new(icon)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted)
+                                        .into_any_element(),
+                                    Some(ForegroundProcessIcon::Embedded(path)) => {
+                                        Icon::from_path(path)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted)
+                                            .into_any_element()
+                                    }
+                                    None => Label::new(chat.kind.label())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .into_any_element(),
+                                })
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .child(
+                                            Label::new(title)
+                                                .size(LabelSize::Small)
+                                                .weight(FontWeight::SEMIBOLD)
+                                                .single_line(),
+                                        )
+                                        .child(
+                                            Label::new(detail)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .single_line(),
+                                        ),
+                                )
+                        })),
+                ),
+        )
     }
 
     fn render_entry(
@@ -2289,6 +2540,8 @@ impl Render for WorkspacesPanel {
                 .anchor(Anchor::BottomLeft)
         });
 
+        let agent_chats = self.render_agent_chats(cx);
+
         v_flex()
             .key_context("WorkspacesPanel")
             .font_family(WORKSPACES_FONT_FAMILY)
@@ -2356,6 +2609,7 @@ impl Render for WorkspacesPanel {
                     .flex_1()
                     .children(rows.iter().map(|entry| self.render_entry(entry, cx))),
             )
+            .when_some(agent_chats, |this, chats| this.child(chats))
             .when(self.notifications_expanded, |this| {
                 this.child(
                     v_flex()
@@ -2556,15 +2810,24 @@ fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceC
     let terminal = terminal_view.read(cx).terminal().clone();
     let terminal = terminal.read(cx);
     context.shell_count += 1;
+    context.terminal_item_ids.push(item.item_id());
     if let Some(directory) = terminal.working_directory() {
         context.reported_directories += 1;
         context.working_directories.push(directory);
     }
-    if let Some(process) = terminal.foreground_process_command_name()
-        && !is_shell_process(&process)
-        && let Some(process) = sanitize_process_label(&process)
-    {
-        context.foreground_processes.push(process);
+    if let Some(process) = terminal.foreground_process_command_name() {
+        if let Some(kind) = AgentKind::from_process(&process) {
+            context.agents.push(AgentInstance {
+                kind,
+                item_id: item.item_id(),
+                title: item.tab_content_text(0, cx),
+            });
+        }
+        if !is_shell_process(&process)
+            && let Some(process) = sanitize_process_label(&process)
+        {
+            context.foreground_processes.push(process);
+        }
     }
 }
 
@@ -2578,6 +2841,9 @@ fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext
         .collect::<BTreeSet<_>>();
     context.foreground_processes = processes.into_iter().take(8).collect();
 
+    context.agents.sort_by_key(|agent| agent.kind);
+    context.agents.truncate(8);
+
     context.git_roots = context
         .working_directories
         .iter()
@@ -2589,6 +2855,123 @@ fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext
         context.git_root = context.git_roots.first().cloned();
     }
     context
+}
+
+fn reconcile_agent_chats_for_workspace(
+    chats: &mut HashMap<(WorkspaceId, EntityId), AgentChat>,
+    next_activity_sequence: &mut u64,
+    workspace_id: WorkspaceId,
+    observed: &WorkspaceContext,
+) -> bool {
+    let live_items = observed
+        .terminal_item_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let running_items = observed
+        .agents
+        .iter()
+        .map(|agent| (agent.item_id, agent))
+        .collect::<HashMap<_, _>>();
+    let previous_len = chats.len();
+    chats.retain(|(chat_workspace_id, item_id), _| {
+        *chat_workspace_id != workspace_id || live_items.contains(item_id)
+    });
+    let mut changed = chats.len() != previous_len;
+
+    for agent in &observed.agents {
+        let key = (workspace_id, agent.item_id);
+        if let Some(chat) = chats.get_mut(&key) {
+            if chat.kind != agent.kind || chat.title != agent.title {
+                chat.kind = agent.kind;
+                chat.title = agent.title.clone();
+                changed = true;
+            }
+            if chat.status != AgentChatStatus::Running {
+                chat.status = AgentChatStatus::Running;
+                chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+                changed = true;
+            }
+            if chat.missing_refreshes != 0 {
+                chat.missing_refreshes = 0;
+                changed = true;
+            }
+        } else {
+            chats.insert(
+                key,
+                AgentChat {
+                    workspace_id,
+                    kind: agent.kind,
+                    item_id: agent.item_id,
+                    title: agent.title.clone(),
+                    status: AgentChatStatus::Running,
+                    activity_sequence: next_agent_activity_sequence(next_activity_sequence),
+                    missing_refreshes: 0,
+                },
+            );
+            changed = true;
+        }
+    }
+
+    for chat in chats.values_mut().filter(|chat| {
+        chat.workspace_id == workspace_id
+            && chat.status == AgentChatStatus::Running
+            && !running_items.contains_key(&chat.item_id)
+    }) {
+        let missing_refreshes = chat.missing_refreshes.saturating_add(1);
+        if missing_refreshes != chat.missing_refreshes {
+            chat.missing_refreshes = missing_refreshes;
+            changed = true;
+        }
+        if chat.missing_refreshes >= AGENT_COMPLETION_MISSES {
+            chat.status = AgentChatStatus::Completed;
+            chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn next_agent_activity_sequence(sequence: &mut u64) -> u64 {
+    *sequence = sequence
+        .checked_add(1)
+        .expect("agent activity sequence exhausted");
+    *sequence
+}
+
+fn agent_chat_display_title(chat: &AgentChat, workspace_name: &str) -> String {
+    let title = chat.title.trim();
+    if title.is_empty() || AgentKind::from_process(title) == Some(chat.kind) {
+        workspace_name.to_owned()
+    } else {
+        title.to_owned()
+    }
+}
+
+fn sort_agent_chats(chats: &mut [AgentChat]) {
+    chats.sort_by(|left, right| {
+        let left_completed = left.status == AgentChatStatus::Completed;
+        let right_completed = right.status == AgentChatStatus::Completed;
+        right_completed
+            .cmp(&left_completed)
+            .then(right.activity_sequence.cmp(&left.activity_sequence))
+            .then(left.workspace_id.cmp(&right.workspace_id))
+            .then(left.item_id.as_u64().cmp(&right.item_id.as_u64()))
+    });
+}
+
+fn agent_chats_for_workspace(
+    chats: &HashMap<(WorkspaceId, EntityId), AgentChat>,
+    workspace_id: WorkspaceId,
+) -> Vec<AgentChat> {
+    let mut chats = chats
+        .values()
+        .filter(|chat| chat.workspace_id == workspace_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_agent_chats(&mut chats);
+    chats
 }
 
 fn nearest_git_root(directory: &Path) -> Option<PathBuf> {
@@ -3296,6 +3679,8 @@ mod tests {
             git_roots: vec![PathBuf::from("/tmp/zmux")],
             git_root: Some(PathBuf::from("/tmp/zmux")),
             foreground_processes: vec!["cargo".into()],
+            agents: Vec::new(),
+            terminal_item_ids: Vec::new(),
             shell_count: 2,
             reported_directories: 2,
         };
@@ -3333,6 +3718,211 @@ mod tests {
         assert!(is_shell_process("/usr/bin/bash"));
         assert!(is_shell_process("pwsh"));
         assert!(!is_shell_process("cargo"));
+    }
+
+    #[test]
+    fn agent_kinds_are_recognized_from_process_paths() {
+        assert_eq!(AgentKind::from_process("claude"), Some(AgentKind::Claude));
+        assert_eq!(
+            AgentKind::from_process("/usr/local/bin/claude"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            AgentKind::from_process(r"C:\tools\claude-code.exe"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(AgentKind::from_process("codex"), Some(AgentKind::Codex));
+        assert_eq!(
+            AgentKind::from_process("opencode"),
+            Some(AgentKind::OpenCode)
+        );
+        assert_eq!(AgentKind::from_process("pi"), Some(AgentKind::Pi));
+        assert_eq!(AgentKind::from_process("amp"), Some(AgentKind::Amp));
+        assert_eq!(AgentKind::from_process("gemini"), Some(AgentKind::Gemini));
+        assert_eq!(AgentKind::from_process("aider"), Some(AgentKind::Aider));
+        assert_eq!(AgentKind::from_process("goose"), Some(AgentKind::Goose));
+    }
+
+    #[test]
+    fn non_agent_processes_are_excluded_from_the_agents_footer() {
+        assert_eq!(AgentKind::from_process("nvim"), None);
+        assert_eq!(AgentKind::from_process("git"), None);
+        assert_eq!(AgentKind::from_process("cargo"), None);
+        assert_eq!(AgentKind::from_process("bash"), None);
+        // "pi" must match exactly; near-misses stay out.
+        assert_eq!(AgentKind::from_process("pip"), None);
+        assert_eq!(AgentKind::from_process("pixi"), None);
+    }
+
+    #[test]
+    fn agent_kinds_map_to_their_product_icons() {
+        assert_eq!(
+            AgentKind::Claude.icon(),
+            Some(ForegroundProcessIcon::Named(IconName::AiClaude))
+        );
+        assert_eq!(
+            AgentKind::Codex.icon(),
+            Some(ForegroundProcessIcon::Named(IconName::AiOpenAi))
+        );
+        assert_eq!(
+            AgentKind::OpenCode.icon(),
+            Some(ForegroundProcessIcon::Named(IconName::AiOpenCode))
+        );
+        assert_eq!(
+            AgentKind::Gemini.icon(),
+            Some(ForegroundProcessIcon::Named(IconName::AiGemini))
+        );
+        assert_eq!(
+            AgentKind::Pi.icon(),
+            Some(ForegroundProcessIcon::Embedded("icons/ai_pi.svg"))
+        );
+        assert_eq!(AgentKind::Amp.icon(), None);
+        assert_eq!(AgentKind::Aider.icon(), None);
+        assert_eq!(AgentKind::Goose.icon(), None);
+    }
+
+    #[test]
+    fn agent_chat_is_retained_and_transitions_to_done_after_two_misses() {
+        let item_id = EntityId::from(41_u64);
+        let running = WorkspaceContext {
+            agents: vec![AgentInstance {
+                kind: AgentKind::Codex,
+                item_id,
+                title: "codex".into(),
+            }],
+            terminal_item_ids: vec![item_id],
+            shell_count: 1,
+            ..WorkspaceContext::default()
+        };
+        let shell = WorkspaceContext {
+            terminal_item_ids: vec![item_id],
+            shell_count: 1,
+            ..WorkspaceContext::default()
+        };
+        let mut chats = HashMap::new();
+        let mut sequence = 0;
+
+        assert!(reconcile_agent_chats_for_workspace(
+            &mut chats,
+            &mut sequence,
+            7,
+            &running,
+        ));
+        let chat = chats.get(&(7, item_id)).unwrap();
+        assert_eq!(chat.status, AgentChatStatus::Running);
+        assert_eq!(chat.activity_sequence, 1);
+
+        assert!(reconcile_agent_chats_for_workspace(
+            &mut chats,
+            &mut sequence,
+            7,
+            &shell,
+        ));
+        assert_eq!(
+            chats.get(&(7, item_id)).unwrap().status,
+            AgentChatStatus::Running,
+            "one missing process sample must not complete a live agent"
+        );
+
+        assert!(reconcile_agent_chats_for_workspace(
+            &mut chats,
+            &mut sequence,
+            7,
+            &shell,
+        ));
+        let chat = chats.get(&(7, item_id)).unwrap();
+        assert_eq!(chat.status, AgentChatStatus::Completed);
+        assert_eq!(chat.activity_sequence, 2);
+
+        let closed = WorkspaceContext::default();
+        assert!(reconcile_agent_chats_for_workspace(
+            &mut chats,
+            &mut sequence,
+            7,
+            &closed,
+        ));
+        assert!(
+            chats.is_empty(),
+            "closing the terminal removes its chat row"
+        );
+    }
+
+    #[test]
+    fn most_recently_completed_chat_sorts_first() {
+        let running_id = EntityId::from(1_u64);
+        let older_completed_id = EntityId::from(2_u64);
+        let newest_completed_id = EntityId::from(3_u64);
+        let chat = |item_id, status, activity_sequence| AgentChat {
+            workspace_id: 1,
+            kind: AgentKind::Claude,
+            item_id,
+            title: "claude".into(),
+            status,
+            activity_sequence,
+            missing_refreshes: 0,
+        };
+        let mut chats = vec![
+            chat(running_id, AgentChatStatus::Running, 9),
+            chat(older_completed_id, AgentChatStatus::Completed, 4),
+            chat(newest_completed_id, AgentChatStatus::Completed, 8),
+        ];
+
+        sort_agent_chats(&mut chats);
+
+        assert_eq!(
+            chats.iter().map(|chat| chat.item_id).collect::<Vec<_>>(),
+            vec![newest_completed_id, older_completed_id, running_id]
+        );
+    }
+
+    #[test]
+    fn chat_list_contains_only_the_selected_workspace() {
+        let first_item = EntityId::from(11_u64);
+        let second_item = EntityId::from(12_u64);
+        let chats = [
+            AgentChat {
+                workspace_id: 1,
+                kind: AgentKind::Codex,
+                item_id: first_item,
+                title: "first".into(),
+                status: AgentChatStatus::Running,
+                activity_sequence: 1,
+                missing_refreshes: 0,
+            },
+            AgentChat {
+                workspace_id: 2,
+                kind: AgentKind::Claude,
+                item_id: second_item,
+                title: "second".into(),
+                status: AgentChatStatus::Completed,
+                activity_sequence: 2,
+                missing_refreshes: 0,
+            },
+        ]
+        .into_iter()
+        .map(|chat| ((chat.workspace_id, chat.item_id), chat))
+        .collect();
+
+        let visible = agent_chats_for_workspace(&chats, 1);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].workspace_id, 1);
+        assert_eq!(visible[0].item_id, first_item);
+    }
+
+    #[test]
+    fn generic_agent_titles_fall_back_to_the_workspace_name() {
+        let chat = AgentChat {
+            workspace_id: 1,
+            kind: AgentKind::Codex,
+            item_id: EntityId::from(1_u64),
+            title: "codex".into(),
+            status: AgentChatStatus::Running,
+            activity_sequence: 1,
+            missing_refreshes: 0,
+        };
+
+        assert_eq!(agent_chat_display_title(&chat, "zmux"), "zmux");
     }
 
     #[test]
