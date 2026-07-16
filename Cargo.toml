@@ -159,14 +159,13 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-gpui_platform = { workspace = true }
-
 [target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
 futures-util = "0.3"
 mac-usernotifications = "0.3.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { workspace = true }
 windows = { version = "0.61", features = [
     "Data_Xml_Dom",
     "Foundation",
