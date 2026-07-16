@@ -93,7 +93,6 @@ pub(super) struct AgentChat {
     pub(super) seen: bool,
     pub(super) focused: bool,
     pub(super) had_active_turn: bool,
-    pub(super) process_exited: bool,
     pub(super) creation_sequence: u64,
     pub(super) activity_sequence: u64,
     pub(super) missing_refreshes: u8,
@@ -207,13 +206,9 @@ pub(super) fn reconcile_agent_chats_for_workspace(
     for agent in &observed.agents {
         let key = (workspace_id, agent.item_id);
         if let Some(chat) = chats.get_mut(&key) {
-            let restarted = chat.process_exited || chat.kind != agent.kind;
             if chat.kind != agent.kind {
                 chat.kind = agent.kind;
                 chat.prompt_snippet = None;
-                changed = true;
-            }
-            if restarted {
                 chat.state = if agent.kind.has_detailed_detection() {
                     AgentChatState::Quiet
                 } else {
@@ -221,7 +216,6 @@ pub(super) fn reconcile_agent_chats_for_workspace(
                 };
                 chat.seen = true;
                 chat.had_active_turn = false;
-                chat.process_exited = false;
                 chat.pending_state = None;
                 chat.pending_confirmations = 0;
                 chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
@@ -249,10 +243,8 @@ pub(super) fn reconcile_agent_chats_for_workspace(
                 chat.seen = true;
                 changed = true;
             }
-            if chat.missing_refreshes != 0 {
-                chat.missing_refreshes = 0;
-                changed = true;
-            }
+            // Internal hysteresis bookkeeping; resetting it is not user-visible.
+            chat.missing_refreshes = 0;
             changed |= apply_agent_observation(chat, agent, next_activity_sequence);
         } else {
             let sequence = next_agent_activity_sequence(next_activity_sequence);
@@ -287,7 +279,6 @@ pub(super) fn reconcile_agent_chats_for_workspace(
                         state,
                         AgentChatState::Working | AgentChatState::NeedsInput
                     ),
-                    process_exited: false,
                     creation_sequence: sequence,
                     activity_sequence: sequence,
                     missing_refreshes: 0,
@@ -299,35 +290,17 @@ pub(super) fn reconcile_agent_chats_for_workspace(
         }
     }
 
-    for chat in chats.values_mut().filter(|chat| {
-        chat.workspace_id == workspace_id && !running_items.contains_key(&chat.item_id)
-    }) {
-        chat.focused = observed.active_item_id == Some(chat.item_id);
-        if chat.process_exited {
-            if chat.focused && chat.state == AgentChatState::Idle && !chat.seen {
-                chat.seen = true;
-                changed = true;
-            }
-            continue;
+    // A vanished process can be a transient sampling miss; drop the chat only
+    // once consecutive refreshes confirm the agent exited (e.g. via Ctrl-C).
+    let len_before_exits = chats.len();
+    chats.retain(|(chat_workspace_id, item_id), chat| {
+        if *chat_workspace_id != workspace_id || running_items.contains_key(item_id) {
+            return true;
         }
-        let missing_refreshes = chat.missing_refreshes.saturating_add(1);
-        if missing_refreshes != chat.missing_refreshes {
-            chat.missing_refreshes = missing_refreshes;
-            changed = true;
-        }
-        if chat.missing_refreshes >= AGENT_STATE_CONFIRMATIONS {
-            chat.process_exited = true;
-            chat.pending_state = None;
-            chat.pending_confirmations = 0;
-            if chat.state != AgentChatState::Idle {
-                chat.state = AgentChatState::Idle;
-                chat.seen = chat.focused;
-                chat.had_active_turn = false;
-                chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
-            }
-            changed = true;
-        }
-    }
+        chat.missing_refreshes = chat.missing_refreshes.saturating_add(1);
+        chat.missing_refreshes < AGENT_STATE_CONFIRMATIONS
+    });
+    changed |= chats.len() != len_before_exits;
 
     changed
 }
@@ -588,7 +561,6 @@ mod tests {
             seen,
             focused: false,
             had_active_turn: matches!(state, AgentChatState::Working | AgentChatState::NeedsInput),
-            process_exited: false,
             creation_sequence: activity_sequence,
             activity_sequence,
             missing_refreshes: 0,
@@ -598,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn coarse_agent_chat_is_retained_and_transitions_to_done_after_two_misses() {
+    fn exited_agent_chat_is_dropped_after_two_missing_process_samples() {
         let item_id = EntityId::from(41_u64);
         let running = observed_workspace(
             Some(observation(item_id, AgentKind::OpenCode, "", "")),
@@ -619,7 +591,7 @@ mod tests {
         assert_eq!(chat.state, AgentChatState::Open);
         assert_eq!(chat.activity_sequence, 1);
 
-        assert!(reconcile_agent_chats_for_workspace(
+        assert!(!reconcile_agent_chats_for_workspace(
             &mut chats,
             &mut sequence,
             7,
@@ -628,7 +600,7 @@ mod tests {
         assert_eq!(
             chats.get(&(7, item_id)).unwrap().state,
             AgentChatState::Open,
-            "one missing process sample must not complete a live agent"
+            "one missing process sample must not tear down a live agent chat"
         );
 
         assert!(reconcile_agent_chats_for_workspace(
@@ -637,10 +609,24 @@ mod tests {
             7,
             &shell,
         ));
-        let chat = chats.get(&(7, item_id)).unwrap();
-        assert_eq!(chat.state, AgentChatState::Idle);
-        assert!(!chat.seen);
-        assert_eq!(chat.activity_sequence, 2);
+        assert!(
+            chats.is_empty(),
+            "an exited agent process (e.g. Ctrl-C) removes its chat row"
+        );
+    }
+
+    #[test]
+    fn closing_the_terminal_removes_its_chat_row_immediately() {
+        let item_id = EntityId::from(43_u64);
+        let running = observed_workspace(
+            Some(observation(item_id, AgentKind::OpenCode, "", "")),
+            item_id,
+            false,
+        );
+        let mut chats = HashMap::new();
+        let mut sequence = 0;
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &running);
+        assert_eq!(chats.len(), 1);
 
         let closed = AgentWorkspaceObservation::default();
         assert!(reconcile_agent_chats_for_workspace(
@@ -649,9 +635,30 @@ mod tests {
             7,
             &closed,
         ));
-        assert!(
-            chats.is_empty(),
-            "closing the terminal removes its chat row"
+        assert!(chats.is_empty());
+    }
+
+    #[test]
+    fn agent_restart_after_brief_exit_reuses_the_chat_row() {
+        let item_id = EntityId::from(44_u64);
+        let running = observed_workspace(
+            Some(observation(item_id, AgentKind::OpenCode, "", "")),
+            item_id,
+            false,
+        );
+        let shell = observed_workspace(None, item_id, false);
+        let mut chats = HashMap::new();
+        let mut sequence = 0;
+
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &running);
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &shell);
+        reconcile_agent_chats_for_workspace(&mut chats, &mut sequence, 7, &running);
+
+        let chat = chats.get(&(7, item_id)).unwrap();
+        assert_eq!(chat.state, AgentChatState::Open);
+        assert_eq!(
+            chat.missing_refreshes, 0,
+            "a returning process resets the exit hysteresis"
         );
     }
 
