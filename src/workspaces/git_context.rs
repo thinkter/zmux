@@ -82,7 +82,7 @@ fn git_root_is_referenced<'a>(
 ) -> bool {
     roots_by_workspace
         .into_iter()
-        .any(|roots| roots.iter().any(|candidate| candidate == root))
+        .any(|roots| roots.iter().any(|candidate| paths_match(candidate, root)))
 }
 
 fn plan_git_root_reconciliation(
@@ -111,10 +111,11 @@ fn reconcile_selected_git_root(
     if discovery != GitDiscoveryState::Authoritative {
         return;
     }
-    if selected
-        .as_ref()
-        .is_none_or(|root| !discovered_roots.contains(root))
-    {
+    if selected.as_ref().is_none_or(|root| {
+        !discovered_roots
+            .iter()
+            .any(|discovered| paths_match(root, discovered))
+    }) {
         *selected = discovered_roots.first().cloned();
     }
 }
@@ -193,9 +194,12 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
             .repositories()
             .values()
             .filter(|repo| {
-                roots
-                    .iter()
-                    .any(|root| repo.read(cx).snapshot().work_directory_abs_path.as_ref() == root)
+                roots.iter().any(|root| {
+                    paths_match(
+                        repo.read(cx).snapshot().work_directory_abs_path.as_ref(),
+                        root,
+                    )
+                })
             })
             .cloned()
             .collect()
@@ -312,7 +316,11 @@ impl WorkspacesPanel {
             .entries
             .iter_mut()
             .find(|entry| entry.id == self.active)
-            && entry.context.git_roots.contains(&root)
+            && entry
+                .context
+                .git_roots
+                .iter()
+                .any(|candidate| paths_match(candidate, &root))
         {
             entry.selected_git_root = Some(root);
             self.request_metadata_refreshes(cx);
@@ -323,10 +331,23 @@ impl WorkspacesPanel {
 
     pub(super) fn workspace_id_for_git_root(&self, path: &Path) -> Option<WorkspaceId> {
         self.entries.iter().find_map(|entry| {
-            (entry.selected_git_root.as_deref() == Some(path)
-                || entry.default_directory.as_deref() == Some(path)
-                || entry.worktree_paths.iter().any(|root| root == path)
-                || entry.context.git_roots.iter().any(|root| root == path))
+            (entry
+                .selected_git_root
+                .as_deref()
+                .is_some_and(|root| paths_match(root, path))
+                || entry
+                    .default_directory
+                    .as_deref()
+                    .is_some_and(|root| paths_match(root, path))
+                || entry
+                    .worktree_paths
+                    .iter()
+                    .any(|root| paths_match(root, path))
+                || entry
+                    .context
+                    .git_roots
+                    .iter()
+                    .any(|root| paths_match(root, path)))
             .then_some(entry.id)
         })
     }
@@ -425,7 +446,7 @@ impl WorkspacesPanel {
             let existing = project
                 .read(cx)
                 .worktrees(cx)
-                .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path());
+                .find(|worktree| paths_match(worktree.read(cx).abs_path().as_ref(), &root));
             let task = if let Some(worktree) = existing {
                 Task::ready(Ok(worktree))
             } else {
@@ -528,7 +549,12 @@ impl WorkspacesPanel {
             .read(cx)
             .repositories()
             .values()
-            .find(|repo| repo.read(cx).snapshot().work_directory_abs_path.as_ref() == root)
+            .find(|repo| {
+                paths_match(
+                    repo.read(cx).snapshot().work_directory_abs_path.as_ref(),
+                    root,
+                )
+            })
             .cloned();
         if let Some(repository) = repository {
             repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
@@ -665,7 +691,21 @@ fn nearest_git_root(directory: &Path) -> Option<PathBuf> {
     directory
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())
-        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+        .map(Path::to_path_buf)
+}
+
+/// Compare existing filesystem paths without replacing their user-visible form.
+///
+/// `canonicalize` rewrites `/var` to `/private/var` on macOS and may introduce
+/// verbatim (`\\?\`) or long-name paths on Windows. Those are useful identity
+/// keys, but persisting them changes workspace labels and breaks equality with
+/// shell-reported paths, so canonicalization is confined to comparison.
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .zip(std::fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
 }
 
 #[cfg(test)]
@@ -673,13 +713,25 @@ mod tests {
     use super::*;
     use crate::session::{LayoutNodeSnapshot, LayoutSnapshot, TerminalSnapshot};
 
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_matches_aliases_without_rewriting_logical_paths() {
+        let base =
+            std::env::temp_dir().join(format!("zmux-path-identity-{}", uuid::Uuid::new_v4()));
+        let physical = base.join("physical");
+        let logical = base.join("logical");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &logical).unwrap();
+
+        assert!(paths_match(&logical, &physical));
+        assert_ne!(logical, physical);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn git_context_keeps_independent_roots_and_ignores_non_repo_terminals() {
-        let base = std::env::temp_dir().join(format!(
-            "zmux-git-context-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let base = std::env::temp_dir().join(format!("zmux-git-context-{}", uuid::Uuid::new_v4()));
         let repo_a = base.join("a");
         let repo_b = base.join("b");
         let outside = base.join("outside");

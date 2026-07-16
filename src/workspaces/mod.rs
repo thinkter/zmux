@@ -450,7 +450,6 @@ impl WorkspacesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(id) = self.workspace_id_for_git_root(&path) {
             self.activate_workspace(id, window, cx);
             return;

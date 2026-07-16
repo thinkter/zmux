@@ -424,6 +424,15 @@ mod tests {
             ),
         ]);
         let mut command = metadata_git_command_with_environment(repository.path(), inherited);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-c", "core.fsmonitor=false"]),
+            "automatic Git commands must disable repository fsmonitor hooks"
+        );
         assert!(
             command
                 .get_envs()
@@ -460,31 +469,43 @@ mod tests {
         let sentinel = repository.path().join(".git/metadata-helper-ran");
         let helper = write_sentinel_helper(repository.path());
 
-        // First prove that each configured helper is executable in this real
-        // repository. The sentinel is then cleared before hardened collection.
+        // Unix Git reliably executes a configured path as an fsmonitor hook,
+        // so prove every sentinel helper works before testing the hardened
+        // collector. Git for Windows no longer reliably treats a `.cmd` path
+        // as an external fsmonitor hook; there the command-construction
+        // assertion above plus the hostile configuration below verifies the
+        // boundary without depending on that Git-version detail.
+        #[cfg(unix)]
+        {
+            git_config(repository.path(), "core.fsmonitor", helper.as_os_str());
+            git(repository.path(), ["status", "--porcelain=v1"]);
+            assert!(sentinel.exists(), "fsmonitor sentinel did not execute");
+            fs::remove_file(&sentinel).unwrap();
+            git(repository.path(), ["config", "--unset", "core.fsmonitor"]);
+
+            git_config(repository.path(), "diff.external", helper.as_os_str());
+            git(repository.path(), ["diff", "HEAD", "--"]);
+            assert!(sentinel.exists(), "external diff sentinel did not execute");
+            fs::remove_file(&sentinel).unwrap();
+            git(repository.path(), ["config", "--unset", "diff.external"]);
+
+            git_config(
+                repository.path(),
+                "diff.sentinel.textconv",
+                helper.as_os_str(),
+            );
+            git(repository.path(), ["diff", "--textconv", "HEAD", "--"]);
+            assert!(sentinel.exists(), "textconv sentinel did not execute");
+            fs::remove_file(&sentinel).unwrap();
+        }
+
         git_config(repository.path(), "core.fsmonitor", helper.as_os_str());
-        git(repository.path(), ["status", "--porcelain=v1"]);
-        assert!(sentinel.exists(), "fsmonitor sentinel did not execute");
-        fs::remove_file(&sentinel).unwrap();
-        git(repository.path(), ["config", "--unset", "core.fsmonitor"]);
-
         git_config(repository.path(), "diff.external", helper.as_os_str());
-        git(repository.path(), ["diff", "HEAD", "--"]);
-        assert!(sentinel.exists(), "external diff sentinel did not execute");
-        fs::remove_file(&sentinel).unwrap();
-        git(repository.path(), ["config", "--unset", "diff.external"]);
-
         git_config(
             repository.path(),
             "diff.sentinel.textconv",
             helper.as_os_str(),
         );
-        git(repository.path(), ["diff", "--textconv", "HEAD", "--"]);
-        assert!(sentinel.exists(), "textconv sentinel did not execute");
-        fs::remove_file(&sentinel).unwrap();
-
-        git_config(repository.path(), "core.fsmonitor", helper.as_os_str());
-        git_config(repository.path(), "diff.external", helper.as_os_str());
         let MetadataState::Ready(metadata) = collect_git_metadata(repository.path()) else {
             panic!("expected hardened Git metadata to be available");
         };
