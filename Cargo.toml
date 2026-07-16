@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/alacritty_terminal", "vendor/terminal_view", "vendor/vte", "vendor/workspace"]
+exclude = ["vendor/alacritty_terminal", "vendor/terminal", "vendor/terminal_view", "vendor/vte", "vendor/workspace"]
 
 [workspace.dependencies]
 agent_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -98,6 +98,7 @@ windows-capture = { git = "https://github.com/zed-industries/windows-capture.git
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
 
 [patch."https://github.com/zed-industries/zed"]
+terminal = { path = "vendor/terminal" }
 terminal_view = { path = "vendor/terminal_view" }
 workspace = { path = "vendor/workspace" }
 
@@ -183,3 +184,8 @@ terminal = { workspace = true, features = ["test-support"] }
 [profile.release]
 strip = "symbols"
 panic = "abort"
+# Thin LTO + a single codegen unit shrink the statically-linked Zed dependency
+# graph substantially and improve runtime code quality; fat LTO was rejected
+# because link memory/time explode on a graph this large for marginal gains.
+lto = "thin"
+codegen-units = 1

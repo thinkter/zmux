@@ -243,8 +243,16 @@ fn outcome(signal: DetectionSignal, evidence: &'static str) -> DetectionOutcome 
     DetectionOutcome { signal, evidence }
 }
 
+/// Allocation-free ASCII-folding search. Non-ASCII bytes (such as UI arrows)
+/// are compared exactly, and this runs on every 300ms detection tick.
 fn contains_ci(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn starts_with_braille_spinner(text: &str) -> bool {
@@ -266,7 +274,7 @@ fn after_last_line_marker(content: &str, marker: impl Fn(&str) -> bool) -> &str 
         .match_indices('\n')
         .map(|(index, _)| index + 1)
         .chain(std::iter::once(0))
-        .filter(|offset| marker(&content[*offset..].lines().next().unwrap_or_default()))
+        .filter(|offset| marker(content[*offset..].lines().next().unwrap_or_default()))
         .max();
     offset.map_or(content, |offset| {
         let line_end = content[offset..]

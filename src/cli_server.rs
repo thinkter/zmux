@@ -49,7 +49,9 @@ const MAX_REGISTERED_ROUTES: usize = 4_096;
 const CONNECTION_QUEUE_CAPACITY: usize = 64;
 const NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 const WORKER_COUNT: usize = 4;
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+// The accept socket stays nonblocking so shutdown is observable; 100ms bounds
+// idle wakeups at 10/s while adding imperceptible latency to CLI deliveries.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESSING_TIMEOUT: Duration = Duration::from_secs(3);

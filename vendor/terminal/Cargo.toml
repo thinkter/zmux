@@ -1,0 +1,77 @@
+[package]
+name = "terminal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+# This crate is vendored from Zed, where it normally inherits the workspace
+# lint policy. Keep the release-relevant subset local so a re-vendor cannot
+# silently drop correctness lints or turn upstream style lints into failures.
+[lints.rust]
+unexpected_cfgs = "allow"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+declare_interior_mutable_const = "deny"
+redundant_clone = "deny"
+disallowed_methods = "deny"
+style = { level = "allow", priority = -1 }
+type_complexity = "allow"
+let_underscore_future = "allow"
+single_range_in_vec_init = "allow"
+too_many_arguments = "allow"
+large_enum_variant = "allow"
+nonminimal_bool = "allow"
+
+[workspace]
+
+[features]
+test-support = [
+    "collections/test-support",
+    "gpui/test-support",
+    "settings/test-support",
+]
+
+[lib]
+path = "src/terminal.rs"
+doctest = false
+
+[dependencies]
+async-channel = "2.5.0"
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
+anyhow = "1.0.86"
+collections = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+futures = "0.3.32"
+futures-lite = "1.13"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+itertools = "0.14.0"
+libc = "0.2"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+regex = "1.5"
+release_channel = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+schemars = { version = "1.0", features = ["indexmap2"] }
+serde = { version = "1.0.221", features = ["derive", "rc"] }
+settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+sysinfo = "0.37.0"
+task = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+theme = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+theme_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+thiserror = "2.0.12"
+url = "2.2"
+util = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+urlencoding = "2.1.2"
+vte = { version = "0.15.0", features = ["ansi"] }
+parking_lot = "0.12.1"
+percent-encoding = "2.3.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = "0.61"
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187", features = ["test-support"] }
+rand = "0.9"
+settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187", features = ["test-support"] }
+util_macros = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }

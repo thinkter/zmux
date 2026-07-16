@@ -11378,7 +11378,6 @@ dependencies = [
 [[package]]
 name = "terminal"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
