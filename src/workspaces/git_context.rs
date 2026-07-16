@@ -1105,6 +1105,9 @@ mod tests {
                 panel.update(cx, |panel, cx| panel.activate_workspace(2, window, cx));
             })
             .expect("window should remain open");
+        // The terminal process-info cache is deliberately refreshed on a
+        // short delay. Wait for the restored cwd, not merely the bounded
+        // incomplete-context fallback becoming authoritative.
         for _ in 0..200 {
             cx.run_until_parked();
             panel.update(cx, |panel, cx| panel.refresh_workspace_contexts(cx));
@@ -1113,7 +1116,10 @@ mod tests {
                     .entries
                     .iter()
                     .find(|entry| entry.id == 2)
-                    .is_some_and(|entry| entry.git_discovery == GitDiscoveryState::Authoritative)
+                    .is_some_and(|entry| {
+                        entry.git_discovery == GitDiscoveryState::Authoritative
+                            && entry.context.git_roots == vec![selected.clone()]
+                    })
             }) {
                 break;
             }
