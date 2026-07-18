@@ -15,6 +15,7 @@ mod session;
 mod settings_page;
 mod syntax;
 mod theme;
+mod visual_power;
 mod welcome;
 mod workspace_switcher;
 mod workspaces;

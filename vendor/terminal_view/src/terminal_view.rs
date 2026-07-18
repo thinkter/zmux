@@ -11,8 +11,9 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EntityId, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, Font, Global, KeyContext, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled,
-    Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
+    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, ReadGlobal, Render, ScrollWheelEvent,
+    Styled, Subscription, Task, TaskExt, UpdateGlobal, WeakEntity, actions, anchored, deferred,
+    div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -26,6 +27,7 @@ use std::{
     any::Any,
     cell::RefCell,
     cmp,
+    collections::HashSet,
     ops::Range as StdRange,
     path::{Path, PathBuf},
     rc::Rc,
@@ -77,6 +79,7 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const LOW_POWER_FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_334);
 const ZMUX_SHELL_TASK_ID_PREFIX: &str = "zmux-shell-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +87,130 @@ enum OutputPacingAction {
     NotifyAndScheduleFrame,
     Suppress,
     Idle,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct TerminalVisualPowerState {
+    pub low_power: bool,
+    hidden_windows: Arc<HashSet<u64>>,
+}
+
+impl Global for TerminalVisualPowerState {}
+
+#[doc(hidden)]
+pub fn set_visual_power_state(state: TerminalVisualPowerState, cx: &mut App) {
+    if !cx.has_global::<TerminalVisualPowerState>() {
+        TerminalVisualPowerState::set_global(cx, state);
+    } else if TerminalVisualPowerState::global(cx) != &state {
+        TerminalVisualPowerState::update_global(cx, |current, _cx| *current = state);
+    }
+}
+
+impl TerminalVisualPowerState {
+    #[doc(hidden)]
+    pub fn new(hidden_windows: impl IntoIterator<Item = u64>, low_power: bool) -> Self {
+        Self {
+            low_power,
+            hidden_windows: Arc::new(hidden_windows.into_iter().collect()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn window_hidden(&self, window_id: u64) -> bool {
+        self.hidden_windows.contains(&window_id)
+    }
+}
+
+#[doc(hidden)]
+pub fn visual_power_state(cx: &App) -> TerminalVisualPowerState {
+    cx.try_global::<TerminalVisualPowerState>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TerminalVisualPowerWindowState {
+    hidden: bool,
+    low_power: bool,
+}
+
+impl TerminalVisualPowerState {
+    fn for_window(&self, window_id: u64) -> TerminalVisualPowerWindowState {
+        TerminalVisualPowerWindowState {
+            hidden: self.window_hidden(window_id),
+            low_power: self.low_power,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualPowerTransition {
+    Hide,
+    ResumeInvalidated,
+    Repaint,
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BreadcrumbUpdateEvent {
+    Invalidate,
+    Resume,
+}
+
+/// Latch breadcrumb churn while a window is hidden and release at most one
+/// workspace update when it becomes visible again.
+fn reduce_breadcrumb_update(
+    pending: &mut bool,
+    hidden: bool,
+    event: BreadcrumbUpdateEvent,
+) -> bool {
+    match event {
+        BreadcrumbUpdateEvent::Invalidate if hidden => {
+            *pending = true;
+            false
+        }
+        BreadcrumbUpdateEvent::Invalidate => true,
+        BreadcrumbUpdateEvent::Resume => {
+            let emit = !hidden && *pending;
+            if !hidden {
+                *pending = false;
+            }
+            emit
+        }
+    }
+}
+
+fn visual_power_transition(
+    previous: TerminalVisualPowerWindowState,
+    next: TerminalVisualPowerWindowState,
+    hidden_output_invalidated: bool,
+) -> VisualPowerTransition {
+    if previous == next {
+        VisualPowerTransition::Unchanged
+    } else if next.hidden {
+        VisualPowerTransition::Hide
+    } else if previous.hidden && hidden_output_invalidated {
+        VisualPowerTransition::ResumeInvalidated
+    } else {
+        VisualPowerTransition::Repaint
+    }
+}
+
+fn cursor_blink_allowed(
+    state: TerminalVisualPowerWindowState,
+    focused: bool,
+    setting: TerminalBlink,
+    terminal_controlled: bool,
+) -> bool {
+    focused
+        && !state.hidden
+        && !state.low_power
+        && match setting {
+            TerminalBlink::Off => false,
+            TerminalBlink::On => true,
+            TerminalBlink::TerminalControlled => terminal_controlled,
+        }
 }
 
 /// Coalesces terminal output invalidations to the display cadence without
@@ -238,6 +365,7 @@ pub struct TerminalView {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
     focus_handle: FocusHandle,
+    focused: bool,
     //Currently using iTerm bell, show bell emoji in tab until input is received
     has_bell: bool,
     context_menu: Option<(Entity<ContextMenu>, GpuiPoint<Pixels>, Subscription)>,
@@ -257,6 +385,10 @@ pub struct TerminalView {
     ime_state: Option<ImeState>,
     pub(crate) render_cache: RefCell<TerminalRenderCache>,
     output_frame_pacer: TerminalOutputFramePacer,
+    window_id: u64,
+    visual_power_state: TerminalVisualPowerWindowState,
+    hidden_output_invalidated: bool,
+    hidden_breadcrumbs_invalidated: bool,
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
@@ -501,7 +633,9 @@ impl TerminalView {
             focus_out,
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
+            cx.observe_global::<TerminalVisualPowerState>(Self::visual_power_changed),
         ];
+        let focused = focus_handle.is_focused(window);
 
         Self {
             terminal,
@@ -509,6 +643,7 @@ impl TerminalView {
             project,
             has_bell: false,
             focus_handle,
+            focused,
             context_menu: None,
             cursor_shape,
             blink_manager,
@@ -526,6 +661,11 @@ impl TerminalView {
             ime_state: None,
             render_cache: RefCell::new(TerminalRenderCache::default()),
             output_frame_pacer: TerminalOutputFramePacer::default(),
+            window_id: window.window_handle().window_id().as_u64(),
+            visual_power_state: visual_power_state(cx)
+                .for_window(window.window_handle().window_id().as_u64()),
+            hidden_output_invalidated: false,
+            hidden_breadcrumbs_invalidated: false,
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
@@ -792,11 +932,12 @@ impl TerminalView {
         let breadcrumb_visibility_changed = self.show_breadcrumbs != settings.toolbar.breadcrumbs;
         self.show_breadcrumbs = settings.toolbar.breadcrumbs;
 
-        let should_blink = match settings.blinking {
-            TerminalBlink::Off => false,
-            TerminalBlink::On => true,
-            TerminalBlink::TerminalControlled => self.blinking_terminal_enabled,
-        };
+        let should_blink = cursor_blink_allowed(
+            self.visual_power_state,
+            self.focused,
+            settings.blinking,
+            self.blinking_terminal_enabled,
+        );
         let new_cursor_shape = settings.cursor_shape;
         let old_cursor_shape = self.cursor_shape;
         if old_cursor_shape != new_cursor_shape {
@@ -816,9 +957,64 @@ impl TerminalView {
         );
 
         if breadcrumb_visibility_changed {
-            cx.emit(ItemEvent::UpdateBreadcrumbs);
+            self.invalidate_breadcrumbs(cx);
         }
         cx.notify();
+    }
+
+    fn visual_power_changed(&mut self, cx: &mut Context<Self>) {
+        let previous = self.visual_power_state;
+        let next = visual_power_state(cx).for_window(self.window_id);
+        let transition = visual_power_transition(previous, next, self.hidden_output_invalidated);
+        if transition == VisualPowerTransition::Unchanged {
+            return;
+        }
+        let resumed = previous.hidden && !next.hidden;
+        self.visual_power_state = next;
+        if next.hidden || next.low_power {
+            self.blink_manager.update(cx, BlinkManager::disable);
+        } else {
+            let should_blink = cursor_blink_allowed(
+                next,
+                self.focused,
+                TerminalSettings::get_global(cx).blinking,
+                self.blinking_terminal_enabled,
+            );
+            if should_blink {
+                self.blink_manager.update(cx, BlinkManager::enable);
+            }
+        }
+        if transition == VisualPowerTransition::Hide {
+            self.hover = None;
+            self.hover_tooltip_update = Task::ready(());
+            self.output_frame_pacer.reset();
+            return;
+        }
+        if transition == VisualPowerTransition::ResumeInvalidated {
+            self.hidden_output_invalidated = false;
+            self.emit_output_invalidation(cx);
+        } else {
+            cx.notify();
+        }
+        if resumed
+            && reduce_breadcrumb_update(
+                &mut self.hidden_breadcrumbs_invalidated,
+                next.hidden,
+                BreadcrumbUpdateEvent::Resume,
+            )
+        {
+            cx.emit(ItemEvent::UpdateBreadcrumbs);
+        }
+    }
+
+    fn invalidate_breadcrumbs(&mut self, cx: &mut Context<Self>) {
+        if reduce_breadcrumb_update(
+            &mut self.hidden_breadcrumbs_invalidated,
+            self.visual_power_state.hidden,
+            BreadcrumbUpdateEvent::Invalidate,
+        ) {
+            cx.emit(ItemEvent::UpdateBreadcrumbs);
+        }
     }
 
     fn show_character_palette(
@@ -1035,6 +1231,10 @@ impl TerminalView {
             if !focused {
                 return false;
             }
+        }
+
+        if self.visual_power_state.hidden || self.visual_power_state.low_power {
+            return true;
         }
 
         // For Standalone mode: always show cursor when not focused or in special modes
@@ -1282,6 +1482,10 @@ impl TerminalView {
     }
 
     fn terminal_output_arrived(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visual_power_state.hidden {
+            self.hidden_output_invalidated = true;
+            return;
+        }
         if self.output_frame_pacer.output_arrived() == OutputPacingAction::NotifyAndScheduleFrame {
             self.emit_output_invalidation(cx);
             self.schedule_output_frame(window, cx);
@@ -1311,9 +1515,22 @@ impl TerminalView {
 
     fn schedule_output_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let generation = self.output_frame_pacer.generation();
-        cx.on_next_frame(window, move |this, window, cx| {
-            this.output_frame_rendered(generation, window, cx);
-        });
+        if self.visual_power_state.low_power {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(LOW_POWER_FRAME_INTERVAL)
+                    .await;
+                this.update_in(cx, |this, window, cx| {
+                    this.output_frame_rendered(generation, window, cx);
+                })
+                .ok();
+            })
+            .detach();
+        } else {
+            cx.on_next_frame(window, move |this, window, cx| {
+                this.output_frame_rendered(generation, window, cx);
+            });
+        }
     }
 
     fn rerun_button(task: &TaskState) -> Option<IconButton> {
@@ -1351,7 +1568,13 @@ fn subscribe_for_terminal_events(
     window: &mut Window,
     cx: &mut Context<TerminalView>,
 ) -> Vec<Subscription> {
-    let terminal_subscription = cx.observe(terminal, |_, _, cx| cx.notify());
+    let terminal_subscription = cx.observe(terminal, |terminal_view, _, cx| {
+        if terminal_view.visual_power_state.hidden {
+            terminal_view.hidden_output_invalidated = true;
+        } else {
+            cx.notify();
+        }
+    });
     let mut previous_cwd = None;
     let terminal_events_subscription = cx.subscribe_in(
         terminal,
@@ -1373,7 +1596,11 @@ fn subscribe_for_terminal_events(
                     if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
                         window.play_system_bell();
                     }
-                    cx.emit(Event::Wakeup);
+                    if terminal_view.visual_power_state.hidden {
+                        terminal_view.hidden_output_invalidated = true;
+                    } else {
+                        cx.emit(Event::Wakeup);
+                    }
                 }
 
                 Event::BlinkChanged(blinking) => {
@@ -1384,6 +1611,8 @@ fn subscribe_for_terminal_events(
                         TerminalSettings::get_global(cx).blinking,
                         TerminalBlink::TerminalControlled
                     ) && terminal_view.focus_handle.is_focused(window)
+                        && !terminal_view.visual_power_state.hidden
+                        && !terminal_view.visual_power_state.low_power
                     {
                         terminal_view.blink_manager.update(cx, |manager, cx| {
                             if *blinking {
@@ -1396,10 +1625,19 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::TitleChanged => {
-                    cx.emit(ItemEvent::UpdateTab);
+                    if terminal_view.visual_power_state.hidden {
+                        terminal_view.hidden_output_invalidated = true;
+                    } else {
+                        cx.emit(ItemEvent::UpdateTab);
+                    }
                 }
 
                 Event::NewNavigationTarget(maybe_navigation_target) => {
+                    if terminal_view.visual_power_state.hidden {
+                        terminal_view.hover = None;
+                        terminal_view.hover_tooltip_update = Task::ready(());
+                        return;
+                    }
                     match maybe_navigation_target
                         .as_ref()
                         .zip(terminal.read(cx).last_content.last_hovered_word.as_ref())
@@ -1454,7 +1692,7 @@ fn subscribe_for_terminal_events(
                         cx,
                     ),
                 },
-                Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
+                Event::BreadcrumbsChanged => terminal_view.invalidate_breadcrumbs(cx),
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
@@ -1522,16 +1760,18 @@ impl TerminalView {
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = true;
         self.terminal.update(cx, |terminal, _| {
             terminal.set_cursor_shape(self.cursor_shape);
             terminal.focus_in();
         });
 
-        let should_blink = match TerminalSettings::get_global(cx).blinking {
-            TerminalBlink::Off => false,
-            TerminalBlink::On => true,
-            TerminalBlink::TerminalControlled => self.blinking_terminal_enabled,
-        };
+        let should_blink = cursor_blink_allowed(
+            self.visual_power_state,
+            self.focused,
+            TerminalSettings::get_global(cx).blinking,
+            self.blinking_terminal_enabled,
+        );
 
         if should_blink {
             self.blink_manager.update(cx, BlinkManager::enable);
@@ -1542,6 +1782,7 @@ impl TerminalView {
     }
 
     fn focus_out(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = false;
         self.blink_manager.update(cx, BlinkManager::disable);
         self.terminal.update(cx, |terminal, _| {
             terminal.focus_out();
@@ -2488,6 +2729,93 @@ mod tests {
     use util::rel_path::RelPath;
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
+
+    #[test]
+    fn visual_power_transition_coalesces_hidden_output_and_repaints_on_resume() {
+        let visible = TerminalVisualPowerWindowState::default();
+        let hidden = TerminalVisualPowerWindowState {
+            hidden: true,
+            low_power: false,
+        };
+        let low_power = TerminalVisualPowerWindowState {
+            hidden: false,
+            low_power: true,
+        };
+
+        assert_eq!(
+            visual_power_transition(visible, hidden, false),
+            VisualPowerTransition::Hide
+        );
+        assert_eq!(
+            visual_power_transition(hidden, hidden, true),
+            VisualPowerTransition::Unchanged
+        );
+        assert_eq!(
+            visual_power_transition(hidden, visible, true),
+            VisualPowerTransition::ResumeInvalidated
+        );
+        assert_eq!(
+            visual_power_transition(hidden, low_power, false),
+            VisualPowerTransition::Repaint
+        );
+        assert!(cursor_blink_allowed(
+            visible,
+            true,
+            TerminalBlink::On,
+            false
+        ));
+        assert!(!cursor_blink_allowed(
+            visible,
+            false,
+            TerminalBlink::On,
+            false
+        ));
+        assert!(!cursor_blink_allowed(
+            low_power,
+            true,
+            TerminalBlink::On,
+            false
+        ));
+    }
+
+    #[test]
+    fn breadcrumb_updates_coalesce_while_hidden_and_emit_once_on_resume() {
+        for hidden_output_invalidated in [false, true] {
+            let mut pending = false;
+            for _ in 0..3 {
+                assert!(!reduce_breadcrumb_update(
+                    &mut pending,
+                    true,
+                    BreadcrumbUpdateEvent::Invalidate,
+                ));
+            }
+            assert!(pending);
+
+            let transition = visual_power_transition(
+                TerminalVisualPowerWindowState {
+                    hidden: true,
+                    low_power: false,
+                },
+                TerminalVisualPowerWindowState::default(),
+                hidden_output_invalidated,
+            );
+            assert!(matches!(
+                transition,
+                VisualPowerTransition::Repaint | VisualPowerTransition::ResumeInvalidated
+            ));
+            assert!(reduce_breadcrumb_update(
+                &mut pending,
+                false,
+                BreadcrumbUpdateEvent::Resume,
+            ));
+            assert!(!pending);
+            assert!(!reduce_breadcrumb_update(
+                &mut pending,
+                false,
+                BreadcrumbUpdateEvent::Resume,
+            ));
+        }
+    }
 
     #[test]
     fn terminal_output_frame_pacer_notifies_immediately_then_stops_when_idle() {

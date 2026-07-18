@@ -67,6 +67,7 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     if let Err(error) = crate::fonts::load_embedded_fonts(cx) {
         eprintln!("failed to load embedded fonts: {error:#}");
     }
+    crate::visual_power::MacVisualPowerMonitor::init(cx);
 
     settings::init(cx);
     theme_settings::init(theme::LoadThemes::JustBase, cx);
