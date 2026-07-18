@@ -1,27 +1,25 @@
 //! The agent chat rail's state machine.
 //!
-//! Observes terminals for known agent CLI processes (sampled every 300ms by
-//! [`super::WorkspacesPanel`]'s agent refresh loop), reconciles them into
+//! Observes terminals for known agent CLI processes when terminal events mark
+//! them dirty, reconciles them into
 //! per-workspace [`AgentChat`] rows, and applies hysteresis: settled-state
 //! transitions and exited-agent row removal both require
 //! `AGENT_STATE_CONFIRMATIONS` consecutive confirming refreshes, so a single
 //! transient sampling miss never flaps or tears down a live chat row.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use gpui::EntityId;
+use gpui::{App, Entity, EntityId};
 use terminal_view::TerminalView;
 use ui::prelude::*;
-use workspace::Workspace;
-use workspace::item::ItemHandle;
 
 use crate::agent_detection::{
     AgentKind, AgentSnapshot, DetectionSignal, detect_agent, sanitized_osc_title, submitted_prompt,
 };
 use crate::notifications::WorkspaceId;
-
-use super::persistence::StoredLayout;
 
 const AGENT_DETECTION_TAIL_LINES: usize = 80;
 const AGENT_STATE_CONFIRMATIONS: u8 = 2;
@@ -100,54 +98,42 @@ pub(super) struct AgentChat {
     pub(super) pending_confirmations: u8,
 }
 
-pub(super) fn agent_observation_for_active_workspace(
-    workspace: &Workspace,
+/// Reconcile a single dirty terminal without sampling any of its siblings.
+///
+/// The workspace-wide reconciliation remains useful for tests and initial
+/// recovery, but output events use this path so a busy shell does not make us
+/// reconstruct agent snapshots for every terminal in every parked workspace.
+pub(super) fn reconcile_agent_chat_for_terminal(
+    chats: &mut HashMap<(WorkspaceId, EntityId), AgentChat>,
+    next_activity_sequence: &mut u64,
+    workspace_id: WorkspaceId,
+    item_id: EntityId,
+    terminal_view: &Entity<TerminalView>,
+    focused: bool,
     cx: &App,
-) -> AgentWorkspaceObservation {
+) -> bool {
     let mut observed = AgentWorkspaceObservation {
-        active_item_id: workspace.active_item(cx).map(|item| item.item_id()),
+        terminal_item_ids: vec![item_id],
+        active_item_id: focused.then_some(item_id),
         ..AgentWorkspaceObservation::default()
     };
-    for pane in workspace.panes() {
-        for item in pane.read(cx).items() {
-            add_item_to_agent_observation(item.as_ref(), &mut observed, cx);
-        }
-    }
-    observed
+    add_terminal_view_to_agent_observation(item_id, terminal_view, &mut observed, cx);
+    reconcile_agent_chat_for_observation(
+        chats,
+        next_activity_sequence,
+        workspace_id,
+        item_id,
+        observed.agents.first(),
+        focused,
+    )
 }
 
-pub(super) fn agent_observation_for_stored_layout(
-    layout: &StoredLayout,
-    cx: &App,
-) -> AgentWorkspaceObservation {
-    fn visit(layout: &StoredLayout, observed: &mut AgentWorkspaceObservation, cx: &App) {
-        match layout {
-            StoredLayout::Leaf { items, .. } => {
-                for item in items {
-                    add_item_to_agent_observation(item.as_ref(), observed, cx);
-                }
-            }
-            StoredLayout::Split { first, second, .. } => {
-                visit(first, observed, cx);
-                visit(second, observed, cx);
-            }
-        }
-    }
-
-    let mut observed = AgentWorkspaceObservation::default();
-    visit(layout, &mut observed, cx);
-    observed
-}
-
-fn add_item_to_agent_observation(
-    item: &dyn ItemHandle,
+fn add_terminal_view_to_agent_observation(
+    item_id: EntityId,
+    terminal_view: &Entity<TerminalView>,
     observed: &mut AgentWorkspaceObservation,
     cx: &App,
 ) {
-    let Some(terminal_view) = item.act_as::<TerminalView>(cx) else {
-        return;
-    };
-    observed.terminal_item_ids.push(item.item_id());
     let (custom_title, terminal) = {
         let terminal_view = terminal_view.read(cx);
         (
@@ -171,7 +157,7 @@ fn add_item_to_agent_observation(
     };
     observed.agents.push(AgentObservation {
         kind,
-        item_id: item.item_id(),
+        item_id,
         custom_title,
         osc_title: terminal.breadcrumb_text.clone(),
         recent,
@@ -179,8 +165,115 @@ fn add_item_to_agent_observation(
     });
 }
 
+fn reconcile_agent_chat_for_observation(
+    chats: &mut HashMap<(WorkspaceId, EntityId), AgentChat>,
+    next_activity_sequence: &mut u64,
+    workspace_id: WorkspaceId,
+    item_id: EntityId,
+    agent: Option<&AgentObservation>,
+    focused: bool,
+) -> bool {
+    let key = (workspace_id, item_id);
+    let Some(agent) = agent else {
+        let Some(chat) = chats.get_mut(&key) else {
+            return false;
+        };
+        chat.missing_refreshes = chat.missing_refreshes.saturating_add(1);
+        if chat.missing_refreshes < AGENT_STATE_CONFIRMATIONS {
+            return false;
+        }
+        chats.remove(&key);
+        return true;
+    };
+
+    if let Some(chat) = chats.get_mut(&key) {
+        let mut changed = false;
+        if chat.kind != agent.kind {
+            chat.kind = agent.kind;
+            chat.prompt_snippet = None;
+            chat.state = if agent.kind.has_detailed_detection() {
+                AgentChatState::Quiet
+            } else {
+                AgentChatState::Open
+            };
+            chat.seen = true;
+            chat.had_active_turn = false;
+            chat.pending_state = None;
+            chat.pending_confirmations = 0;
+            chat.activity_sequence = next_agent_activity_sequence(next_activity_sequence);
+            changed = true;
+        }
+        if chat.custom_title != agent.custom_title {
+            chat.custom_title.clone_from(&agent.custom_title);
+            changed = true;
+        }
+        let osc_title = sanitized_osc_title(agent.kind, &agent.osc_title);
+        if chat.osc_title != osc_title {
+            chat.osc_title = osc_title;
+            changed = true;
+        }
+        if chat.cwd != agent.cwd {
+            chat.cwd.clone_from(&agent.cwd);
+            changed = true;
+        }
+        if chat.focused != focused {
+            chat.focused = focused;
+            changed = true;
+        }
+        if focused && chat.state == AgentChatState::Idle && !chat.seen {
+            chat.seen = true;
+            changed = true;
+        }
+        chat.missing_refreshes = 0;
+        return changed | apply_agent_observation(chat, agent, next_activity_sequence);
+    }
+
+    let sequence = next_agent_activity_sequence(next_activity_sequence);
+    let outcome = agent.kind.has_detailed_detection().then(|| {
+        detect_agent(
+            agent.kind,
+            AgentSnapshot {
+                recent: &agent.recent,
+                osc_title: &agent.osc_title,
+            },
+        )
+    });
+    let state = outcome.map_or(AgentChatState::Open, |outcome| {
+        chat_state_for_signal(outcome.signal).unwrap_or(AgentChatState::Quiet)
+    });
+    chats.insert(
+        key,
+        AgentChat {
+            workspace_id,
+            kind: agent.kind,
+            item_id,
+            custom_title: agent.custom_title.clone(),
+            osc_title: sanitized_osc_title(agent.kind, &agent.osc_title),
+            prompt_snippet: (state == AgentChatState::Working)
+                .then(|| submitted_prompt(agent.kind, &agent.recent))
+                .flatten(),
+            cwd: agent.cwd.clone(),
+            state,
+            seen: true,
+            focused,
+            had_active_turn: matches!(state, AgentChatState::Working | AgentChatState::NeedsInput),
+            creation_sequence: sequence,
+            activity_sequence: sequence,
+            missing_refreshes: 0,
+            pending_state: None,
+            pending_confirmations: 0,
+        },
+    );
+    true
+}
+
+pub(super) fn agent_chat_needs_follow_up(chat: &AgentChat) -> bool {
+    chat.pending_state.is_some() || chat.missing_refreshes > 0
+}
+
 /// Reconcile one workspace's chat rows against a fresh observation pass;
 /// returns whether anything user-visible changed.
+#[cfg(test)]
 pub(super) fn reconcile_agent_chats_for_workspace(
     chats: &mut HashMap<(WorkspaceId, EntityId), AgentChat>,
     next_activity_sequence: &mut u64,
@@ -659,6 +752,48 @@ mod tests {
         assert_eq!(
             chat.missing_refreshes, 0,
             "a returning process resets the exit hysteresis"
+        );
+    }
+
+    #[test]
+    fn dirty_terminal_reconciliation_does_not_sample_or_age_siblings() {
+        let dirty_id = EntityId::from(45_u64);
+        let sibling_id = EntityId::from(46_u64);
+        let mut chats = HashMap::from([
+            (
+                (7, dirty_id),
+                AgentChat {
+                    workspace_id: 7,
+                    ..chat(dirty_id, AgentChatState::Open, true, 1)
+                },
+            ),
+            (
+                (7, sibling_id),
+                AgentChat {
+                    workspace_id: 7,
+                    ..chat(sibling_id, AgentChatState::Open, true, 2)
+                },
+            ),
+        ]);
+        let mut sequence = 2;
+
+        assert!(!reconcile_agent_chat_for_observation(
+            &mut chats,
+            &mut sequence,
+            7,
+            dirty_id,
+            None,
+            false,
+        ));
+
+        assert_eq!(chats.get(&(7, dirty_id)).unwrap().missing_refreshes, 1);
+        assert!(agent_chat_needs_follow_up(
+            chats.get(&(7, dirty_id)).unwrap()
+        ));
+        assert_eq!(
+            chats.get(&(7, sibling_id)).unwrap().missing_refreshes,
+            0,
+            "only the terminal invalidated by an event should be scanned"
         );
     }
 

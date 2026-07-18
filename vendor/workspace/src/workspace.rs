@@ -1277,6 +1277,11 @@ pub enum Event {
         item: Box<dyn ItemHandle>,
     },
     ActiveItemChanged,
+    /// The center pane tree, its tabs, or the active tab changed.
+    ///
+    /// Consumers that persist an application-specific center layout can use
+    /// this instead of periodically snapshotting the workspace.
+    CenterLayoutChanged,
     ItemRemoved {
         item_id: EntityId,
     },
@@ -7007,6 +7012,7 @@ impl Workspace {
     }
 
     fn serialize_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Event::CenterLayoutChanged);
         if self._schedule_serialize_workspace.is_none() {
             self._schedule_serialize_workspace =
                 Some(cx.spawn_in(window, async move |this, cx| {

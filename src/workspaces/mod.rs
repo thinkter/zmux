@@ -22,7 +22,7 @@ mod persistence;
 pub use self::git_context::{install_git_repository_scope, register_git_repository_scope};
 pub(crate) use self::persistence::{RestoredTerminal, restore_startup_layout};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use gpui::{
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::dock::PanelEvent;
+use workspace::item::ItemHandle;
 
 use crate::app::{
     create_center_terminal_at_for_workspace, create_center_terminal_for_workspace,
@@ -46,8 +47,7 @@ use crate::session::{LayoutSnapshot, SessionStore};
 use crate::welcome::ZmuxWelcome;
 
 use self::agent_chat::{
-    AgentChat, AgentChatState, agent_observation_for_active_workspace,
-    agent_observation_for_stored_layout, reconcile_agent_chats_for_workspace,
+    AgentChat, AgentChatState, agent_chat_needs_follow_up, reconcile_agent_chat_for_terminal,
 };
 use self::git_context::{
     GitDiscoveryState, WorkspaceContext, workspace_context_for_active_workspace,
@@ -71,8 +71,9 @@ actions!(
 );
 
 const MAX_WORKSPACE_NAME_CHARS: usize = 64;
-const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
+const EVENT_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+const SESSION_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 const MAX_INCOMPLETE_CONTEXT_REFRESHES: u8 = 3;
 
 /// One logical workspace: identity, naming, discovered context, and parked
@@ -146,8 +147,20 @@ struct RenameState {
     _subscription: Subscription,
 }
 
-/// The left dock panel that owns every logical workspace and drives the
-/// periodic context (2s) and agent (300ms) refresh loops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalContextFingerprint {
+    working_directory: Option<PathBuf>,
+    foreground_process: Option<String>,
+}
+
+struct RegisteredTerminal {
+    workspace_id: WorkspaceId,
+    view: WeakEntity<terminal_view::TerminalView>,
+    context: TerminalContextFingerprint,
+}
+
+/// The left dock panel that owns every logical workspace and refreshes derived
+/// state only when workspace or terminal events invalidate it.
 pub struct WorkspacesPanel {
     scope_id: EntityId,
     workspace: WeakEntity<Workspace>,
@@ -160,8 +173,12 @@ pub struct WorkspacesPanel {
     notifications_expanded: bool,
     notification_filter: Option<WorkspaceId>,
     _notification_subscription: Subscription,
-    _context_refresh_task: Task<()>,
-    _agent_refresh_task: Task<()>,
+    _workspace_subscription: Subscription,
+    terminal_registry: HashMap<EntityId, RegisteredTerminal>,
+    dirty_agent_terminals: HashSet<EntityId>,
+    context_refresh_task: Option<Task<()>>,
+    agent_refresh_task: Option<Task<()>>,
+    session_persist_task: Option<Task<()>>,
     session_store: SessionStore,
     owns_session: bool,
     session_persistence: SessionPersistence,
@@ -175,7 +192,7 @@ impl WorkspacesPanel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         session_enabled: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -259,34 +276,17 @@ impl WorkspacesPanel {
         };
         let notification_store = NotificationStore::global(cx);
         let notification_subscription = cx.observe(&notification_store, |_, _, cx| cx.notify());
-        let context_refresh_task = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(CONTEXT_REFRESH_INTERVAL)
-                    .await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.refresh_workspace_contexts(cx);
-                        this.request_metadata_refreshes(cx);
-                        this.persist_session(cx);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let agent_refresh_task = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(AGENT_REFRESH_INTERVAL).await;
-                if this
-                    .update(cx, |this, cx| this.refresh_agent_chats(cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let workspace_entity = workspace
+            .upgrade()
+            .expect("WorkspacesPanel must be created for a live workspace");
+        let workspace_subscription = cx.subscribe_in(
+            &workspace_entity,
+            window,
+            |this, _, event: &workspace::Event, window, cx| {
+                this.handle_workspace_event(event, window, cx);
+            },
+        );
+        Self::subscribe_to_git_metadata(&workspace_entity, cx);
         Self {
             scope_id: cx.entity_id(),
             workspace,
@@ -299,8 +299,12 @@ impl WorkspacesPanel {
             notifications_expanded: false,
             notification_filter: None,
             _notification_subscription: notification_subscription,
-            _context_refresh_task: context_refresh_task,
-            _agent_refresh_task: agent_refresh_task,
+            _workspace_subscription: workspace_subscription,
+            terminal_registry: HashMap::new(),
+            dirty_agent_terminals: HashSet::new(),
+            context_refresh_task: None,
+            agent_refresh_task: None,
+            session_persist_task: None,
             session_store,
             owns_session,
             session_persistence: SessionPersistence::new(restored),
@@ -380,6 +384,267 @@ impl WorkspacesPanel {
                     .then_some(entry.id)
             })
             .unwrap_or(self.active)
+    }
+
+    fn handle_workspace_event(
+        &mut self,
+        event: &workspace::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            workspace::Event::ItemAdded { item } => {
+                // The view can still be on GPUI's update stack while ItemAdded
+                // is emitted. Register after the complete workspace mutation,
+                // when a layout swap's logical owner has also been committed.
+                let item = item.boxed_clone();
+                cx.defer_in(window, move |this, window, cx| {
+                    this.register_terminal(item.as_ref(), window, cx);
+                });
+            }
+            workspace::Event::ItemRemoved { item_id } => {
+                let item_id = *item_id;
+                cx.defer_in(window, move |this, _window, cx| {
+                    this.prune_unmounted_terminal(item_id, cx);
+                });
+            }
+            workspace::Event::ActiveItemChanged => {
+                self.invalidate_active_workspace_agents();
+                self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+            }
+            workspace::Event::CenterLayoutChanged => self.schedule_session_persistence(cx),
+            _ => {}
+        }
+    }
+
+    fn terminal_context_fingerprint(terminal: &terminal::Terminal) -> TerminalContextFingerprint {
+        TerminalContextFingerprint {
+            working_directory: terminal.working_directory(),
+            foreground_process: terminal.foreground_process_command_name(),
+        }
+    }
+
+    fn register_terminal(
+        &mut self,
+        item: &dyn ItemHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = item.act_as::<terminal_view::TerminalView>(cx) else {
+            return;
+        };
+        let item_id = item.item_id();
+        let workspace_id = self.workspace_id_for_item(item_id);
+        let terminal = view.read(cx).terminal().clone();
+        let context = Self::terminal_context_fingerprint(terminal.read(cx));
+
+        if let Some(registered) = self.terminal_registry.get_mut(&item_id) {
+            let context_changed = registered.context != context;
+            registered.workspace_id = workspace_id;
+            registered.view = view.downgrade();
+            registered.context = context;
+            self.dirty_agent_terminals.insert(item_id);
+            self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+            if context_changed {
+                self.schedule_context_refresh(cx);
+            }
+            return;
+        }
+
+        self.terminal_registry.insert(
+            item_id,
+            RegisteredTerminal {
+                workspace_id,
+                view: view.downgrade(),
+                context,
+            },
+        );
+        self.dirty_agent_terminals.insert(item_id);
+        self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+        self.schedule_context_refresh(cx);
+
+        cx.subscribe_in(
+            &terminal,
+            window,
+            move |this, terminal, event: &terminal::Event, _window, cx| {
+                this.handle_terminal_event(item_id, terminal, event, cx);
+            },
+        )
+        .detach();
+
+        let panel = cx.weak_entity();
+        view.update(cx, |view, view_cx| {
+            let focus = view.focus_handle(view_cx);
+            view_cx
+                .on_focus_in(&focus, window, move |_view, _window, cx| {
+                    let _ = panel.update(cx, |panel, cx| {
+                        panel.invalidate_active_workspace_agents();
+                        panel.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+                    });
+                })
+                .detach();
+        });
+    }
+
+    fn handle_terminal_event(
+        &mut self,
+        item_id: EntityId,
+        terminal: &Entity<terminal::Terminal>,
+        event: &terminal::Event,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            event,
+            terminal::Event::Wakeup
+                | terminal::Event::TitleChanged
+                | terminal::Event::BreadcrumbsChanged
+                | terminal::Event::CloseTerminal
+        ) {
+            self.dirty_agent_terminals.insert(item_id);
+            self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+        }
+
+        let next = Self::terminal_context_fingerprint(terminal.read(cx));
+        let context_changed = self
+            .terminal_registry
+            .get_mut(&item_id)
+            .is_some_and(|registered| {
+                if registered.context == next {
+                    false
+                } else {
+                    registered.context = next;
+                    true
+                }
+            });
+        if context_changed {
+            self.schedule_context_refresh(cx);
+        }
+    }
+
+    fn invalidate_active_workspace_agents(&mut self) {
+        self.dirty_agent_terminals
+            .extend(
+                self.terminal_registry
+                    .iter()
+                    .filter_map(|(item_id, terminal)| {
+                        (terminal.workspace_id == self.active).then_some(*item_id)
+                    }),
+            );
+    }
+
+    fn schedule_agent_refresh(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if self.agent_refresh_task.is_some() {
+            return;
+        }
+        self.agent_refresh_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                this.agent_refresh_task.take();
+                this.refresh_dirty_agent_chats(cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn refresh_dirty_agent_chats(&mut self, cx: &mut Context<Self>) {
+        let dirty = self.dirty_agent_terminals.drain().collect::<Vec<_>>();
+        let active_item_id = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item(cx))
+            .map(|item| item.item_id());
+        let mut changed = false;
+        let mut follow_up = Vec::new();
+        let mut released = Vec::new();
+
+        for item_id in dirty {
+            let Some(registered) = self.terminal_registry.get(&item_id) else {
+                continue;
+            };
+            let workspace_id = registered.workspace_id;
+            let Some(view) = registered.view.upgrade() else {
+                released.push(item_id);
+                continue;
+            };
+            changed |= reconcile_agent_chat_for_terminal(
+                &mut self.agent_chats,
+                &mut self.next_agent_activity_sequence,
+                workspace_id,
+                item_id,
+                &view,
+                workspace_id == self.active && active_item_id == Some(item_id),
+                cx,
+            );
+            if self
+                .agent_chats
+                .get(&(workspace_id, item_id))
+                .is_some_and(agent_chat_needs_follow_up)
+            {
+                follow_up.push(item_id);
+            }
+        }
+
+        for item_id in released {
+            self.remove_terminal_registration(item_id);
+        }
+        if !follow_up.is_empty() {
+            self.dirty_agent_terminals.extend(follow_up);
+            self.schedule_agent_refresh(AGENT_REFRESH_INTERVAL, cx);
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn schedule_context_refresh(&mut self, cx: &mut Context<Self>) {
+        self.schedule_context_refresh_after(EVENT_COALESCE_INTERVAL, cx);
+    }
+
+    fn schedule_context_refresh_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if self.context_refresh_task.is_some() {
+            return;
+        }
+        self.context_refresh_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                this.context_refresh_task.take();
+                this.refresh_workspace_contexts(cx);
+                this.request_metadata_refreshes(cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn prune_unmounted_terminal(&mut self, item_id: EntityId, cx: &mut Context<Self>) {
+        let mounted_in_active = self.workspace.upgrade().is_some_and(|workspace| {
+            workspace
+                .read(cx)
+                .panes()
+                .iter()
+                .any(|pane| pane.read(cx).items().any(|item| item.item_id() == item_id))
+        });
+        let parked = self.entries.iter().any(|entry| {
+            entry
+                .stored
+                .as_ref()
+                .is_some_and(|layout| stored_layout_contains_item(layout, item_id))
+        });
+        if mounted_in_active || parked {
+            return;
+        }
+        if self.remove_terminal_registration(item_id) {
+            self.schedule_context_refresh(cx);
+            cx.notify();
+        }
+    }
+
+    fn remove_terminal_registration(&mut self, item_id: EntityId) -> bool {
+        let Some(registered) = self.terminal_registry.remove(&item_id) else {
+            return false;
+        };
+        self.dirty_agent_terminals.remove(&item_id);
+        self.agent_chats.remove(&(registered.workspace_id, item_id));
+        true
     }
 
     /// Create a fresh, empty workspace and switch to it.
@@ -657,7 +922,7 @@ impl WorkspacesPanel {
         }
         self.refresh_workspace_contexts(cx);
         self.request_metadata_refreshes(cx);
-        self.persist_session(cx);
+        self.schedule_session_persistence(cx);
         cx.notify();
     }
 
@@ -715,7 +980,7 @@ impl WorkspacesPanel {
             self.notification_filter = None;
         }
         NotificationRuntime::clear_workspace(cx.entity_id(), id, cx);
-        self.persist_session(cx);
+        self.schedule_session_persistence(cx);
         cx.notify();
     }
 
@@ -739,7 +1004,7 @@ impl WorkspacesPanel {
         };
         let entry = self.entries.remove(drag_ix);
         self.entries.insert(target_ix, entry);
-        self.persist_session(cx);
+        self.schedule_session_persistence(cx);
         cx.notify();
     }
 
@@ -781,41 +1046,12 @@ impl WorkspacesPanel {
             cx.notify();
         }
         self.reconcile_git_context(cx);
-    }
-
-    fn refresh_agent_chats(&mut self, cx: &mut Context<Self>) {
-        let active_observation = self
-            .workspace
-            .upgrade()
-            .map(|workspace| agent_observation_for_active_workspace(workspace.read(cx), cx));
-        let observations = self
+        if self
             .entries
             .iter()
-            .map(|entry| {
-                let observed = if entry.id == self.active {
-                    active_observation.clone().unwrap_or_default()
-                } else {
-                    entry
-                        .stored
-                        .as_ref()
-                        .map(|layout| agent_observation_for_stored_layout(layout, cx))
-                        .unwrap_or_default()
-                };
-                (entry.id, observed)
-            })
-            .collect::<Vec<_>>();
-
-        let mut changed = false;
-        for (workspace_id, observed) in observations {
-            changed |= reconcile_agent_chats_for_workspace(
-                &mut self.agent_chats,
-                &mut self.next_agent_activity_sequence,
-                workspace_id,
-                &observed,
-            );
-        }
-        if changed {
-            cx.notify();
+            .any(|entry| !entry.context_authoritative)
+        {
+            self.schedule_context_refresh_after(AGENT_REFRESH_INTERVAL, cx);
         }
     }
 
@@ -853,14 +1089,14 @@ impl WorkspacesPanel {
         {
             entry.manual_name = Some(name);
         }
-        self.persist_session(cx);
+        self.schedule_session_persistence(cx);
         cx.notify();
     }
 
     fn use_automatic_name(&mut self, id: WorkspaceId, cx: &mut Context<Self>) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
             entry.manual_name = None;
-            self.persist_session(cx);
+            self.schedule_session_persistence(cx);
             cx.notify();
         }
     }

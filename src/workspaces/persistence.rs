@@ -229,6 +229,25 @@ impl SessionPersistence {
 }
 
 impl WorkspacesPanel {
+    /// Persist the newest layout after mutations have been quiet for 500 ms.
+    /// Replacing the task resets the debounce window, so a burst of split,
+    /// resize, tab, and workspace changes produces one detached snapshot.
+    pub(super) fn schedule_session_persistence(&mut self, cx: &mut Context<Self>) {
+        if !self.owns_session {
+            return;
+        }
+        self.session_persist_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(super::SESSION_PERSIST_DEBOUNCE)
+                .await;
+            this.update(cx, |this, cx| {
+                this.session_persist_task.take();
+                this.persist_session(cx);
+            })
+            .ok();
+        }));
+    }
+
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
         if !self.owns_session {
             return;
