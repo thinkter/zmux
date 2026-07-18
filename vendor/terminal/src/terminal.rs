@@ -2489,7 +2489,7 @@ impl Terminal {
                 .current
                 .read()
                 .as_ref()
-                .map(|process| process.cwd.clone()),
+                .and_then(|process| process.cwd.clone()),
             TerminalType::DisplayOnly => None,
         }
     }
@@ -2516,7 +2516,8 @@ impl Terminal {
                         .map(|fpi| {
                             let process_file = fpi
                                 .cwd
-                                .file_name()
+                                .as_deref()
+                                .and_then(Path::file_name)
                                 .map(|name| name.to_string_lossy().into_owned())
                                 .unwrap_or_default();
 
