@@ -10,8 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Entity, EntityId, Global, SharedString, Task, WeakEntity, Window};
 use project::git_store::GitStoreEvent;
@@ -24,6 +23,123 @@ use crate::notifications::WorkspaceId;
 
 use super::persistence::{FailedRestoreSlot, StoredLayout};
 use super::{WorkspaceEntry, WorkspacesPanel, is_shell_process, sanitize_process_label};
+
+const PATH_CONTEXT_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Clone, Debug)]
+struct GitRootCacheEntry {
+    root: Option<PathBuf>,
+    checked_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GitRootRecheck {
+    Missing,
+    Positive,
+    Due,
+    Pending(Duration),
+}
+
+/// Filesystem-derived path identity owned by one workspace panel.
+///
+/// Values deliberately retain the logical path supplied by the shell. The
+/// canonical form exists only as a comparison key, so macOS `/var` aliases and
+/// Windows verbatim paths never leak into labels or persisted sessions.
+#[derive(Debug, Default)]
+pub(super) struct PathContextCache {
+    canonical_paths: HashMap<PathBuf, Option<PathBuf>>,
+    git_roots: HashMap<PathBuf, GitRootCacheEntry>,
+}
+
+impl PathContextCache {
+    fn insert_bounded<T>(map: &mut HashMap<PathBuf, T>, key: PathBuf, value: T) {
+        if !map.contains_key(&key) && map.len() >= PATH_CONTEXT_CACHE_CAPACITY {
+            map.clear();
+        }
+        map.insert(key, value);
+    }
+
+    fn canonical_identity(&mut self, path: &Path) -> Option<PathBuf> {
+        self.canonical_identity_with(path, |path| std::fs::canonicalize(path))
+    }
+
+    fn canonical_identity_with(
+        &mut self,
+        path: &Path,
+        resolve: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+    ) -> Option<PathBuf> {
+        if let Some(identity) = self.canonical_paths.get(path) {
+            return identity.clone();
+        }
+        let identity = resolve(path).ok();
+        Self::insert_bounded(
+            &mut self.canonical_paths,
+            path.to_path_buf(),
+            identity.clone(),
+        );
+        identity
+    }
+
+    fn paths_match(&mut self, left: &Path, right: &Path) -> bool {
+        left == right
+            || self
+                .canonical_identity(left)
+                .zip(self.canonical_identity(right))
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    fn nearest_git_root(&mut self, directory: &Path) -> Option<PathBuf> {
+        self.nearest_git_root_with(directory, |candidate| candidate.join(".git").exists())
+    }
+
+    fn nearest_git_root_with(
+        &mut self,
+        directory: &Path,
+        is_git_root: impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        if let Some(cached) = self.git_roots.get(directory) {
+            return cached.root.clone();
+        }
+        let root = directory
+            .ancestors()
+            .find(|ancestor| is_git_root(ancestor))
+            .map(Path::to_path_buf);
+        Self::insert_bounded(
+            &mut self.git_roots,
+            directory.to_path_buf(),
+            GitRootCacheEntry {
+                root: root.clone(),
+                checked_at: Instant::now(),
+            },
+        );
+        root
+    }
+
+    pub(super) fn git_root_recheck(
+        &mut self,
+        directory: &Path,
+        interval: Duration,
+    ) -> GitRootRecheck {
+        let Some(cached) = self.git_roots.get(directory) else {
+            return GitRootRecheck::Missing;
+        };
+        if cached.root.is_some() {
+            return GitRootRecheck::Positive;
+        }
+        let elapsed = cached.checked_at.elapsed();
+        if elapsed >= interval {
+            self.git_roots.remove(directory);
+            GitRootRecheck::Due
+        } else {
+            GitRootRecheck::Pending(interval - elapsed)
+        }
+    }
+
+    fn clear(&mut self) {
+        self.canonical_paths.clear();
+        self.git_roots.clear();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GitDiscoveryState {
@@ -77,43 +193,96 @@ fn git_root_reference_counts<'a>(
 fn git_root_is_referenced<'a>(
     roots_by_workspace: impl IntoIterator<Item = &'a [PathBuf]>,
     root: &Path,
+    cache: &Mutex<PathContextCache>,
 ) -> bool {
-    roots_by_workspace
-        .into_iter()
-        .any(|roots| roots.iter().any(|candidate| paths_match(candidate, root)))
+    roots_by_workspace.into_iter().any(|roots| {
+        roots
+            .iter()
+            .any(|candidate| paths_match(cache, candidate, root))
+    })
 }
 
 fn plan_git_root_reconciliation(
     reference_counts: BTreeMap<PathBuf, usize>,
     attached: &BTreeSet<PathBuf>,
     pending: &BTreeSet<PathBuf>,
+    cache: &Mutex<PathContextCache>,
 ) -> GitRootReconciliation {
-    let added = reference_counts
-        .keys()
-        .filter(|root| !attached.contains(*root) && !pending.contains(*root))
-        .cloned()
-        .collect();
-    let removed = attached
-        .iter()
-        .filter(|root| !reference_counts.contains_key(*root))
-        .cloned()
+    let mut desired: Vec<PathBuf> = Vec::new();
+    for root in reference_counts.keys() {
+        push_unique_logical_path(&mut desired, root.clone(), cache);
+    }
+
+    let mut retained: Vec<PathBuf> = Vec::new();
+    let mut removed = BTreeSet::new();
+    for root in attached {
+        let referenced = desired
+            .iter()
+            .any(|desired| paths_match(cache, desired, root));
+        let duplicate = retained
+            .iter()
+            .any(|existing| paths_match(cache, existing, root));
+        if referenced && !duplicate {
+            retained.push(root.clone());
+        } else {
+            removed.insert(root.clone());
+        }
+    }
+
+    let added = desired
+        .into_iter()
+        .filter(|root| {
+            !retained
+                .iter()
+                .chain(pending)
+                .any(|existing| paths_match(cache, existing, root))
+        })
         .collect();
     GitRootReconciliation { added, removed }
+}
+
+fn push_unique_logical_path(
+    paths: &mut Vec<PathBuf>,
+    path: PathBuf,
+    cache: &Mutex<PathContextCache>,
+) {
+    if !paths
+        .iter()
+        .any(|existing| paths_match(cache, existing, &path))
+    {
+        paths.push(path);
+    }
+}
+
+fn matched_logical_git_root(
+    discovered: &[PathBuf],
+    candidate: &Path,
+    cache: &Mutex<PathContextCache>,
+) -> Option<PathBuf> {
+    discovered
+        .iter()
+        .find(|root| paths_match(cache, root, candidate))
+        .cloned()
 }
 
 fn reconcile_selected_git_root(
     selected: &mut Option<PathBuf>,
     discovered_roots: &[PathBuf],
     discovery: GitDiscoveryState,
+    cache: &Mutex<PathContextCache>,
 ) {
     if discovery != GitDiscoveryState::Authoritative {
         return;
     }
-    if selected.as_ref().is_none_or(|root| {
-        !discovered_roots
+    if let Some(matched) = selected.as_ref().and_then(|root| {
+        discovered_roots
             .iter()
-            .any(|discovered| paths_match(root, discovered))
+            .find(|discovered| paths_match(cache, root, discovered))
     }) {
+        if selected.as_ref() != Some(matched) {
+            *selected = Some(matched.clone());
+        }
+    } else {
         *selected = discovered_roots.first().cloned();
     }
 }
@@ -180,9 +349,9 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
         project: &Entity<project::Project>,
         cx: &App,
     ) -> Vec<Entity<project::git_store::Repository>> {
-        let roots = self
-            .panel_for(project)
-            .and_then(|panel| panel.upgrade())
+        let panel = self.panel_for(project).and_then(|panel| panel.upgrade());
+        let roots = panel
+            .as_ref()
             .map(|panel| panel.read(cx).active_git_roots().to_vec())
             .unwrap_or_default();
         project
@@ -193,10 +362,13 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
             .values()
             .filter(|repo| {
                 roots.iter().any(|root| {
-                    paths_match(
-                        repo.read(cx).snapshot().work_directory_abs_path.as_ref(),
-                        root,
-                    )
+                    panel.as_ref().is_some_and(|panel| {
+                        paths_match(
+                            &panel.read(cx).path_context_cache,
+                            repo.read(cx).snapshot().work_directory_abs_path.as_ref(),
+                            root,
+                        )
+                    })
                 })
             })
             .cloned()
@@ -273,9 +445,12 @@ impl WorkspacesPanel {
     pub(super) fn subscribe_to_git_metadata(workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         let git_store = workspace.read(cx).project().read(cx).git_store().clone();
         cx.subscribe(&git_store, |this, _git_store, event, cx| match event {
+            GitStoreEvent::RepositoryAdded | GitStoreEvent::RepositoryRemoved(_) => {
+                this.invalidate_path_context_cache();
+                this.schedule_context_refresh(cx);
+                this.request_metadata_refreshes(cx);
+            }
             GitStoreEvent::RepositoryUpdated(_, _, _)
-            | GitStoreEvent::RepositoryAdded
-            | GitStoreEvent::RepositoryRemoved(_)
             | GitStoreEvent::ActiveRepositoryChanged(_) => {
                 this.request_metadata_refreshes(cx);
             }
@@ -305,28 +480,36 @@ impl WorkspacesPanel {
                     .clone()
                     .or_else(|| entry.context.git_root.clone())
                     .or_else(|| {
-                        entry
-                            .default_directory
-                            .as_deref()
-                            .and_then(nearest_git_root)
+                        entry.default_directory.as_deref().and_then(|directory| {
+                            nearest_git_root(&self.path_context_cache, directory)
+                        })
                     })
             })
     }
 
     fn open_git_roots(&self) -> Vec<PathBuf> {
-        let mut roots = BTreeSet::new();
+        let mut roots = Vec::new();
         for entry in &self.entries {
-            roots.extend(entry.context.git_roots.iter().cloned());
-            roots.extend(entry.selected_git_root.iter().cloned());
-            roots.extend(entry.worktree_paths.iter().cloned());
-            roots.extend(
-                entry
-                    .default_directory
-                    .as_deref()
-                    .and_then(nearest_git_root),
-            );
+            for root in entry
+                .context
+                .git_roots
+                .iter()
+                .chain(entry.selected_git_root.iter())
+                .chain(&entry.worktree_paths)
+                .cloned()
+            {
+                push_unique_logical_path(&mut roots, root, &self.path_context_cache);
+            }
+            if let Some(root) = entry
+                .default_directory
+                .as_deref()
+                .and_then(|directory| nearest_git_root(&self.path_context_cache, directory))
+            {
+                push_unique_logical_path(&mut roots, root, &self.path_context_cache);
+            }
         }
-        roots.into_iter().collect()
+        roots.sort();
+        roots
     }
 
     fn select_git_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -334,13 +517,10 @@ impl WorkspacesPanel {
             .entries
             .iter_mut()
             .find(|entry| entry.id == self.active)
-            && entry
-                .context
-                .git_roots
-                .iter()
-                .any(|candidate| paths_match(candidate, &root))
+            && let Some(logical_root) =
+                matched_logical_git_root(&entry.context.git_roots, &root, &self.path_context_cache)
         {
-            entry.selected_git_root = Some(root);
+            entry.selected_git_root = Some(logical_root);
             self.request_metadata_refreshes(cx);
             self.schedule_session_persistence(cx);
             cx.notify();
@@ -352,20 +532,20 @@ impl WorkspacesPanel {
             (entry
                 .selected_git_root
                 .as_deref()
-                .is_some_and(|root| paths_match(root, path))
+                .is_some_and(|root| paths_match(&self.path_context_cache, root, path))
                 || entry
                     .default_directory
                     .as_deref()
-                    .is_some_and(|root| paths_match(root, path))
+                    .is_some_and(|root| paths_match(&self.path_context_cache, root, path))
                 || entry
                     .worktree_paths
                     .iter()
-                    .any(|root| paths_match(root, path))
+                    .any(|root| paths_match(&self.path_context_cache, root, path))
                 || entry
                     .context
                     .git_roots
                     .iter()
-                    .any(|root| paths_match(root, path)))
+                    .any(|root| paths_match(&self.path_context_cache, root, path)))
             .then_some(entry.id)
         })
     }
@@ -418,6 +598,7 @@ impl WorkspacesPanel {
                 &mut entry.selected_git_root,
                 &entry.context.git_roots,
                 entry.git_discovery,
+                &self.path_context_cache,
             );
         }
 
@@ -427,8 +608,12 @@ impl WorkspacesPanel {
                 .map(|entry| entry.context.git_roots.as_slice()),
         );
         let attached = self.attached_worktrees.keys().cloned().collect();
-        let reconciliation =
-            plan_git_root_reconciliation(reference_counts, &attached, &self.pending_worktrees);
+        let reconciliation = plan_git_root_reconciliation(
+            reference_counts,
+            &attached,
+            &self.pending_worktrees,
+            &self.path_context_cache,
+        );
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -443,6 +628,7 @@ impl WorkspacesPanel {
                 if let Some(worktree) = self.attached_worktrees.remove(&root) {
                     let id = worktree.read(cx).id();
                     project.update(cx, |project, cx| project.remove_worktree(id, cx));
+                    self.invalidate_path_context_cache();
                 }
             }
         }
@@ -461,10 +647,13 @@ impl WorkspacesPanel {
             // worktrees. Both behaviors are wrong for terminal-driven discovery:
             // attach an exact, Git-tracked worktree root. zmux has no project
             // panel, so making it visible affects only Zed's internal scanning.
-            let existing = project
-                .read(cx)
-                .worktrees(cx)
-                .find(|worktree| paths_match(worktree.read(cx).abs_path().as_ref(), &root));
+            let existing = project.read(cx).worktrees(cx).find(|worktree| {
+                paths_match(
+                    &self.path_context_cache,
+                    worktree.read(cx).abs_path().as_ref(),
+                    &root,
+                )
+            });
             let task = if let Some(worktree) = existing {
                 Task::ready(Ok(worktree))
             } else {
@@ -483,11 +672,13 @@ impl WorkspacesPanel {
                                         .iter()
                                         .map(|entry| entry.context.git_roots.as_slice()),
                                     &root,
+                                    &this.path_context_cache,
                                 ),
                                 git_contexts_are_authoritative(&this.entries),
                             ) =>
                         {
                             this.attached_worktrees.insert(root.clone(), worktree);
+                            this.invalidate_path_context_cache();
                             this.activate_selected_repository(cx);
                         }
                         Ok(worktree) => {
@@ -496,6 +687,7 @@ impl WorkspacesPanel {
                             // well as dropping this late result.
                             let id = worktree.read(cx).id();
                             project.update(cx, |project, cx| project.remove_worktree(id, cx));
+                            this.invalidate_path_context_cache();
                         }
                         Err(error) => {
                             eprintln!(
@@ -569,6 +761,7 @@ impl WorkspacesPanel {
             .values()
             .find(|repo| {
                 paths_match(
+                    &self.path_context_cache,
                     repo.read(cx).snapshot().work_directory_abs_path.as_ref(),
                     root,
                 )
@@ -602,7 +795,11 @@ impl WorkspacesPanel {
             }
             let git = if let Some(root) = root {
                 let repository = repositories.iter().find(|repository| {
-                    paths_match(repository.work_directory_abs_path.as_ref(), &root)
+                    paths_match(
+                        &self.path_context_cache,
+                        repository.work_directory_abs_path.as_ref(),
+                        &root,
+                    )
                 });
                 git_metadata_from_repository(repository)
             } else {
@@ -617,10 +814,19 @@ impl WorkspacesPanel {
             cx.notify();
         }
     }
+
+    pub(super) fn invalidate_path_context_cache(&mut self) {
+        self.clear_pending_git_root_rechecks();
+        self.path_context_cache
+            .lock()
+            .expect("path context cache poisoned")
+            .clear();
+    }
 }
 
 pub(super) fn workspace_context_for_active_workspace(
     workspace: &Workspace,
+    cache: &Mutex<PathContextCache>,
     cx: &App,
 ) -> WorkspaceContext {
     let mut context = WorkspaceContext::default();
@@ -629,11 +835,12 @@ pub(super) fn workspace_context_for_active_workspace(
             add_item_to_workspace_context(item.as_ref(), &mut context, cx);
         }
     }
-    finalize_workspace_context(context)
+    finalize_workspace_context(context, cache)
 }
 
 pub(super) fn workspace_context_for_stored_layout(
     layout: &StoredLayout,
+    cache: &Mutex<PathContextCache>,
     cx: &App,
 ) -> WorkspaceContext {
     fn visit(layout: &StoredLayout, context: &mut WorkspaceContext, cx: &App) {
@@ -652,7 +859,7 @@ pub(super) fn workspace_context_for_stored_layout(
 
     let mut context = WorkspaceContext::default();
     visit(layout, &mut context, cx);
-    finalize_workspace_context(context)
+    finalize_workspace_context(context, cache)
 }
 
 fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceContext, cx: &App) {
@@ -674,7 +881,10 @@ fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceC
     }
 }
 
-fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext {
+fn finalize_workspace_context(
+    mut context: WorkspaceContext,
+    cache: &Mutex<PathContextCache>,
+) -> WorkspaceContext {
     context.working_directories.sort();
     context.working_directories.dedup();
 
@@ -684,24 +894,32 @@ fn finalize_workspace_context(mut context: WorkspaceContext) -> WorkspaceContext
         .collect::<BTreeSet<_>>();
     context.foreground_processes = processes.into_iter().take(8).collect();
 
-    context.git_roots = context
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for root in context
         .working_directories
         .iter()
-        .filter_map(|directory| nearest_git_root(directory))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+        .filter_map(|directory| nearest_git_root(cache, directory))
+    {
+        if !roots
+            .iter()
+            .any(|existing| paths_match(cache, existing, &root))
+        {
+            roots.push(root);
+        }
+    }
+    roots.sort();
+    context.git_roots = roots;
     if context.git_roots.len() == 1 {
         context.git_root = context.git_roots.first().cloned();
     }
     context
 }
 
-fn nearest_git_root(directory: &Path) -> Option<PathBuf> {
-    directory
-        .ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
-        .map(Path::to_path_buf)
+fn nearest_git_root(cache: &Mutex<PathContextCache>, directory: &Path) -> Option<PathBuf> {
+    cache
+        .lock()
+        .expect("path context cache poisoned")
+        .nearest_git_root(directory)
 }
 
 /// Compare existing filesystem paths without replacing their user-visible form.
@@ -710,12 +928,11 @@ fn nearest_git_root(directory: &Path) -> Option<PathBuf> {
 /// verbatim (`\\?\`) or long-name paths on Windows. Those are useful identity
 /// keys, but persisting them changes workspace labels and breaks equality with
 /// shell-reported paths, so canonicalization is confined to comparison.
-fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || std::fs::canonicalize(left)
-            .ok()
-            .zip(std::fs::canonicalize(right).ok())
-            .is_some_and(|(left, right)| left == right)
+fn paths_match(cache: &Mutex<PathContextCache>, left: &Path, right: &Path) -> bool {
+    cache
+        .lock()
+        .expect("path context cache poisoned")
+        .paths_match(left, right)
 }
 
 #[cfg(test)]
@@ -737,6 +954,10 @@ mod tests {
         }
     }
 
+    fn path_cache() -> Mutex<PathContextCache> {
+        Mutex::new(PathContextCache::default())
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_identity_matches_aliases_without_rewriting_logical_paths() {
@@ -747,8 +968,202 @@ mod tests {
         std::fs::create_dir_all(&physical).unwrap();
         std::os::unix::fs::symlink(&physical, &logical).unwrap();
 
-        assert!(paths_match(&logical, &physical));
+        assert!(paths_match(&path_cache(), &logical, &physical));
         assert_ne!(logical, physical);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_identity_matches_macos_var_alias() {
+        let logical = PathBuf::from("/var");
+        let physical = PathBuf::from("/private/var");
+        assert!(paths_match(&path_cache(), &logical, &physical));
+        assert_eq!(logical, PathBuf::from("/var"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_identity_matches_windows_verbatim_canonical_form() {
+        let logical = std::env::temp_dir();
+        let canonical = logical.canonicalize().unwrap();
+        assert!(paths_match(&path_cache(), &logical, &canonical));
+        assert_eq!(logical, std::env::temp_dir());
+    }
+
+    #[test]
+    fn path_context_cache_reuses_filesystem_lookups() {
+        use std::cell::Cell;
+
+        let mut cache = PathContextCache::default();
+        let canonical_calls = Cell::new(0);
+        let path = Path::new("/logical/repository");
+        let expected = PathBuf::from("/physical/repository");
+        assert_eq!(
+            cache.canonical_identity_with(path, |_| {
+                canonical_calls.set(canonical_calls.get() + 1);
+                Ok(expected.clone())
+            }),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            cache.canonical_identity_with(path, |_| {
+                canonical_calls.set(canonical_calls.get() + 1);
+                Ok(PathBuf::from("/unexpected"))
+            }),
+            Some(expected)
+        );
+        assert_eq!(canonical_calls.get(), 1);
+
+        let git_calls = Cell::new(0);
+        let directory = Path::new("/repo/src/bin");
+        let first = cache.nearest_git_root_with(directory, |candidate| {
+            git_calls.set(git_calls.get() + 1);
+            candidate == Path::new("/repo")
+        });
+        let calls_after_first = git_calls.get();
+        let second = cache.nearest_git_root_with(directory, |_| {
+            git_calls.set(git_calls.get() + 1);
+            false
+        });
+        assert_eq!(first, Some(PathBuf::from("/repo")));
+        assert_eq!(second, first);
+        assert_eq!(git_calls.get(), calls_after_first);
+    }
+
+    #[test]
+    fn path_context_cache_clears_each_map_at_capacity() {
+        let mut cache = PathContextCache::default();
+        for index in 0..PATH_CONTEXT_CACHE_CAPACITY {
+            cache.canonical_identity_with(Path::new(&format!("/path-{index}")), |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            });
+            cache.nearest_git_root_with(Path::new(&format!("/repo-{index}")), |_| false);
+        }
+        assert_eq!(cache.canonical_paths.len(), PATH_CONTEXT_CACHE_CAPACITY);
+        assert_eq!(cache.git_roots.len(), PATH_CONTEXT_CACHE_CAPACITY);
+
+        cache.canonical_identity_with(Path::new("/overflow"), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        cache.nearest_git_root_with(Path::new("/repo-overflow"), |_| false);
+        assert_eq!(cache.canonical_paths.len(), 1);
+        assert_eq!(cache.git_roots.len(), 1);
+    }
+
+    #[test]
+    fn git_root_cache_invalidation_refreshes_positive_entries() {
+        let mut cache = PathContextCache::default();
+        let directory = Path::new("/repo/src");
+        assert_eq!(
+            cache.nearest_git_root_with(directory, |candidate| candidate == Path::new("/repo")),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            cache.git_root_recheck(directory, Duration::from_secs(1)),
+            GitRootRecheck::Positive
+        );
+        cache.clear();
+        assert_eq!(cache.nearest_git_root_with(directory, |_| false), None);
+        cache.clear();
+        assert_eq!(
+            cache.git_root_recheck(directory, Duration::from_secs(1)),
+            GitRootRecheck::Missing
+        );
+    }
+
+    #[test]
+    fn negative_git_root_rechecks_retain_per_cwd_deadlines() {
+        let mut cache = PathContextCache::default();
+        let due = PathBuf::from("/outside/due");
+        let pending = PathBuf::from("/outside/pending");
+        cache.git_roots.insert(
+            due.clone(),
+            GitRootCacheEntry {
+                root: None,
+                checked_at: Instant::now() - Duration::from_secs(2),
+            },
+        );
+        cache.git_roots.insert(
+            pending.clone(),
+            GitRootCacheEntry {
+                root: None,
+                checked_at: Instant::now() - Duration::from_millis(100),
+            },
+        );
+
+        assert_eq!(
+            cache.git_root_recheck(&due, Duration::from_secs(1)),
+            GitRootRecheck::Due
+        );
+        let GitRootRecheck::Pending(delay) =
+            cache.git_root_recheck(&pending, Duration::from_secs(1))
+        else {
+            panic!("the newer negative entry must keep its own deadline");
+        };
+        assert!(delay > Duration::from_millis(800));
+        assert!(!cache.git_roots.contains_key(&due));
+        assert!(cache.git_roots.contains_key(&pending));
+    }
+
+    #[test]
+    fn terminal_wakeup_policy_discovers_git_init_after_negative_cache() {
+        let base =
+            std::env::temp_dir().join(format!("zmux-git-init-cache-{}", uuid::Uuid::new_v4()));
+        let directory = base.join("src");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut cache = PathContextCache::default();
+        assert_eq!(cache.nearest_git_root(&directory), None);
+
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        assert_eq!(cache.nearest_git_root(&directory), None);
+        assert_eq!(
+            cache.git_root_recheck(&directory, Duration::ZERO),
+            GitRootRecheck::Due
+        );
+        assert_eq!(cache.nearest_git_root(&directory), Some(base.clone()));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_roots_are_deduplicated_for_reconciliation_and_open_sets() {
+        let base = std::env::temp_dir().join(format!("zmux-alias-roots-{}", uuid::Uuid::new_v4()));
+        let physical = base.join("physical");
+        let logical = base.join("logical");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &logical).unwrap();
+        let cache = path_cache();
+
+        let counts = git_root_reference_counts([[physical.clone(), logical.clone()].as_slice()]);
+        let reconciliation = plan_git_root_reconciliation(
+            counts,
+            &BTreeSet::from([physical.clone(), logical.clone()]),
+            &BTreeSet::new(),
+            &cache,
+        );
+        assert!(reconciliation.added.is_empty());
+        assert_eq!(reconciliation.removed.len(), 1);
+
+        let mut open = Vec::new();
+        push_unique_logical_path(&mut open, logical.clone(), &cache);
+        push_unique_logical_path(&mut open, physical.clone(), &cache);
+        assert_eq!(open, vec![logical.clone()]);
+        assert_eq!(
+            matched_logical_git_root(&open, &physical, &cache),
+            Some(logical.clone())
+        );
+
+        let mut selected = Some(physical.clone());
+        reconcile_selected_git_root(
+            &mut selected,
+            std::slice::from_ref(&logical),
+            GitDiscoveryState::Authoritative,
+            &cache,
+        );
+        assert_eq!(selected, Some(logical));
 
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -764,11 +1179,14 @@ mod tests {
         std::fs::create_dir_all(repo_b.join(".git")).unwrap();
         std::fs::create_dir_all(outside.clone()).unwrap();
 
-        let context = finalize_workspace_context(WorkspaceContext {
-            working_directories: vec![repo_a.join("src"), outside, repo_b.clone()],
-            shell_count: 3,
-            ..WorkspaceContext::default()
-        });
+        let context = finalize_workspace_context(
+            WorkspaceContext {
+                working_directories: vec![repo_a.join("src"), outside, repo_b.clone()],
+                shell_count: 3,
+                ..WorkspaceContext::default()
+            },
+            &path_cache(),
+        );
 
         assert_eq!(context.git_roots, vec![repo_a, repo_b]);
         assert_eq!(context.git_root, None);
@@ -783,11 +1201,14 @@ mod tests {
         std::fs::create_dir_all(base.join("api")).unwrap();
         std::fs::create_dir_all(base.join("web")).unwrap();
 
-        let context = finalize_workspace_context(WorkspaceContext {
-            working_directories: vec![base.join("api"), base.join("web")],
-            shell_count: 2,
-            ..WorkspaceContext::default()
-        });
+        let context = finalize_workspace_context(
+            WorkspaceContext {
+                working_directories: vec![base.join("api"), base.join("web")],
+                shell_count: 2,
+                ..WorkspaceContext::default()
+            },
+            &path_cache(),
+        );
 
         assert_eq!(context.git_roots, vec![base.clone()]);
         assert_eq!(context.git_root, Some(base.clone()));
@@ -799,7 +1220,12 @@ mod tests {
         let selected_root = PathBuf::from("/repos/selected");
         let mut selected = Some(selected_root.clone());
 
-        reconcile_selected_git_root(&mut selected, &[], GitDiscoveryState::Restoring);
+        reconcile_selected_git_root(
+            &mut selected,
+            &[],
+            GitDiscoveryState::Restoring,
+            &path_cache(),
+        );
 
         assert_eq!(selected, Some(selected_root));
     }
@@ -816,12 +1242,14 @@ mod tests {
             &mut selected,
             std::slice::from_ref(&first_root),
             GitDiscoveryState::Restoring,
+            &path_cache(),
         );
         assert_eq!(selected, Some(selected_root.clone()));
         reconcile_selected_git_root(
             &mut selected,
             std::slice::from_ref(&first_root),
             GitDiscoveryState::Discovering,
+            &path_cache(),
         );
         assert_eq!(selected, Some(selected_root.clone()));
 
@@ -829,6 +1257,7 @@ mod tests {
             &mut selected,
             &[first_root, selected_root.clone()],
             GitDiscoveryState::Authoritative,
+            &path_cache(),
         );
         assert_eq!(selected, Some(selected_root));
     }
@@ -842,6 +1271,7 @@ mod tests {
             &mut selected,
             std::slice::from_ref(&discovered_root),
             GitDiscoveryState::Authoritative,
+            &path_cache(),
         );
 
         assert_eq!(selected, Some(discovered_root));
@@ -898,7 +1328,8 @@ mod tests {
         let attached = BTreeSet::from([shared.clone(), stale.clone()]);
         let pending = BTreeSet::from([second.clone()]);
 
-        let reconciliation = plan_git_root_reconciliation(counts, &attached, &pending);
+        let reconciliation =
+            plan_git_root_reconciliation(counts, &attached, &pending, &path_cache());
 
         assert_eq!(reconciliation.added, BTreeSet::from([first]));
         assert_eq!(reconciliation.removed, BTreeSet::from([stale]));
@@ -910,7 +1341,11 @@ mod tests {
         let current = PathBuf::from("/repos/current");
         let roots = [current];
 
-        assert!(!git_root_is_referenced([roots.as_slice()], &late));
+        assert!(!git_root_is_referenced(
+            [roots.as_slice()],
+            &late,
+            &path_cache()
+        ));
     }
 
     #[test]
@@ -921,8 +1356,12 @@ mod tests {
         let active = visited.iter().rev().take(3).cloned().collect::<Vec<_>>();
         let reference_counts = git_root_reference_counts([active.as_slice()]);
 
-        let reconciliation =
-            plan_git_root_reconciliation(reference_counts, &visited, &BTreeSet::new());
+        let reconciliation = plan_git_root_reconciliation(
+            reference_counts,
+            &visited,
+            &BTreeSet::new(),
+            &path_cache(),
+        );
         let mut retained = visited;
         for root in reconciliation.removed {
             retained.remove(&root);
@@ -1022,8 +1461,10 @@ mod tests {
                 .timer(Duration::from_millis(10))
                 .await;
         }
+        let live_context_cache = path_cache();
         let live_directories = opened.workspace.read_with(cx, |workspace, cx| {
-            workspace_context_for_active_workspace(workspace, cx).working_directories
+            workspace_context_for_active_workspace(workspace, &live_context_cache, cx)
+                .working_directories
         });
         panel.read_with(cx, |panel, _| {
             let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();

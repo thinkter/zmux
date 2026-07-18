@@ -24,7 +24,7 @@ pub(crate) use self::persistence::{RestoredTerminal, restore_startup_layout};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -50,8 +50,8 @@ use self::agent_chat::{
     AgentChat, AgentChatState, agent_chat_needs_follow_up, reconcile_agent_chat_for_terminal,
 };
 use self::git_context::{
-    GitDiscoveryState, WorkspaceContext, workspace_context_for_active_workspace,
-    workspace_context_for_stored_layout,
+    GitDiscoveryState, GitRootRecheck, PathContextCache, WorkspaceContext,
+    workspace_context_for_active_workspace, workspace_context_for_stored_layout,
 };
 use self::persistence::{
     FailedRestoreSlot, SessionOwnerClaimed, SessionPersistence, StoredLayout, UnitRect,
@@ -158,6 +158,159 @@ struct RegisteredTerminal {
     context: TerminalContextFingerprint,
 }
 
+#[derive(Debug, Default)]
+struct DeadlineQueue<K> {
+    deadlines: HashMap<K, Instant>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> DeadlineQueue<K> {
+    fn schedule(&mut self, key: K, deadline: Instant) {
+        self.deadlines
+            .entry(key)
+            .and_modify(|current| *current = (*current).min(deadline))
+            .or_insert(deadline);
+    }
+
+    fn earliest(&self) -> Option<Instant> {
+        self.deadlines.values().copied().min()
+    }
+
+    fn take_due(&mut self, now: Instant) -> Vec<K> {
+        let due = self
+            .deadlines
+            .iter()
+            .filter_map(|(key, deadline)| (*deadline <= now).then_some(*key))
+            .collect::<Vec<_>>();
+        for key in &due {
+            self.deadlines.remove(key);
+        }
+        due
+    }
+
+    fn remove(&mut self, key: &K) {
+        self.deadlines.remove(key);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitRootRecheckTimerUpdate {
+    Keep,
+    Cancel,
+    Arm(Duration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GitRootRecheckScheduleUpdate {
+    refresh: bool,
+    timer: GitRootRecheckTimerUpdate,
+}
+
+#[derive(Debug, Default)]
+struct GitRootRecheckSchedule {
+    pending: HashSet<PathBuf>,
+    deadline: Option<Instant>,
+}
+
+impl GitRootRecheckSchedule {
+    fn observe(
+        &mut self,
+        directory: PathBuf,
+        recheck: GitRootRecheck,
+        now: Instant,
+    ) -> GitRootRecheckScheduleUpdate {
+        let previous_deadline = self.deadline;
+        let refresh = self.observe_without_update(directory, recheck, now);
+        GitRootRecheckScheduleUpdate {
+            refresh,
+            timer: Self::timer_update(previous_deadline, self.deadline, now),
+        }
+    }
+
+    fn observe_without_update(
+        &mut self,
+        directory: PathBuf,
+        recheck: GitRootRecheck,
+        now: Instant,
+    ) -> bool {
+        match recheck {
+            GitRootRecheck::Missing | GitRootRecheck::Due => {
+                self.remove(&directory);
+                true
+            }
+            GitRootRecheck::Positive => {
+                self.remove(&directory);
+                false
+            }
+            GitRootRecheck::Pending(delay) => {
+                self.pending.insert(directory);
+                let deadline = now + delay;
+                if self.deadline.is_none_or(|current| deadline < current) {
+                    self.deadline = Some(deadline);
+                }
+                false
+            }
+        }
+    }
+
+    fn remove(&mut self, directory: &Path) {
+        self.pending.remove(directory);
+        if self.pending.is_empty() {
+            self.deadline = None;
+        }
+    }
+
+    fn take_firing_paths(&mut self) -> Vec<PathBuf> {
+        self.deadline = None;
+        self.pending.drain().collect()
+    }
+
+    fn reduce_fired(
+        &mut self,
+        states: impl IntoIterator<Item = (PathBuf, GitRootRecheck)>,
+        now: Instant,
+    ) -> GitRootRecheckScheduleUpdate {
+        debug_assert!(self.pending.is_empty() && self.deadline.is_none());
+        let mut refresh = false;
+        for (directory, state) in states {
+            refresh |= self.observe_without_update(directory, state, now);
+        }
+        GitRootRecheckScheduleUpdate {
+            refresh,
+            timer: self
+                .deadline
+                .map_or(GitRootRecheckTimerUpdate::Cancel, |deadline| {
+                    GitRootRecheckTimerUpdate::Arm(
+                        deadline.checked_duration_since(now).unwrap_or_default(),
+                    )
+                }),
+        }
+    }
+
+    fn clear(&mut self) -> GitRootRecheckTimerUpdate {
+        let had_timer = self.deadline.take().is_some();
+        self.pending.clear();
+        if had_timer {
+            GitRootRecheckTimerUpdate::Cancel
+        } else {
+            GitRootRecheckTimerUpdate::Keep
+        }
+    }
+
+    fn timer_update(
+        previous: Option<Instant>,
+        next: Option<Instant>,
+        now: Instant,
+    ) -> GitRootRecheckTimerUpdate {
+        if previous == next {
+            GitRootRecheckTimerUpdate::Keep
+        } else if let Some(deadline) = next {
+            GitRootRecheckTimerUpdate::Arm(deadline.checked_duration_since(now).unwrap_or_default())
+        } else {
+            GitRootRecheckTimerUpdate::Cancel
+        }
+    }
+}
+
 /// The left dock panel that owns every logical workspace and refreshes derived
 /// state only when workspace or terminal events invalidate it.
 pub struct WorkspacesPanel {
@@ -175,7 +328,13 @@ pub struct WorkspacesPanel {
     _workspace_subscription: Subscription,
     terminal_registry: HashMap<EntityId, RegisteredTerminal>,
     dirty_agent_terminals: HashSet<EntityId>,
+    agent_refresh_queue: DeadlineQueue<EntityId>,
+    agent_refresh_deadline: Option<Instant>,
     context_refresh_task: Option<Task<()>>,
+    context_refresh_queue: DeadlineQueue<WorkspaceId>,
+    context_refresh_deadline: Option<Instant>,
+    git_root_recheck_task: Option<Task<()>>,
+    git_root_recheck_schedule: GitRootRecheckSchedule,
     agent_refresh_task: Option<Task<()>>,
     session_persist_task: Option<Task<()>>,
     session_store: SessionStore,
@@ -183,6 +342,7 @@ pub struct WorkspacesPanel {
     session_persistence: SessionPersistence,
     attached_worktrees: HashMap<PathBuf, Entity<project::Worktree>>,
     pending_worktrees: BTreeSet<PathBuf>,
+    path_context_cache: std::sync::Mutex<PathContextCache>,
     agent_chats: HashMap<(WorkspaceId, EntityId), AgentChat>,
     next_agent_activity_sequence: u64,
 }
@@ -309,7 +469,13 @@ impl WorkspacesPanel {
             _workspace_subscription: workspace_subscription,
             terminal_registry: HashMap::new(),
             dirty_agent_terminals: HashSet::new(),
+            agent_refresh_queue: DeadlineQueue::default(),
+            agent_refresh_deadline: None,
             context_refresh_task: None,
+            context_refresh_queue: DeadlineQueue::default(),
+            context_refresh_deadline: None,
+            git_root_recheck_task: None,
+            git_root_recheck_schedule: GitRootRecheckSchedule::default(),
             agent_refresh_task: None,
             session_persist_task: None,
             session_store,
@@ -317,6 +483,7 @@ impl WorkspacesPanel {
             session_persistence: SessionPersistence::new(restored),
             attached_worktrees: HashMap::new(),
             pending_worktrees: BTreeSet::new(),
+            path_context_cache: std::sync::Mutex::new(PathContextCache::default()),
             agent_chats: HashMap::new(),
             next_agent_activity_sequence: 0,
         }
@@ -417,7 +584,7 @@ impl WorkspacesPanel {
             }
             workspace::Event::ActiveItemChanged => {
                 self.invalidate_active_workspace_agents();
-                self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+                self.schedule_active_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
             }
             workspace::Event::CenterLayoutChanged => self.schedule_session_persistence(cx),
             _ => {}
@@ -451,12 +618,12 @@ impl WorkspacesPanel {
             registered.view = view.downgrade();
             registered.context = context;
             self.dirty_agent_terminals.insert(item_id);
-            self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+            self.schedule_agent_refresh_for(item_id, EVENT_COALESCE_INTERVAL, cx);
             if context_changed {
                 self.schedule_context_refresh(cx);
             }
             return;
-        }
+        };
 
         self.terminal_registry.insert(
             item_id,
@@ -467,7 +634,7 @@ impl WorkspacesPanel {
             },
         );
         self.dirty_agent_terminals.insert(item_id);
-        self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+        self.schedule_agent_refresh_for(item_id, EVENT_COALESCE_INTERVAL, cx);
         self.schedule_context_refresh(cx);
 
         cx.subscribe_in(
@@ -486,7 +653,7 @@ impl WorkspacesPanel {
                 .on_focus_in(&focus, window, move |_view, _window, cx| {
                     let _ = panel.update(cx, |panel, cx| {
                         panel.invalidate_active_workspace_agents();
-                        panel.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+                        panel.schedule_active_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
                     });
                 })
                 .detach();
@@ -500,6 +667,18 @@ impl WorkspacesPanel {
         event: &terminal::Event,
         cx: &mut Context<Self>,
     ) {
+        let workspace_id = self
+            .terminal_registry
+            .get(&item_id)
+            .map(|terminal| terminal.workspace_id)
+            .unwrap_or(self.active);
+        let event_delay = self.event_coalesce_interval(workspace_id, cx);
+        if matches!(event, terminal::Event::Wakeup)
+            && let Some(directory) = terminal.read(cx).working_directory()
+        {
+            self.schedule_negative_git_root_recheck(directory, cx);
+        }
+
         if matches!(
             event,
             terminal::Event::Wakeup
@@ -508,7 +687,7 @@ impl WorkspacesPanel {
                 | terminal::Event::CloseTerminal
         ) {
             self.dirty_agent_terminals.insert(item_id);
-            self.schedule_agent_refresh(EVENT_COALESCE_INTERVAL, cx);
+            self.schedule_agent_refresh_for(item_id, event_delay, cx);
         }
 
         let next = Self::terminal_context_fingerprint(terminal.read(cx));
@@ -524,8 +703,91 @@ impl WorkspacesPanel {
                 }
             });
         if context_changed {
+            self.schedule_context_refresh_for(workspace_id, event_delay, cx);
+        }
+    }
+
+    fn event_coalesce_interval(&self, workspace_id: WorkspaceId, cx: &App) -> Duration {
+        if terminal_view::visual_power_state(cx).low_power && workspace_id != self.active {
+            Duration::from_secs(1)
+        } else {
+            EVENT_COALESCE_INTERVAL
+        }
+    }
+
+    /// Negative Git-root entries are cheap to retain while a shell is idle,
+    /// but terminal output is a useful signal that a command such as
+    /// `git init` may have changed the answer. Low-power support can widen
+    /// this policy interval without changing the cache's event-driven shape.
+    fn negative_git_root_recheck_interval(&self, cx: &App) -> Duration {
+        // Low Power Mode deliberately trades repository-discovery latency for
+        // fewer filesystem wakeups while terminal output is active.
+        if terminal_view::visual_power_state(cx).low_power {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+
+    fn schedule_negative_git_root_recheck(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        let interval = self.negative_git_root_recheck_interval(cx);
+        let recheck = self
+            .path_context_cache
+            .lock()
+            .expect("path context cache poisoned")
+            .git_root_recheck(&directory, interval);
+        let update = self
+            .git_root_recheck_schedule
+            .observe(directory, recheck, Instant::now());
+        self.apply_git_root_recheck_schedule(update, cx);
+    }
+
+    fn clear_pending_git_root_rechecks(&mut self) {
+        self.git_root_recheck_schedule.clear();
+        self.git_root_recheck_task.take();
+    }
+
+    fn apply_git_root_recheck_schedule(
+        &mut self,
+        update: GitRootRecheckScheduleUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        if update.refresh {
             self.schedule_context_refresh(cx);
         }
+        let GitRootRecheckTimerUpdate::Arm(delay) = update.timer else {
+            if matches!(update.timer, GitRootRecheckTimerUpdate::Cancel) {
+                self.git_root_recheck_task.take();
+            }
+            return;
+        };
+        self.git_root_recheck_task.take();
+        self.git_root_recheck_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                this.git_root_recheck_task.take();
+                let pending = this.git_root_recheck_schedule.take_firing_paths();
+                let interval = this.negative_git_root_recheck_interval(cx);
+                let states = {
+                    let mut cache = this
+                        .path_context_cache
+                        .lock()
+                        .expect("path context cache poisoned");
+                    pending
+                        .into_iter()
+                        .map(|directory| {
+                            let state = cache.git_root_recheck(&directory, interval);
+                            (directory, state)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let update = this
+                    .git_root_recheck_schedule
+                    .reduce_fired(states, Instant::now());
+                this.apply_git_root_recheck_schedule(update, cx);
+            })
+            .ok();
+        }));
     }
 
     fn invalidate_active_workspace_agents(&mut self) {
@@ -540,21 +802,65 @@ impl WorkspacesPanel {
     }
 
     fn schedule_agent_refresh(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        if self.agent_refresh_task.is_some() {
+        let deadline = Instant::now() + delay;
+        for item_id in &self.dirty_agent_terminals {
+            if !self.agent_refresh_queue.deadlines.contains_key(item_id) {
+                self.agent_refresh_queue.schedule(*item_id, deadline);
+            }
+        }
+        self.arm_agent_refresh(cx);
+    }
+
+    fn schedule_agent_refresh_for(
+        &mut self,
+        item_id: EntityId,
+        delay: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.dirty_agent_terminals.insert(item_id);
+        self.agent_refresh_queue
+            .schedule(item_id, Instant::now() + delay);
+        self.arm_agent_refresh(cx);
+    }
+
+    fn schedule_active_agent_refresh(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let deadline = Instant::now() + delay;
+        for (item_id, terminal) in &self.terminal_registry {
+            if terminal.workspace_id == self.active {
+                self.dirty_agent_terminals.insert(*item_id);
+                self.agent_refresh_queue.schedule(*item_id, deadline);
+            }
+        }
+        self.arm_agent_refresh(cx);
+    }
+
+    fn arm_agent_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(next_deadline) = self.agent_refresh_queue.earliest() else {
+            return;
+        };
+        if self
+            .agent_refresh_deadline
+            .is_some_and(|current| current <= next_deadline)
+        {
             return;
         }
+        self.agent_refresh_task.take();
+        self.agent_refresh_deadline = Some(next_deadline);
+        let delay = next_deadline.saturating_duration_since(Instant::now());
         self.agent_refresh_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update(cx, |this, cx| {
                 this.agent_refresh_task.take();
-                this.refresh_dirty_agent_chats(cx);
+                this.agent_refresh_deadline.take();
+                let due = this.agent_refresh_queue.take_due(Instant::now());
+                this.refresh_dirty_agent_chats(due, cx);
+                this.schedule_agent_refresh(Duration::ZERO, cx);
             })
             .ok();
         }));
     }
 
-    fn refresh_dirty_agent_chats(&mut self, cx: &mut Context<Self>) {
-        let dirty = self.dirty_agent_terminals.drain().collect::<Vec<_>>();
+    fn refresh_dirty_agent_chats(&mut self, dirty: Vec<EntityId>, cx: &mut Context<Self>) {
         let active_item_id = self
             .workspace
             .upgrade()
@@ -565,6 +871,7 @@ impl WorkspacesPanel {
         let mut released = Vec::new();
 
         for item_id in dirty {
+            self.dirty_agent_terminals.remove(&item_id);
             let Some(registered) = self.terminal_registry.get(&item_id) else {
                 continue;
             };
@@ -592,7 +899,7 @@ impl WorkspacesPanel {
         }
 
         for item_id in released {
-            self.remove_terminal_registration(item_id);
+            self.remove_terminal_registration(item_id, cx);
         }
         if !follow_up.is_empty() {
             self.dirty_agent_terminals.extend(follow_up);
@@ -608,15 +915,59 @@ impl WorkspacesPanel {
     }
 
     fn schedule_context_refresh_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        if self.context_refresh_task.is_some() {
+        let now = Instant::now();
+        let low_power = terminal_view::visual_power_state(cx).low_power;
+        for entry in &self.entries {
+            let effective_delay = if low_power && entry.id != self.active {
+                delay.max(Duration::from_secs(1))
+            } else {
+                delay
+            };
+            self.context_refresh_queue
+                .schedule(entry.id, now + effective_delay);
+        }
+        self.arm_context_refresh(cx);
+    }
+
+    fn schedule_context_refresh_for(
+        &mut self,
+        workspace_id: WorkspaceId,
+        delay: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let delay =
+            if terminal_view::visual_power_state(cx).low_power && workspace_id != self.active {
+                delay.max(Duration::from_secs(1))
+            } else {
+                delay
+            };
+        self.context_refresh_queue
+            .schedule(workspace_id, Instant::now() + delay);
+        self.arm_context_refresh(cx);
+    }
+
+    fn arm_context_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(next_deadline) = self.context_refresh_queue.earliest() else {
+            return;
+        };
+        if self
+            .context_refresh_deadline
+            .is_some_and(|current| current <= next_deadline)
+        {
             return;
         }
+        self.context_refresh_task.take();
+        self.context_refresh_deadline = Some(next_deadline);
+        let delay = next_deadline.saturating_duration_since(Instant::now());
         self.context_refresh_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update(cx, |this, cx| {
                 this.context_refresh_task.take();
-                this.refresh_workspace_contexts(cx);
+                this.context_refresh_deadline.take();
+                let due = this.context_refresh_queue.take_due(Instant::now());
+                this.refresh_workspace_contexts_for(&due, cx);
                 this.request_metadata_refreshes(cx);
+                this.arm_context_refresh(cx);
             })
             .ok();
         }));
@@ -639,17 +990,21 @@ impl WorkspacesPanel {
         if mounted_in_active || parked {
             return;
         }
-        if self.remove_terminal_registration(item_id) {
+        if self.remove_terminal_registration(item_id, cx) {
             self.schedule_context_refresh(cx);
             cx.notify();
         }
     }
 
-    fn remove_terminal_registration(&mut self, item_id: EntityId) -> bool {
+    fn remove_terminal_registration(&mut self, item_id: EntityId, cx: &mut Context<Self>) -> bool {
         let Some(registered) = self.terminal_registry.remove(&item_id) else {
             return false;
         };
         self.dirty_agent_terminals.remove(&item_id);
+        self.agent_refresh_queue.remove(&item_id);
+        self.agent_refresh_task.take();
+        self.agent_refresh_deadline.take();
+        self.arm_agent_refresh(cx);
         self.agent_chats.remove(&(registered.workspace_id, item_id));
         true
     }
@@ -978,6 +1333,10 @@ impl WorkspacesPanel {
 
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
+        self.context_refresh_queue.remove(&id);
+        self.context_refresh_task.take();
+        self.context_refresh_deadline.take();
+        self.arm_context_refresh(cx);
         self.agent_chats
             .retain(|(workspace_id, _), _| *workspace_id != id);
         self.reconcile_git_context(cx);
@@ -1015,20 +1374,54 @@ impl WorkspacesPanel {
     }
 
     fn refresh_workspace_contexts(&mut self, cx: &mut Context<Self>) {
-        let active_context = self
-            .workspace
-            .upgrade()
-            .map(|workspace| workspace_context_for_active_workspace(workspace.read(cx), cx));
+        let workspace_ids = self
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        for id in &workspace_ids {
+            self.context_refresh_queue.remove(id);
+        }
+        if self.context_refresh_queue.earliest().is_none() {
+            self.context_refresh_task.take();
+            self.context_refresh_deadline.take();
+        }
+        self.refresh_workspace_contexts_for(&workspace_ids, cx);
+    }
+
+    fn refresh_workspace_contexts_for(
+        &mut self,
+        workspace_ids: &[WorkspaceId],
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_ids = workspace_ids.iter().copied().collect::<HashSet<_>>();
+        let active_context = workspace_ids
+            .contains(&self.active)
+            .then(|| {
+                self.workspace.upgrade().map(|workspace| {
+                    workspace_context_for_active_workspace(
+                        workspace.read(cx),
+                        &self.path_context_cache,
+                        cx,
+                    )
+                })
+            })
+            .flatten();
         let mut changed = false;
 
         for entry in &mut self.entries {
+            if !workspace_ids.contains(&entry.id) {
+                continue;
+            }
             let observed = if entry.id == self.active {
                 active_context.clone().unwrap_or_default()
             } else {
                 entry
                     .stored
                     .as_ref()
-                    .map(|layout| workspace_context_for_stored_layout(layout, cx))
+                    .map(|layout| {
+                        workspace_context_for_stored_layout(layout, &self.path_context_cache, cx)
+                    })
                     .unwrap_or_default()
             };
             let previous_context = entry.context.clone();
@@ -1055,9 +1448,19 @@ impl WorkspacesPanel {
         if self
             .entries
             .iter()
-            .any(|entry| !entry.context_authoritative)
+            .any(|entry| workspace_ids.contains(&entry.id) && !entry.context_authoritative)
         {
-            self.schedule_context_refresh_after(AGENT_REFRESH_INTERVAL, cx);
+            let incomplete = self
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    (workspace_ids.contains(&entry.id) && !entry.context_authoritative)
+                        .then_some(entry.id)
+                })
+                .collect::<Vec<_>>();
+            for id in incomplete {
+                self.schedule_context_refresh_for(id, AGENT_REFRESH_INTERVAL, cx);
+            }
         }
     }
 
@@ -1320,6 +1723,141 @@ mod tests {
         assert!(is_shell_process("/usr/bin/bash"));
         assert!(is_shell_process("pwsh"));
         assert!(!is_shell_process("cargo"));
+    }
+
+    #[test]
+    fn git_root_recheck_reducer_covers_scheduling_cancellation_and_mixed_fire() {
+        let now = Instant::now();
+        let first = PathBuf::from("/outside/first");
+        let second = PathBuf::from("/outside/second");
+        let mut schedule = GitRootRecheckSchedule::default();
+
+        let first_update = schedule.observe(
+            first.clone(),
+            GitRootRecheck::Pending(Duration::from_secs(1)),
+            now,
+        );
+        assert_eq!(
+            first_update.timer,
+            GitRootRecheckTimerUpdate::Arm(Duration::from_secs(1))
+        );
+        assert_eq!(
+            schedule
+                .observe(
+                    first.clone(),
+                    GitRootRecheck::Pending(Duration::from_secs(1)),
+                    now,
+                )
+                .timer,
+            GitRootRecheckTimerUpdate::Keep
+        );
+        assert_eq!(
+            schedule
+                .observe(
+                    second.clone(),
+                    GitRootRecheck::Pending(Duration::from_millis(500)),
+                    now,
+                )
+                .timer,
+            GitRootRecheckTimerUpdate::Arm(Duration::from_millis(500))
+        );
+
+        assert_eq!(
+            schedule.observe(second.clone(), GitRootRecheck::Positive, now),
+            GitRootRecheckScheduleUpdate {
+                refresh: false,
+                timer: GitRootRecheckTimerUpdate::Keep,
+            }
+        );
+        assert_eq!(
+            schedule.observe(first.clone(), GitRootRecheck::Due, now),
+            GitRootRecheckScheduleUpdate {
+                refresh: true,
+                timer: GitRootRecheckTimerUpdate::Cancel,
+            }
+        );
+        assert_eq!(schedule.clear(), GitRootRecheckTimerUpdate::Keep);
+
+        schedule.observe(
+            first.clone(),
+            GitRootRecheck::Pending(Duration::from_secs(1)),
+            now,
+        );
+        schedule.observe(
+            second.clone(),
+            GitRootRecheck::Pending(Duration::from_secs(2)),
+            now,
+        );
+        assert_eq!(schedule.take_firing_paths().len(), 2);
+        assert_eq!(
+            schedule.reduce_fired(
+                [
+                    (first, GitRootRecheck::Due),
+                    (
+                        second.clone(),
+                        GitRootRecheck::Pending(Duration::from_secs(1)),
+                    ),
+                ],
+                now + Duration::from_secs(1),
+            ),
+            GitRootRecheckScheduleUpdate {
+                refresh: true,
+                timer: GitRootRecheckTimerUpdate::Arm(Duration::from_secs(1)),
+            }
+        );
+        assert_eq!(schedule.pending, HashSet::from([second]));
+        assert_eq!(schedule.clear(), GitRootRecheckTimerUpdate::Cancel);
+        assert!(schedule.pending.is_empty());
+    }
+
+    #[test]
+    fn deadline_queue_keeps_inactive_work_behind_active_preemption_and_settles() {
+        let now = Instant::now();
+        let mut queue = DeadlineQueue::default();
+        queue.schedule(2_u64, now + Duration::from_secs(1));
+        queue.schedule(1_u64, now + EVENT_COALESCE_INTERVAL);
+
+        assert_eq!(queue.earliest(), Some(now + EVENT_COALESCE_INTERVAL));
+        assert_eq!(queue.take_due(now + EVENT_COALESCE_INTERVAL), vec![1_u64]);
+        assert_eq!(queue.earliest(), Some(now + Duration::from_secs(1)));
+        assert!(queue.take_due(now + Duration::from_millis(999)).is_empty());
+        assert_eq!(queue.take_due(now + Duration::from_secs(1)), vec![2_u64]);
+        assert_eq!(queue.earliest(), None, "settled queues must stay quiescent");
+
+        let mut promoted_same_agent = DeadlineQueue::default();
+        promoted_same_agent.schedule(9_u64, now + Duration::from_secs(1));
+        promoted_same_agent.schedule(9_u64, now + EVENT_COALESCE_INTERVAL);
+        assert_eq!(
+            promoted_same_agent.earliest(),
+            Some(now + EVENT_COALESCE_INTERVAL),
+            "the same terminal becoming active must promote its existing deadline"
+        );
+
+        let mut existing_contexts = DeadlineQueue::default();
+        existing_contexts.schedule(1_u64, now + Duration::from_secs(1));
+        existing_contexts.schedule(2_u64, now + Duration::from_secs(1));
+        existing_contexts.schedule(1_u64, now + EVENT_COALESCE_INTERVAL);
+        existing_contexts.schedule(2_u64, now + Duration::from_secs(1));
+        assert_eq!(
+            existing_contexts.take_due(now + EVENT_COALESCE_INTERVAL),
+            vec![1_u64]
+        );
+        assert_eq!(
+            existing_contexts.earliest(),
+            Some(now + Duration::from_secs(1))
+        );
+
+        let mut removed_earliest = DeadlineQueue::default();
+        removed_earliest.schedule(1_u64, now + EVENT_COALESCE_INTERVAL);
+        removed_earliest.schedule(2_u64, now + Duration::from_secs(1));
+        removed_earliest.remove(&1);
+        assert_eq!(
+            removed_earliest.earliest(),
+            Some(now + Duration::from_secs(1)),
+            "removing the armed key must expose the next real deadline"
+        );
+        removed_earliest.remove(&2);
+        assert_eq!(removed_earliest.earliest(), None);
     }
 
     #[test]
