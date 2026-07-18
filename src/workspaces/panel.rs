@@ -259,10 +259,7 @@ impl WorkspacesPanel {
         let cwd_label = workspace_cwd_label(&context).filter(|cwd| cwd != &entry.name);
         let git_label = match &entry.git {
             MetadataState::Ready(git) => Some(git.compact_label()),
-            MetadataState::Pending => Some("git refreshing".to_string()),
-            MetadataState::Unavailable(_) | MetadataState::Error(_) => {
-                Some("git unavailable".to_string())
-            }
+            MetadataState::Unavailable(_) => Some("git unavailable".to_string()),
             MetadataState::NotRequested => None,
         };
         let diff_stats = match &entry.git {

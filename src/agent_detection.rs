@@ -244,7 +244,7 @@ fn outcome(signal: DetectionSignal, evidence: &'static str) -> DetectionOutcome 
 }
 
 /// Allocation-free ASCII-folding search. Non-ASCII bytes (such as UI arrows)
-/// are compared exactly, and this runs on every 300ms detection tick.
+/// are compared exactly, and this runs when terminal events invalidate detection.
 fn contains_ci(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;

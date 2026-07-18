@@ -9,7 +9,7 @@
 //! stays snappy regardless of how many terminals are open.
 //!
 //! This file owns the [`WorkspacesPanel`] entry list, activation state
-//! machine, and periodic refresh loops (2s context, 300ms agent). The other
+//! machine, and event-driven terminal/context refreshes. The other
 //! concerns live in submodules: [`agent_chat`] (agent chat rail state),
 //! [`git_context`] (repository discovery/reconciliation), [`panel`]
 //! (rendering), and [`persistence`] (layout capture/restore, session writes).
@@ -24,7 +24,7 @@ pub(crate) use self::persistence::{RestoredTerminal, restore_startup_layout};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -93,7 +93,6 @@ struct WorkspaceEntry {
     git_discovery: GitDiscoveryState,
     git: MetadataState<GitMetadata>,
     metadata_root: Option<PathBuf>,
-    metadata_refreshed_at: Option<Instant>,
     /// The complete persisted layout, retained until every fresh terminal has
     /// materialized so an interrupted restore can retry without losing tabs.
     restore: Option<LayoutSnapshot>,
@@ -237,7 +236,6 @@ impl WorkspacesPanel {
                         git_discovery: GitDiscoveryState::Restoring,
                         git: MetadataState::NotRequested,
                         metadata_root: None,
-                        metadata_refreshed_at: None,
                         // Sessions saved before empty panes were pruned at
                         // capture time may still carry them; prune here so the
                         // retry snapshot and its failed-restore paths agree.
@@ -265,7 +263,6 @@ impl WorkspacesPanel {
                     git_discovery: GitDiscoveryState::Authoritative,
                     git: MetadataState::NotRequested,
                     metadata_root: None,
-                    metadata_refreshed_at: None,
                     restore: None,
                     failed_restores: Vec::new(),
                     stored: None,
@@ -286,7 +283,17 @@ impl WorkspacesPanel {
                 this.handle_workspace_event(event, window, cx);
             },
         );
-        Self::subscribe_to_git_metadata(&workspace_entity, cx);
+        // Panels can be constructed from inside a Workspace update. Subscribe
+        // after that update completes so reading the project's Git store does
+        // not re-enter the Workspace entity.
+        let panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            panel
+                .update(cx, |_, cx| {
+                    Self::subscribe_to_git_metadata(&workspace_entity, cx)
+                })
+                .ok();
+        });
         Self {
             scope_id: cx.entity_id(),
             workspace,
@@ -700,7 +707,6 @@ impl WorkspacesPanel {
             git_discovery: GitDiscoveryState::Authoritative,
             git: MetadataState::NotRequested,
             metadata_root: None,
-            metadata_refreshed_at: None,
             restore: None,
             failed_restores: Vec::new(),
             stored: None,
@@ -1339,7 +1345,6 @@ mod tests {
             git_discovery: GitDiscoveryState::Authoritative,
             git: MetadataState::NotRequested,
             metadata_root: None,
-            metadata_refreshed_at: None,
             restore: None,
             failed_restores: Vec::new(),
             stored: None,

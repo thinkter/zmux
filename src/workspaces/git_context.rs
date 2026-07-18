@@ -16,7 +16,6 @@ use std::time::Duration;
 use gpui::{App, Context, Entity, EntityId, Global, SharedString, Task, WeakEntity, Window};
 use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
-use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::ItemHandle;
 
@@ -600,7 +599,6 @@ impl WorkspacesPanel {
             let root = entry.selected_git_root.clone();
             if entry.metadata_root != root {
                 entry.metadata_root = root.clone();
-                entry.metadata_refreshed_at = None;
             }
             let git = if let Some(root) = root {
                 let repository = repositories.iter().find(|repository| {
@@ -972,7 +970,6 @@ mod tests {
                 git_discovery: GitDiscoveryState::Restoring,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
-                metadata_refreshed_at: None,
                 restore: Some(LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: vec![
@@ -1077,7 +1074,6 @@ mod tests {
                 git_discovery: GitDiscoveryState::Restoring,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
-                metadata_refreshed_at: None,
                 restore: Some(LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: Vec::new(),
@@ -1139,7 +1135,6 @@ mod tests {
                 git_discovery: GitDiscoveryState::Restoring,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
-                metadata_refreshed_at: None,
                 restore: Some(LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: vec![TerminalSnapshot::fresh_shell(Some(selected.clone()))],
@@ -1320,7 +1315,6 @@ mod tests {
                 git_discovery: GitDiscoveryState::Authoritative,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
-                metadata_refreshed_at: None,
                 restore: None,
                 failed_restores: Vec::new(),
                 stored: Some(StoredLayout::Leaf {

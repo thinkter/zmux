@@ -7,10 +7,8 @@ use project::git_store::RepositorySnapshot;
 pub enum MetadataState<T> {
     #[default]
     NotRequested,
-    Pending,
     Ready(T),
     Unavailable(String),
-    Error(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
