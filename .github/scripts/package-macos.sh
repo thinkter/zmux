@@ -8,12 +8,15 @@ zmux_version="$(awk '/^\[package\]/{in_package=1; next} in_package && /^version 
 mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"
 install -m 755 target/release/zmux "$app_bundle/Contents/MacOS/zmux"
 install -m 644 LICENSE "$app_bundle/Contents/Resources/LICENSE"
+install -m 644 packaging/icons/macos/zmux.icns "$app_bundle/Contents/Resources/zmux.icns"
 cp packaging/macos/Info.plist "$app_bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $zmux_version" "$app_bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $zmux_version" "$app_bundle/Contents/Info.plist"
 
 plutil -lint "$app_bundle/Contents/Info.plist"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_bundle/Contents/Info.plist")" = "$bundle_id"
+test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app_bundle/Contents/Info.plist")" = 'zmux.icns'
+test -s "$app_bundle/Contents/Resources/zmux.icns"
 
 credentials=(
   APPLE_APP_PASSWORD

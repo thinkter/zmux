@@ -114,6 +114,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Decompiling the MSI failed' }
 if (-not (Select-String -Path $decompiled -SimpleMatch 'io.github.thinkter.zmux')) {
   throw 'The MSI does not contain zmux AppUserModelID metadata'
 }
+if (-not (Select-String -Path $decompiled -SimpleMatch 'ARPPRODUCTICON')) {
+  throw 'The MSI does not contain Add/Remove Programs icon metadata'
+}
+if (-not (Select-String -Path $decompiled -SimpleMatch 'ZMuxIcon.ico')) {
+  throw 'The MSI does not contain the zmux shortcut icon'
+}
 
 $install = Start-Process msiexec.exe `
   -ArgumentList @('/i', $msi.FullName, '/qn', '/norestart') `
@@ -132,6 +138,11 @@ foreach ($path in @($installedExecutable, $installedGuiExecutable, $installedLic
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($installedShortcut)
 if ($shortcut.TargetPath -ne $installedGuiExecutable) {
   throw "Start Menu shortcut targets $($shortcut.TargetPath), expected $installedGuiExecutable"
+}
+Add-Type -AssemblyName System.Drawing
+$associatedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($installedGuiExecutable)
+if (-not $associatedIcon -or $associatedIcon.Width -lt 16 -or $associatedIcon.Height -lt 16) {
+  throw 'Installed GUI executable does not expose the embedded zmux icon'
 }
 
 $stdout = Join-Path $env:RUNNER_TEMP 'zmux-windows-smoke.stdout.log'

@@ -159,6 +159,7 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit"] }
@@ -180,6 +181,9 @@ windows = { version = "0.61", features = [
     "Win32_System_WinRT",
     "Win32_UI_Shell",
 ] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1.31"
 
 [dev-dependencies]
 async-channel = "2"

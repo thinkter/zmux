@@ -10,6 +10,8 @@
 	<string>zmux</string>
 	<key>CFBundleIdentifier</key>
 	<string>io.github.thinkter.zmux</string>
+	<key>CFBundleIconFile</key>
+	<string>zmux.icns</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

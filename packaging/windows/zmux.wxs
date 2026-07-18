@@ -10,6 +10,10 @@
       AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage="A newer version of zmux is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon
+      Id="ZMuxIcon.ico"
+      SourceFile="$(var.ProjectDir)\packaging\icons\windows\zmux.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ZMuxIcon.ico" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="LocalProgramsFolder" Name="Programs">
@@ -25,7 +29,9 @@
                 Name="zmux"
                 Description="zmux terminal workspace"
                 WorkingDirectory="INSTALLFOLDER"
-                Advertise="no">
+                Advertise="no"
+                Icon="ZMuxIcon.ico"
+                IconIndex="0">
                 <ShortcutProperty
                   Key="System.AppUserModel.ID"
                   Value="io.github.thinkter.zmux" />

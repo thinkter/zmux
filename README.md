@@ -113,13 +113,14 @@ has actually been recorded.
 
 Native delivery uses the same application identity on Linux, macOS, and
 Windows. Release artifacts include the Linux desktop entry, macOS app bundle,
-and Windows installer metadata required by those operating systems; source
-builds still retain the full in-app history if the host has no usable
-notification service or packaged identity.
+and Windows installer metadata required by those operating systems. Each format
+also carries the same branded application icon; source builds still retain the
+full in-app history if the host has no usable notification service or packaged
+identity.
 
 Tagged releases are the distributable artifacts: Linux is a `.deb` that
 installs `zmux` on `PATH` together with its XDG desktop identity (plus a
-distro-neutral `.tar.gz` carrying the binary, license, and desktop file for
+distro-neutral `.tar.gz` carrying the binary, license, desktop file, and icons for
 non-Debian distributions), macOS is a Developer ID-signed and Apple-notarized
 app bundle, and Windows is an Authenticode-signed MSI whose shortcut shares
 zmux's AppUserModelID. Install the Linux package with

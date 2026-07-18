@@ -2,6 +2,7 @@
 set -euo pipefail
 
 desktop_file="packaging/linux/io.github.thinkter.zmux.desktop"
+icon_root="packaging/icons/linux/hicolor"
 deb_root="dist/deb-root"
 archive_root="dist/zmux-linux-x86_64"
 zmux_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zmux") | .version')"
@@ -11,12 +12,19 @@ mkdir -p \
   "$deb_root/DEBIAN" \
   "$deb_root/usr/bin" \
   "$deb_root/usr/share/applications" \
-  "$deb_root/usr/share/doc/zmux"
+  "$deb_root/usr/share/doc/zmux" \
+  "$deb_root/usr/share/icons/hicolor"
 install -m 755 target/release/zmux "$deb_root/usr/bin/zmux"
 install -m 644 "$desktop_file" "$deb_root/usr/share/applications/io.github.thinkter.zmux.desktop"
 install -m 755 packaging/linux/postinst "$deb_root/DEBIAN/postinst"
 install -m 755 packaging/linux/postrm "$deb_root/DEBIAN/postrm"
 install -m 644 LICENSE "$deb_root/usr/share/doc/zmux/copyright"
+for icon in "$icon_root"/*/apps/io.github.thinkter.zmux.png; do
+  size="$(basename "$(dirname "$(dirname "$icon")")")"
+  destination="$deb_root/usr/share/icons/hicolor/$size/apps"
+  mkdir -p "$destination"
+  install -m 644 "$icon" "$destination/io.github.thinkter.zmux.png"
+done
 
 mkdir -p debian
 install -m 644 packaging/linux/control debian/control
@@ -39,6 +47,12 @@ install -m 755 target/release/zmux "$archive_root/zmux"
 install -m 644 LICENSE "$archive_root/LICENSE"
 install -m 644 README.md "$archive_root/README.md"
 install -m 644 "$desktop_file" "$archive_root/io.github.thinkter.zmux.desktop"
+for icon in "$icon_root"/*/apps/io.github.thinkter.zmux.png; do
+  relative_path="${icon#packaging/icons/linux/}"
+  destination="$archive_root/share/icons/$(dirname "$relative_path")"
+  mkdir -p "$destination"
+  install -m 644 "$icon" "$destination/io.github.thinkter.zmux.png"
+done
 tar -C dist -czf dist/zmux-linux-x86_64.tar.gz zmux-linux-x86_64
 tar -tzf dist/zmux-linux-x86_64.tar.gz
 
@@ -46,6 +60,8 @@ sudo dpkg --install dist/zmux-linux-x86_64.deb
 test "$(command -v zmux)" = /usr/bin/zmux
 desktop-file-validate /usr/share/applications/io.github.thinkter.zmux.desktop
 test "$(grep '^Exec=' /usr/share/applications/io.github.thinkter.zmux.desktop)" = 'Exec=zmux'
+test "$(grep '^Icon=' /usr/share/applications/io.github.thinkter.zmux.desktop)" = 'Icon=io.github.thinkter.zmux'
+test -s /usr/share/icons/hicolor/256x256/apps/io.github.thinkter.zmux.png
 dbus-run-session -- xvfb-run -a sh -eu -c '
   gtk-launch io.github.thinkter.zmux >"$RUNNER_TEMP/zmux-linux-smoke.log" 2>&1 &
   launcher=$!

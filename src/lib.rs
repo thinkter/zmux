@@ -1,5 +1,6 @@
 mod agent_detection;
 mod app;
+mod app_icon;
 mod assets;
 mod cli_server;
 mod desktop_notifications;

@@ -14229,6 +14229,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml 1.1.2+spec-1.1.0",
+ "version_check",
+]
+
+[[package]]
 name = "winsafe"
 version = "0.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15042,6 +15052,7 @@ dependencies = [
  "grammars",
  "hmac",
  "http_client",
+ "image",
  "language",
  "mac-usernotifications",
  "mio",
@@ -15071,6 +15082,7 @@ dependencies = [
  "vim",
  "vim_mode_setting",
  "windows 0.61.3",
+ "winresource",
  "workspace",
  "zbus",
  "zed_actions",

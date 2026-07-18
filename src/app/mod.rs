@@ -41,6 +41,7 @@ pub fn run() -> anyhow::Result<()> {
     application()
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
+            crate::app_icon::configure_native_app_icon();
             let app_state = init_zmux(cx);
             load_user_settings(app_state.fs.clone(), cx);
 
@@ -260,6 +261,9 @@ fn build_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOpt
     let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        app_id: Some(crate::desktop_notifications::ZMUX_APPLICATION_ID.to_owned()),
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        icon: crate::app_icon::linux_window_icon(),
         ..Default::default()
     }
 }
