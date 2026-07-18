@@ -111,16 +111,19 @@ builds still retain the full in-app history if the host has no usable
 notification service or packaged identity.
 
 Tagged releases are the distributable artifacts: Linux is a `.deb` that
-installs `zmux` on `PATH` together with its XDG desktop identity, macOS is a
-Developer ID-signed and Apple-notarized app bundle, and Windows is an
-Authenticode-signed MSI whose shortcut shares zmux's AppUserModelID. Install
-the Linux package with `sudo apt install ./zmux-linux-x86_64.deb`; use the app
-bundle or MSI normally on macOS and Windows. Non-tag CI artifacts whose names
-end in `-unsigned` are macOS/Windows packaging smoke-test outputs, not end-user
-releases. Tagged builds fail closed unless all Apple notarization or Windows
-Authenticode credentials are available, and the release job accepts only the
-three exact signed platform artifact names. The Linux package requires a
-Vulkan-capable driver and declares the Vulkan loader dependency explicitly.
+installs `zmux` on `PATH` together with its XDG desktop identity (plus a
+distro-neutral `.tar.gz` carrying the binary, license, and desktop file for
+non-Debian distributions), macOS is a Developer ID-signed and Apple-notarized
+app bundle, and Windows is an Authenticode-signed MSI whose shortcut shares
+zmux's AppUserModelID. Install the Linux package with
+`sudo apt install ./zmux-linux-x86_64.deb`, or unpack the tarball anywhere and
+run its `zmux` binary directly; use the app bundle or MSI normally on macOS and
+Windows. Non-tag CI artifacts whose names end in `-unsigned` are macOS/Windows
+packaging smoke-test outputs, not end-user releases. Tagged builds fail closed
+unless all Apple notarization or Windows Authenticode credentials are
+available, and the release job accepts only the four exact platform artifact
+names. The Linux packages require a Vulkan-capable driver; the `.deb` declares
+the Vulkan loader dependency explicitly.
 
 Build notes:
 
@@ -130,6 +133,7 @@ Build notes:
 - Linux and FreeBSD builds enable `gpui_platform`'s `font-kit`, `wayland`, and `x11` backends. macOS and Windows avoid those Linux display features in this crate's target-specific dependency configuration.
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.
 - Release CI pins Ubuntu 24.04, macOS 15 (with a macOS 12 deployment target), and Windows 2025; the Linux `.deb` therefore targets the Ubuntu 24.04/glibc compatibility baseline.
+- Release builds are dispatched manually from the Actions tab. Plain dispatches package immediately and skip formatting, Clippy, and the test suites unless the `full_validation` input is enabled; dispatches on a `v*` tag always run every check and require the signing credentials. Windows runs the suite under `cargo nextest` so each test gets its own process (ConPTY state is process-wide), with retries configured in `.config/nextest.toml` for spawn-timeout flakes.
 - After `Cargo.lock` is committed, use `cargo build --locked` and `cargo test --locked` to reproduce the pinned dependency set.
 
 ## Roadmap
