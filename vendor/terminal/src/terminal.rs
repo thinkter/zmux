@@ -10,10 +10,7 @@ use anyhow::{Result, bail};
 use futures_lite::future::yield_now;
 use log::trace;
 
-use futures::{
-    FutureExt,
-    channel::mpsc::{UnboundedReceiver, unbounded},
-};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
 use itertools::Itertools as _;
 use mappings::mouse::{
@@ -722,6 +719,47 @@ enum PtyEvent {
     Event(TerminalBackendEvent),
 }
 
+const MAX_PTY_EVENTS_PER_BATCH: usize = 100;
+
+/// A bounded group of ready PTY events. Wakeups only invalidate terminal
+/// content, so processing more than one in a batch does redundant work. Keep
+/// the first wakeup in its original position while preserving every control
+/// event in arrival order.
+#[derive(Default)]
+struct PtyEventBatch {
+    events: Vec<PtyEvent>,
+    contains_wakeup: bool,
+}
+
+impl PtyEventBatch {
+    fn push(&mut self, event: PtyEvent) {
+        let is_wakeup = matches!(event, PtyEvent::Event(TerminalBackendEvent::Wakeup));
+        if is_wakeup && self.contains_wakeup {
+            return;
+        }
+
+        self.contains_wakeup |= is_wakeup;
+        self.events.push(event);
+    }
+}
+
+fn drain_ready_pty_events(
+    events_rx: &mut UnboundedReceiver<PtyEvent>,
+    first_event: PtyEvent,
+) -> PtyEventBatch {
+    let mut batch = PtyEventBatch::default();
+    batch.push(first_event);
+
+    for _ in 1..MAX_PTY_EVENTS_PER_BATCH {
+        let Ok(event) = events_rx.try_recv() else {
+            break;
+        };
+        batch.push(event);
+    }
+
+    batch
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalBounds {
     pub cell_width: Pixels,
@@ -1210,62 +1248,18 @@ impl TerminalBuilder {
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
-            while let Some(event) = self.events_rx.next().await {
+            while let Some(first_event) = self.events_rx.next().await {
+                let batch = drain_ready_pty_events(&mut self.events_rx, first_event);
+
                 terminal.update(cx, |terminal, cx| {
-                    //Process the first event immediately for lowered latency
-                    terminal.process_pty_event(event, cx);
+                    for event in batch.events {
+                        terminal.process_pty_event(event, cx);
+                    }
                 })?;
 
-                'outer: loop {
-                    let mut events = Vec::new();
-
-                    #[cfg(any(test, feature = "test-support"))]
-                    let mut timer = cx.background_executor().simulate_random_delay().fuse();
-                    #[cfg(not(any(test, feature = "test-support")))]
-                    let mut timer = cx
-                        .background_executor()
-                        .timer(std::time::Duration::from_millis(4))
-                        .fuse();
-
-                    let mut wakeup = false;
-                    loop {
-                        futures::select_biased! {
-                            _ = timer => break,
-                            event = self.events_rx.next() => {
-                                if let Some(event) = event {
-                                    if matches!(event, PtyEvent::Event(TerminalBackendEvent::Wakeup))
-                                    {
-                                        wakeup = true;
-                                    } else {
-                                        events.push(event);
-                                    }
-
-                                    if events.len() > 100 {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            },
-                        }
-                    }
-
-                    if events.is_empty() && !wakeup {
-                        yield_now().await;
-                        break 'outer;
-                    }
-
-                    terminal.update(cx, |this, cx| {
-                        if wakeup {
-                            this.process_event(TerminalBackendEvent::Wakeup, cx);
-                        }
-
-                        for event in events {
-                            this.process_pty_event(event, cx);
-                        }
-                    })?;
-                    yield_now().await;
-                }
+                // Bound each turn even when a producer continuously fills the
+                // channel, so input and other UI work cannot be starved.
+                yield_now().await;
             }
             anyhow::Ok(())
         });
@@ -2945,6 +2939,68 @@ mod tests {
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
     use task::{Shell, ShellBuilder};
+
+    #[test]
+    fn pty_event_batch_collapses_wakeups_without_reordering_controls() {
+        let mut batch = PtyEventBatch::default();
+        batch.push(PtyEvent::Event(TerminalBackendEvent::Bell));
+        batch.push(PtyEvent::Event(TerminalBackendEvent::Wakeup));
+        batch.push(PtyEvent::Event(TerminalBackendEvent::Title(
+            "after wakeup".to_owned(),
+        )));
+        batch.push(PtyEvent::Event(TerminalBackendEvent::Wakeup));
+        batch.push(PtyEvent::Event(TerminalBackendEvent::Exit));
+
+        assert_eq!(batch.events.len(), 4);
+        assert!(matches!(
+            batch.events[0],
+            PtyEvent::Event(TerminalBackendEvent::Bell)
+        ));
+        assert!(matches!(
+            batch.events[1],
+            PtyEvent::Event(TerminalBackendEvent::Wakeup)
+        ));
+        assert!(matches!(
+            &batch.events[2],
+            PtyEvent::Event(TerminalBackendEvent::Title(title)) if title == "after wakeup"
+        ));
+        assert!(matches!(
+            batch.events[3],
+            PtyEvent::Event(TerminalBackendEvent::Exit)
+        ));
+    }
+
+    #[test]
+    fn ready_pty_event_drain_stops_at_boundary_and_progresses_next_turn() {
+        let (events_tx, mut events_rx) = unbounded();
+        for index in 1..=MAX_PTY_EVENTS_PER_BATCH {
+            events_tx
+                .unbounded_send(PtyEvent::Event(TerminalBackendEvent::Title(
+                    index.to_string(),
+                )))
+                .unwrap();
+        }
+
+        let first_batch = drain_ready_pty_events(
+            &mut events_rx,
+            PtyEvent::Event(TerminalBackendEvent::Title("0".to_owned())),
+        );
+        assert_eq!(first_batch.events.len(), MAX_PTY_EVENTS_PER_BATCH);
+        assert!(matches!(
+            &first_batch.events[MAX_PTY_EVENTS_PER_BATCH - 1],
+            PtyEvent::Event(TerminalBackendEvent::Title(title)) if title == "99"
+        ));
+
+        let next_event = events_rx
+            .try_recv()
+            .expect("the bounded drain must leave the next event queued");
+        let second_batch = drain_ready_pty_events(&mut events_rx, next_event);
+        assert_eq!(second_batch.events.len(), 1);
+        assert!(matches!(
+            &second_batch.events[0],
+            PtyEvent::Event(TerminalBackendEvent::Title(title)) if title == "100"
+        ));
+    }
 
     #[test]
     fn test_normalize_path_command_name() {

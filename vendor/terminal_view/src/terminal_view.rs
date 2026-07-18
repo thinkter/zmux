@@ -9,10 +9,10 @@ use editor::{
     ui_scrollbar_settings_from_raw,
 };
 use gpui::{
-    Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
-    EntityId, FocusHandle, Focusable, Font, Global, KeyContext, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription,
-    Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
+    Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EntityId, EventEmitter,
+    ExternalPaths, FocusHandle, Focusable, Font, Global, KeyContext, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled,
+    Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -78,6 +78,58 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const ZMUX_SHELL_TASK_ID_PREFIX: &str = "zmux-shell-";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputPacingAction {
+    NotifyAndScheduleFrame,
+    Suppress,
+    Idle,
+}
+
+/// Coalesces terminal output invalidations to the display cadence without
+/// adding latency to the first output after an idle period.
+#[derive(Default)]
+struct TerminalOutputFramePacer {
+    frame_scheduled: bool,
+    trailing_output: bool,
+    generation: u64,
+}
+
+impl TerminalOutputFramePacer {
+    fn output_arrived(&mut self) -> OutputPacingAction {
+        if self.frame_scheduled {
+            self.trailing_output = true;
+            OutputPacingAction::Suppress
+        } else {
+            self.frame_scheduled = true;
+            OutputPacingAction::NotifyAndScheduleFrame
+        }
+    }
+
+    fn frame_rendered(&mut self, callback_generation: u64) -> OutputPacingAction {
+        if callback_generation != self.generation || !self.frame_scheduled {
+            return OutputPacingAction::Idle;
+        }
+
+        if self.trailing_output {
+            self.trailing_output = false;
+            OutputPacingAction::NotifyAndScheduleFrame
+        } else {
+            self.frame_scheduled = false;
+            OutputPacingAction::Idle
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn reset(&mut self) {
+        self.frame_scheduled = false;
+        self.trailing_output = false;
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalTabIcon {
@@ -204,6 +256,7 @@ pub struct TerminalView {
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
     pub(crate) render_cache: RefCell<TerminalRenderCache>,
+    output_frame_pacer: TerminalOutputFramePacer,
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
@@ -266,9 +319,7 @@ impl TerminalView {
     fn tab_title(&self, terminal: &Terminal, truncate: bool) -> String {
         Self::select_tab_title(
             self.custom_title.as_deref(),
-            terminal
-                .task()
-                .map(|task| &task.spawned_task.id),
+            terminal.task().map(|task| &task.spawned_task.id),
             || terminal.foreground_process_command_name(),
             || Self::working_directory_title(terminal),
             || terminal.title(truncate),
@@ -371,8 +422,8 @@ impl TerminalView {
         }
 
         if task_id.is_some_and(|task_id| task_id.0.starts_with(ZMUX_SHELL_TASK_ID_PREFIX)) {
-            if let Some(process_title) = foreground_process_command_name()
-                .filter(|title| !title.trim().is_empty())
+            if let Some(process_title) =
+                foreground_process_command_name().filter(|title| !title.trim().is_empty())
             {
                 return process_title;
             }
@@ -474,6 +525,7 @@ impl TerminalView {
             custom_title: None,
             ime_state: None,
             render_cache: RefCell::new(TerminalRenderCache::default()),
+            output_frame_pacer: TerminalOutputFramePacer::default(),
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
@@ -1226,6 +1278,42 @@ impl TerminalView {
             subscribe_for_terminal_events(&terminal, self.workspace.clone(), window, cx);
         self.terminal = terminal;
         self.render_cache.borrow_mut().clear();
+        self.output_frame_pacer.reset();
+    }
+
+    fn terminal_output_arrived(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.output_frame_pacer.output_arrived() == OutputPacingAction::NotifyAndScheduleFrame {
+            self.emit_output_invalidation(cx);
+            self.schedule_output_frame(window, cx);
+        }
+    }
+
+    fn output_frame_rendered(
+        &mut self,
+        callback_generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.output_frame_pacer.frame_rendered(callback_generation)
+            == OutputPacingAction::NotifyAndScheduleFrame
+        {
+            self.emit_output_invalidation(cx);
+            self.schedule_output_frame(window, cx);
+        }
+    }
+
+    fn emit_output_invalidation(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        cx.emit(Event::Wakeup);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.emit(SearchEvent::MatchesInvalidated);
+    }
+
+    fn schedule_output_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.output_frame_pacer.generation();
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.output_frame_rendered(generation, window, cx);
+        });
     }
 
     fn rerun_button(task: &TaskState) -> Option<IconButton> {
@@ -1277,10 +1365,7 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
-                    cx.notify();
-                    cx.emit(Event::Wakeup);
-                    cx.emit(ItemEvent::UpdateTab);
-                    cx.emit(SearchEvent::MatchesInvalidated);
+                    terminal_view.terminal_output_arrived(window, cx);
                 }
 
                 Event::Bell => {
@@ -1986,9 +2071,7 @@ impl Item for TerminalView {
                     .starts_with(ZMUX_SHELL_TASK_ID_PREFIX)
                     && cx
                         .try_global::<RegisteredTerminalTabIndicatorHandler>()
-                        .is_some_and(|handler| {
-                            (handler.0)(self.self_handle.entity_id(), cx)
-                        });
+                        .is_some_and(|handler| (handler.0)(self.self_handle.entity_id(), cx));
                 Self::task_marks_tab_dirty(
                     &task.spawned_task.id,
                     &task.status,
@@ -2407,6 +2490,103 @@ mod tests {
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
 
     #[test]
+    fn terminal_output_frame_pacer_notifies_immediately_then_stops_when_idle() {
+        let mut pacer = TerminalOutputFramePacer::default();
+
+        assert_eq!(
+            pacer.output_arrived(),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        let generation = pacer.generation();
+        assert_eq!(pacer.frame_rendered(generation), OutputPacingAction::Idle);
+        assert_eq!(pacer.frame_rendered(generation), OutputPacingAction::Idle);
+
+        assert_eq!(
+            pacer.output_arrived(),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+    }
+
+    #[test]
+    fn terminal_output_frame_pacer_coalesces_bursts_to_one_trailing_frame() {
+        let mut pacer = TerminalOutputFramePacer::default();
+
+        assert_eq!(
+            pacer.output_arrived(),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        for _ in 0..32 {
+            assert_eq!(pacer.output_arrived(), OutputPacingAction::Suppress);
+        }
+        let generation = pacer.generation();
+
+        assert_eq!(
+            pacer.frame_rendered(generation),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        assert_eq!(pacer.frame_rendered(generation), OutputPacingAction::Idle);
+    }
+
+    #[test]
+    fn terminal_output_frame_pacer_allows_at_most_one_notification_per_frame() {
+        let mut pacer = TerminalOutputFramePacer::default();
+
+        assert_eq!(
+            pacer.output_arrived(),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        assert_eq!(pacer.output_arrived(), OutputPacingAction::Suppress);
+        let generation = pacer.generation();
+        assert_eq!(
+            pacer.frame_rendered(generation),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+
+        assert_eq!(pacer.output_arrived(), OutputPacingAction::Suppress);
+        assert_eq!(pacer.output_arrived(), OutputPacingAction::Suppress);
+        assert_eq!(
+            pacer.frame_rendered(generation),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        assert_eq!(pacer.frame_rendered(generation), OutputPacingAction::Idle);
+    }
+
+    #[test]
+    fn terminal_output_frame_pacer_reset_discards_pending_output() {
+        let mut pacer = TerminalOutputFramePacer::default();
+        assert_eq!(
+            pacer.output_arrived(),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        assert_eq!(pacer.output_arrived(), OutputPacingAction::Suppress);
+        let stale_generation = pacer.generation();
+
+        pacer.reset();
+
+        assert_eq!(
+            pacer.output_arrived(),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        let current_generation = pacer.generation();
+
+        // A callback queued for the replaced terminal must not consume the
+        // current terminal's scheduled frame.
+        assert_eq!(
+            pacer.frame_rendered(stale_generation),
+            OutputPacingAction::Idle
+        );
+        assert_eq!(pacer.output_arrived(), OutputPacingAction::Suppress);
+        assert_eq!(
+            pacer.frame_rendered(current_generation),
+            OutputPacingAction::NotifyAndScheduleFrame
+        );
+        assert_eq!(
+            pacer.frame_rendered(current_generation),
+            OutputPacingAction::Idle
+        );
+    }
+
+    #[test]
     fn zmux_shell_tab_title_uses_zed_normalized_process_titles() {
         let task_id = TaskId("zmux-shell-test-route".to_owned());
 
@@ -2524,34 +2704,18 @@ mod tests {
         let task_id = TaskId("zmux-shell-test-route".to_owned());
 
         for (process, expected) in [
-            (
-                "codex",
-                TerminalTabIcon::Named(IconName::AiOpenAi),
-            ),
-            (
-                "claude",
-                TerminalTabIcon::Named(IconName::AiClaude),
-            ),
-            (
-                "opencode",
-                TerminalTabIcon::Named(IconName::AiOpenCode),
-            ),
+            ("codex", TerminalTabIcon::Named(IconName::AiOpenAi)),
+            ("claude", TerminalTabIcon::Named(IconName::AiClaude)),
+            ("opencode", TerminalTabIcon::Named(IconName::AiOpenCode)),
             ("pi", TerminalTabIcon::Embedded("icons/ai_pi.svg")),
-            (
-                "nvim",
-                TerminalTabIcon::Embedded("icons/neovim.svg"),
-            ),
+            ("nvim", TerminalTabIcon::Embedded("icons/neovim.svg")),
             (
                 r"C:\\Program Files\\Neovim\\bin\\nvim.EXE",
                 TerminalTabIcon::Embedded("icons/neovim.svg"),
             ),
         ] {
             assert_eq!(
-                TerminalView::select_foreground_process_icon(
-                    None,
-                    Some(&task_id),
-                    Some(process),
-                ),
+                TerminalView::select_foreground_process_icon(None, Some(&task_id), Some(process),),
                 Some(expected),
                 "unexpected icon for {process}",
             );
@@ -2572,19 +2736,11 @@ mod tests {
             None,
         );
         assert_eq!(
-            TerminalView::select_foreground_process_icon(
-                None,
-                Some(&named_task_id),
-                Some("codex"),
-            ),
+            TerminalView::select_foreground_process_icon(None, Some(&named_task_id), Some("codex"),),
             None,
         );
         assert_eq!(
-            TerminalView::select_foreground_process_icon(
-                None,
-                Some(&zmux_task_id),
-                Some("cargo"),
-            ),
+            TerminalView::select_foreground_process_icon(None, Some(&zmux_task_id), Some("cargo"),),
             None,
         );
     }
