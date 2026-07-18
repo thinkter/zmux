@@ -24,6 +24,7 @@ use settings::{
 };
 use std::{
     any::Any,
+    cell::RefCell,
     cmp,
     ops::Range as StdRange,
     path::{Path, PathBuf},
@@ -38,7 +39,7 @@ use terminal::{
     Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
-use terminal_element::TerminalElement;
+use terminal_element::{TerminalElement, TerminalRenderCache};
 use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
@@ -202,6 +203,7 @@ pub struct TerminalView {
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
+    pub(crate) render_cache: RefCell<TerminalRenderCache>,
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
@@ -471,6 +473,7 @@ impl TerminalView {
             needs_serialize: false,
             custom_title: None,
             ime_state: None,
+            render_cache: RefCell::new(TerminalRenderCache::default()),
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
@@ -1222,6 +1225,7 @@ impl TerminalView {
         self._terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, self.workspace.clone(), window, cx);
         self.terminal = terminal;
+        self.render_cache.borrow_mut().clear();
     }
 
     fn rerun_button(task: &TaskState) -> Option<IconButton> {

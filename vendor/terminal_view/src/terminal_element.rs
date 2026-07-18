@@ -4,9 +4,9 @@ use gpui::{
     Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
     IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    Point as GpuiPoint, ShapedLine, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill,
+    point, px, relative, size,
 };
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -25,15 +25,14 @@ use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
-use std::{fmt::Debug, rc::Rc};
+use std::{fmt::Debug, rc::Rc, sync::Arc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
     hitbox: Hitbox,
-    batched_text_runs: Vec<BatchedTextRun>,
-    rects: Vec<LayoutRect>,
+    grid: Rc<CachedGridLayout>,
     relative_highlighted_ranges: Vec<(Range, Hsla)>,
     cursor: Option<CursorLayout>,
     ime_cursor_bounds: Option<Bounds<Pixels>>,
@@ -45,6 +44,123 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisibleRows {
+    Hidden,
+    All,
+    Range { start: usize, count: usize },
+}
+
+struct GridCacheKey {
+    render_generation: u64,
+    visible_rows: VisibleRows,
+    dimensions: TerminalBounds,
+    text_style: TextStyle,
+    font_pixels: Pixels,
+    minimum_contrast: f32,
+    theme: ThemeIdentity,
+    hovered_range: Option<Range>,
+}
+
+impl GridCacheKey {
+    fn matches(&self, other: &Self) -> bool {
+        self.render_generation == other.render_generation
+            && self.visible_rows == other.visible_rows
+            && self.dimensions == other.dimensions
+            && self.text_style == other.text_style
+            && self.font_pixels == other.font_pixels
+            && self.minimum_contrast == other.minimum_contrast
+            && self.theme == other.theme
+            && self.hovered_range == other.hovered_range
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ThemeIdentity(Arc<Theme>);
+
+impl PartialEq for ThemeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ThemeIdentity {}
+
+impl ThemeIdentity {
+    fn new(theme: &Arc<Theme>) -> Self {
+        Self(theme.clone())
+    }
+}
+
+struct ShapedTextRun {
+    start_point: LayoutPoint,
+    line: ShapedLine,
+}
+
+struct CachedGridLayout {
+    rects: Vec<LayoutRect>,
+    text_runs: Vec<ShapedTextRun>,
+}
+
+struct CursorCacheKey {
+    character: char,
+    font: Font,
+    font_pixels: Pixels,
+    color: Hsla,
+}
+
+impl PartialEq for CursorCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.character == other.character
+            && self.font == other.font
+            && self.font_pixels == other.font_pixels
+            && self.color == other.color
+    }
+}
+
+pub(crate) struct TerminalRenderCache {
+    grid: Option<(GridCacheKey, Rc<CachedGridLayout>)>,
+    cursor: Option<(CursorCacheKey, ShapedLine)>,
+}
+
+impl Default for TerminalRenderCache {
+    fn default() -> Self {
+        Self {
+            grid: None,
+            cursor: None,
+        }
+    }
+}
+
+impl TerminalRenderCache {
+    pub(crate) fn clear(&mut self) {
+        self.grid = None;
+        self.cursor = None;
+    }
+
+    fn grid(&self, key: &GridCacheKey) -> Option<Rc<CachedGridLayout>> {
+        self.grid
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key.matches(key))
+            .map(|(_, layout)| layout.clone())
+    }
+
+    fn store_grid(&mut self, key: GridCacheKey, layout: Rc<CachedGridLayout>) {
+        self.grid = Some((key, layout));
+    }
+
+    fn cursor(&self, key: &CursorCacheKey) -> Option<ShapedLine> {
+        self.cursor
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, line)| line.clone())
+    }
+
+    fn store_cursor(&mut self, key: CursorCacheKey, line: ShapedLine) {
+        self.cursor = Some((key, line));
+    }
 }
 
 /// Helper struct for converting terminal cursor points to displayed cursor points.
@@ -145,7 +261,22 @@ impl BatchedTextRun {
         self.style.len += c.len_utf8();
     }
 
-    pub fn paint(
+    fn shape(self, dimensions: &TerminalBounds, window: &mut Window) -> ShapedTextRun {
+        let line = window.text_system().shape_line(
+            self.text.into(),
+            self.font_size.to_pixels(window.rem_size()),
+            std::slice::from_ref(&self.style),
+            Some(dimensions.cell_width),
+        );
+        ShapedTextRun {
+            start_point: self.start_point,
+            line,
+        }
+    }
+}
+
+impl ShapedTextRun {
+    fn paint(
         &self,
         origin: GpuiPoint<Pixels>,
         dimensions: &TerminalBounds,
@@ -156,15 +287,7 @@ impl BatchedTextRun {
             origin.x + self.start_point.column as f32 * dimensions.cell_width,
             origin.y + self.start_point.line as f32 * dimensions.line_height,
         );
-
-        window
-            .text_system()
-            .shape_line(
-                self.text.clone().into(),
-                self.font_size.to_pixels(window.rem_size()),
-                std::slice::from_ref(&self.style),
-                Some(dimensions.cell_width),
-            )
+        self.line
             .paint(
                 pos,
                 dimensions.line_height,
@@ -377,7 +500,7 @@ impl TerminalElement {
         minimum_contrast: f32,
         cx: &App,
     ) -> (Vec<LayoutRect>, Vec<BatchedTextRun>) {
-        let start_time = Instant::now();
+        let start_time = log::log_enabled!(log::Level::Debug).then(Instant::now);
         let theme = cx.theme();
 
         // Pre-allocate with estimated capacity to reduce reallocations
@@ -528,18 +651,18 @@ impl TerminalElement {
             }
         }
 
-        let layout_time = start_time.elapsed();
-
-        log::debug!(
-            "Terminal layout_grid: {} cells processed, \
-            {} batched runs created, {} rects (from {} merged regions), \
-            layout took {:?}",
-            cell_count,
-            batched_runs.len(),
-            rects.len(),
-            region_count,
-            layout_time
-        );
+        if let Some(start_time) = start_time {
+            log::debug!(
+                "Terminal layout_grid: {} cells processed, \
+                {} batched runs created, {} rects (from {} merged regions), \
+                layout took {:?}",
+                cell_count,
+                batched_runs.len(),
+                rects.len(),
+                region_count,
+                start_time.elapsed()
+            );
+        }
 
         (rects, batched_runs)
     }
@@ -1125,6 +1248,7 @@ impl Element for TerminalElement {
                     cursor,
                     ..
                 } = &self.terminal.read(cx).last_content;
+                let render_generation = self.terminal.read(cx).render_generation();
                 let mode = *mode;
                 let display_offset = *display_offset;
 
@@ -1158,23 +1282,12 @@ impl Element for TerminalElement {
                 // This handles the case where the terminal has been scrolled past (above or
                 // below the viewport), similar to the editor fix in PR #45077 where start_row
                 // could exceed max_row when the editor was positioned above the viewport.
-                let (rects, batched_text_runs) = if intersection.size.height <= px(0.)
+                let visible_rows = if intersection.size.height <= px(0.)
                     || intersection.size.width <= px(0.)
                 {
-                    (Vec::new(), Vec::new())
+                    VisibleRows::Hidden
                 } else if intersection == content_bounds {
-                    // Fast path: terminal fully visible, no clipping needed.
-                    // Avoid grouping/allocation overhead by streaming cells directly.
-                    TerminalElement::layout_grid(
-                        cells.iter(),
-                        0,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
+                    VisibleRows::All
                 } else {
                     // Calculate which screen rows are visible based on pixel positions.
                     // This works for both Scrollable and Inline modes because we filter
@@ -1187,45 +1300,114 @@ impl Element for TerminalElement {
                     let visible_row_count =
                         f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
 
-                    TerminalElement::layout_grid(
-                        // Group cells by line and filter to only the visible screen rows.
-                        // skip() and take() work on enumerated line groups (screen position),
-                        // making this work regardless of the actual cell.point.line values.
-                        cells
-                            .iter()
-                            .chunk_by(|c| c.point.line)
-                            .into_iter()
-                            .skip(rows_above_viewport)
-                            .take(visible_row_count)
-                            .flat_map(|(_, line_cells)| line_cells),
-                        rows_above_viewport as i32,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
+                    VisibleRows::Range {
+                        start: rows_above_viewport,
+                        count: visible_row_count,
+                    }
+                };
+
+                let grid_key = GridCacheKey {
+                    render_generation,
+                    visible_rows,
+                    dimensions,
+                    text_style: text_style.clone(),
+                    font_pixels: text_style.font_size.to_pixels(window.rem_size()),
+                    minimum_contrast,
+                    theme: ThemeIdentity::new(&theme),
+                    hovered_range: last_hovered_word
+                        .as_ref()
+                        .map(|hovered| hovered.word_match.clone()),
+                };
+                let cached_grid = self
+                    .terminal_view
+                    .read(cx)
+                    .render_cache
+                    .borrow()
+                    .grid(&grid_key);
+                let grid = if let Some(cached_grid) = cached_grid {
+                    cached_grid
+                } else {
+                    let hyperlink = last_hovered_word
+                        .as_ref()
+                        .map(|hovered| (link_style, &hovered.word_match));
+                    let (rects, batched_text_runs) = match visible_rows {
+                        VisibleRows::Hidden => (Vec::new(), Vec::new()),
+                        VisibleRows::All => TerminalElement::layout_grid(
+                            cells.iter(),
+                            0,
+                            &text_style,
+                            hyperlink,
+                            minimum_contrast,
+                            cx,
+                        ),
+                        VisibleRows::Range { start, count } => TerminalElement::layout_grid(
+                            // Group cells by line and filter to only the visible screen rows.
+                            // skip() and take() work on screen position regardless of the
+                            // internal (possibly negative) scrollback line number.
+                            cells
+                                .iter()
+                                .chunk_by(|cell| cell.point.line)
+                                .into_iter()
+                                .skip(start)
+                                .take(count)
+                                .flat_map(|(_, line_cells)| line_cells),
+                            start as i32,
+                            &text_style,
+                            hyperlink,
+                            minimum_contrast,
+                            cx,
+                        ),
+                    };
+                    let text_runs = batched_text_runs
+                        .into_iter()
+                        .map(|run| run.shape(&dimensions, window))
+                        .collect();
+                    let grid = Rc::new(CachedGridLayout { rects, text_runs });
+                    self.terminal_view
+                        .read(cx)
+                        .render_cache
+                        .borrow_mut()
+                        .store_grid(grid_key, grid.clone());
+                    grid
                 };
 
                 // Layout cursor. Rectangle is used for IME, so we should lay it out even
                 // if we don't end up showing it.
                 let cursor_point = DisplayCursor::from(cursor.point, display_offset);
-                let cursor_text = {
-                    let str_trxt = cursor_char.to_string();
-                    let len = str_trxt.len();
-                    window.text_system().shape_line(
-                        str_trxt.into(),
-                        text_style.font_size.to_pixels(window.rem_size()),
+                let cursor_font_pixels = text_style.font_size.to_pixels(window.rem_size());
+                let cursor_cache_key = CursorCacheKey {
+                    character: *cursor_char,
+                    font: text_style.font(),
+                    font_pixels: cursor_font_pixels,
+                    color: theme.colors().terminal_ansi_background,
+                };
+                let cached_cursor = self
+                    .terminal_view
+                    .read(cx)
+                    .render_cache
+                    .borrow()
+                    .cursor(&cursor_cache_key);
+                let cursor_text = cached_cursor.unwrap_or_else(|| {
+                    let cursor_string = cursor_char.to_string();
+                    let len = cursor_string.len();
+                    let shaped = window.text_system().shape_line(
+                        cursor_string.into(),
+                        cursor_font_pixels,
                         &[TextRun {
                             len,
-                            font: text_style.font(),
+                            font: cursor_cache_key.font.clone(),
                             color: theme.colors().terminal_ansi_background,
                             ..Default::default()
                         }],
                         None,
-                    )
-                };
+                    );
+                    self.terminal_view
+                        .read(cx)
+                        .render_cache
+                        .borrow_mut()
+                        .store_cursor(cursor_cache_key, shaped.clone());
+                    shaped
+                });
 
                 // For whitespace, use cell width to avoid cursor stretching.
                 // For other characters, use the larger of shaped width and cell width
@@ -1303,12 +1485,11 @@ impl Element for TerminalElement {
 
                 LayoutState {
                     hitbox,
-                    batched_text_runs,
+                    grid,
                     cursor,
                     ime_cursor_bounds,
                     background_color,
                     dimensions,
-                    rects,
                     relative_highlighted_ranges,
                     mode,
                     display_offset,
@@ -1331,7 +1512,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let paint_start = Instant::now();
+        let paint_start = log::log_enabled!(log::Level::Debug).then(Instant::now);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let scroll_top = self.terminal_view.read(cx).scroll_top;
 
@@ -1396,7 +1577,7 @@ impl Element for TerminalElement {
                         }
                     });
 
-                    for rect in &layout.rects {
+                    for rect in &layout.grid.rects {
                         rect.paint(origin, &layout.dimensions, window);
                     }
 
@@ -1422,11 +1603,10 @@ impl Element for TerminalElement {
                     }
 
                     // Paint batched text runs instead of individual cells
-                    let text_paint_start = Instant::now();
-                    for batch in &layout.batched_text_runs {
+                    let text_paint_start = log::log_enabled!(log::Level::Debug).then(Instant::now);
+                    for batch in &layout.grid.text_runs {
                         batch.paint(origin, &layout.dimensions, window, cx);
                     }
-                    let text_paint_time = text_paint_start.elapsed();
 
                     if let Some(text_to_mark) = &marked_text_cloned
                         && !text_to_mark.is_empty()
@@ -1487,14 +1667,18 @@ impl Element for TerminalElement {
                         element.paint(window, cx);
                     }
 
-                    log::debug!(
-                        "Terminal paint: {} text runs, {} rects, \
-                        text paint took {:?}, total paint took {total_paint_time:?}",
-                        layout.batched_text_runs.len(),
-                        layout.rects.len(),
-                        text_paint_time,
-                        total_paint_time = paint_start.elapsed()
-                    );
+                    if let (Some(text_paint_start), Some(paint_start)) =
+                        (text_paint_start, paint_start)
+                    {
+                        log::debug!(
+                            "Terminal paint: {} text runs, {} rects, \
+                            text paint took {:?}, total paint took {:?}",
+                            layout.grid.text_runs.len(),
+                            layout.grid.rects.len(),
+                            text_paint_start.elapsed(),
+                            paint_start.elapsed()
+                        );
+                    }
                 },
             );
         });
@@ -1758,7 +1942,133 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
 mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, font};
+    use theme::{DEFAULT_DARK_THEME, ThemeRegistry};
     use ui::utils::apca_contrast;
+
+    fn test_theme() -> Arc<Theme> {
+        ThemeRegistry::default().get(DEFAULT_DARK_THEME).unwrap()
+    }
+
+    fn test_grid_cache_key(theme: &Arc<Theme>) -> GridCacheKey {
+        GridCacheKey {
+            render_generation: 1,
+            visible_rows: VisibleRows::All,
+            dimensions: TerminalBounds::default(),
+            text_style: TextStyle::default(),
+            font_pixels: px(12.),
+            minimum_contrast: 0.,
+            theme: ThemeIdentity::new(theme),
+            hovered_range: None,
+        }
+    }
+
+    #[test]
+    fn grid_render_cache_hits_only_when_grid_inputs_match() {
+        let theme = test_theme();
+        let layout = Rc::new(CachedGridLayout {
+            rects: Vec::new(),
+            text_runs: Vec::new(),
+        });
+        let mut cache = TerminalRenderCache::default();
+        cache.store_grid(test_grid_cache_key(&theme), layout);
+
+        // Cursor visibility/shape, focus, blink phase, and pointer position are
+        // intentionally absent from GridCacheKey, so repaint-only changes hit.
+        assert!(cache.grid(&test_grid_cache_key(&theme)).is_some());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.render_generation += 1;
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.visible_rows = VisibleRows::Range { start: 1, count: 2 };
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.dimensions.bounds.size.width = px(1.);
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.text_style.color = Hsla::red();
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.text_style.font_family = "Monaco".into();
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.font_pixels = px(13.);
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.minimum_contrast = 1.;
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.theme = ThemeIdentity::new(&Arc::new((*theme).clone()));
+        assert!(cache.grid(&changed).is_none());
+
+        let mut changed = test_grid_cache_key(&theme);
+        changed.hovered_range = Some(Range::new(Point::new(0, 0), Point::new(0, 1)));
+        assert!(cache.grid(&changed).is_none());
+    }
+
+    #[test]
+    fn cursor_render_cache_reuses_only_matching_shape_inputs() {
+        let mut cache = TerminalRenderCache::default();
+        let key = CursorCacheKey {
+            character: 'a',
+            font: font("Helvetica"),
+            font_pixels: px(12.),
+            color: Hsla::red(),
+        };
+        cache.store_cursor(key, ShapedLine::default());
+
+        let matching = CursorCacheKey {
+            character: 'a',
+            font: font("Helvetica"),
+            font_pixels: px(12.),
+            color: Hsla::red(),
+        };
+        assert!(cache.cursor(&matching).is_some());
+
+        let changed_character = CursorCacheKey {
+            character: 'b',
+            ..matching
+        };
+        assert!(cache.cursor(&changed_character).is_none());
+    }
+
+    #[test]
+    fn clearing_render_cache_drops_grid_and_cursor_entries() {
+        let theme = test_theme();
+        let mut cache = TerminalRenderCache::default();
+        cache.store_grid(
+            test_grid_cache_key(&theme),
+            Rc::new(CachedGridLayout {
+                rects: Vec::new(),
+                text_runs: Vec::new(),
+            }),
+        );
+        let cursor_key = CursorCacheKey {
+            character: 'a',
+            font: font("Helvetica"),
+            font_pixels: px(12.),
+            color: Hsla::red(),
+        };
+        cache.store_cursor(cursor_key, ShapedLine::default());
+
+        cache.clear();
+
+        assert!(cache.grid(&test_grid_cache_key(&theme)).is_none());
+        let cursor_key = CursorCacheKey {
+            character: 'a',
+            font: font("Helvetica"),
+            font_pixels: px(12.),
+            color: Hsla::red(),
+        };
+        assert!(cache.cursor(&cursor_key).is_none());
+    }
 
     #[test]
     fn test_is_decorative_character() {

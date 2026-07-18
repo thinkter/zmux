@@ -912,6 +912,7 @@ impl TerminalBuilder {
                 ..Default::default()
             },
             renderable_content_dirty: true,
+            render_generation: 0,
             #[cfg(test)]
             content_rebuild_count: 0,
             last_mouse: None,
@@ -1135,6 +1136,7 @@ impl TerminalBuilder {
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 renderable_content_dirty: true,
+                render_generation: 0,
                 #[cfg(test)]
                 content_rebuild_count: 0,
                 last_mouse: None,
@@ -1311,6 +1313,9 @@ pub struct Terminal {
     /// Whether the next sync must reconstruct the visible cell vector. Cursor
     /// blink, pointer, and focus-only paints can reuse the existing allocation.
     renderable_content_dirty: bool,
+    /// Changes whenever [`Content::cells`] is reconstructed. Views can use this
+    /// to retain derived layout and shaping work across unrelated repaints.
+    render_generation: u64,
     #[cfg(test)]
     content_rebuild_count: usize,
     pub selection_head: Option<Point>,
@@ -2053,11 +2058,19 @@ impl Terminal {
 
         let rebuild_cells = self.renderable_content_dirty;
         update_content(&terminal, &mut self.last_content, rebuild_cells);
+        if rebuild_cells {
+            self.render_generation = self.render_generation.wrapping_add(1);
+        }
         #[cfg(test)]
         if rebuild_cells {
             self.content_rebuild_count += 1;
         }
         self.renderable_content_dirty = false;
+    }
+
+    /// Identifies the current visible emulator-cell content.
+    pub fn render_generation(&self) -> u64 {
+        self.render_generation
     }
 
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
@@ -3522,6 +3535,7 @@ mod tests {
         window.update_window_entity(&terminal, |terminal, window, cx| {
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 1);
+            assert_eq!(terminal.render_generation(), 1);
 
             // Unchanged, cursor-blink, pointer-only, and focus/configuration paints
             // still update cheap metadata without reconstructing the grid cells.
@@ -3532,10 +3546,12 @@ mod tests {
             terminal.set_cursor_shape(SettingsCursorShape::Hollow);
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 1);
+            assert_eq!(terminal.render_generation(), 1);
 
             terminal.write_output(b"rendered output", cx);
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 2);
+            assert_eq!(terminal.render_generation(), 2);
             assert!(terminal.get_content().contains("rendered output"));
 
             let mut resized_bounds = terminal.last_content.terminal_bounds;
@@ -3543,24 +3559,29 @@ mod tests {
             terminal.set_size(resized_bounds);
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 3);
+            assert_eq!(terminal.render_generation(), 3);
 
             terminal.scroll_line_up();
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 4);
+            assert_eq!(terminal.render_generation(), 4);
 
             terminal.select_all();
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 5);
+            assert_eq!(terminal.render_generation(), 5);
 
             // Search-range highlights are rendered by TerminalElement and do not
             // mutate the emulator cells until a match is activated/selected.
             terminal.matches = vec![Range::new(Point::new(0, 0), Point::new(0, 1))];
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 5);
+            assert_eq!(terminal.render_generation(), 5);
 
             terminal.activate_match(0);
             terminal.sync(window, cx);
             assert_eq!(terminal.content_rebuild_count, 6);
+            assert_eq!(terminal.render_generation(), 6);
         });
     }
 
