@@ -14,16 +14,22 @@ Shortcuts:
 
 - Copy: `Ctrl-Shift-C`, `Ctrl-Insert`, or `Cmd-C`.
 - Paste: `Ctrl-Shift-V`, `Shift-Insert`, or `Cmd-V`.
-- New terminal tab: `Ctrl-Shift-T` or `Ctrl-Shift-N`.
-- New workspace: `Ctrl-Shift-E`. Toggle the workspaces sidebar: `Ctrl-Shift-B`.
+- New terminal tab: `Cmd-T` on macOS or `Ctrl-Shift-T`/`Ctrl-Shift-N` elsewhere.
+- New workspace: `Cmd-N` on macOS or `Ctrl-Shift-E` elsewhere. Toggle the
+  workspaces sidebar with `Cmd-B` on macOS or `Ctrl-Shift-B` elsewhere.
 - Worktree picker: `Cmd-Ctrl-W` on macOS, `Alt-Ctrl-Shift-W` on Linux, or
   `Shift-Alt-W` on Windows.
-- Notify the current terminal pane (manual test trigger): `Ctrl-Shift-M`.
-- Jump to the latest unread notification: `Ctrl-Shift-U`.
+- Notify the current terminal pane (manual test trigger): `Cmd-Shift-M` on macOS
+  or `Ctrl-Shift-M` elsewhere.
+- Jump to the latest unread notification: `Cmd-Shift-U` on macOS or
+  `Ctrl-Shift-U` elsewhere.
 - Toggle notification history: `Ctrl-Shift-I` or `Cmd-I`.
 - CLI: `zmux notify "Title" "Body"` or `zmux notify --title "Title" --body "Body"`.
 - Zoom terminal font: `Ctrl-=`/`Ctrl-+`, `Ctrl--`, `Ctrl-0`; macOS-style `Cmd` variants are also bound.
 - Plain `Ctrl-C` is intentionally left for the shell interrupt signal.
+- macOS also uses `Cmd-W` to close a tab, `Cmd-Option-W` to close all tabs,
+  `Cmd-{`/`Cmd-}` to switch workspaces, and `Cmd-D`/`Cmd-Shift-D` to split a
+  terminal right/down.
 
 ## Workspaces
 
@@ -33,7 +39,8 @@ workspace lives in the center pane group, while inactive ones are detached and
 parked with their terminals still running (no PTY restart), so a build or watch
 process keeps going in the background while you work elsewhere.
 
-- Click **+** (or press `Ctrl-Shift-E`) to create a workspace.
+- Click **+** (or press `Cmd-N` on macOS or `Ctrl-Shift-E` elsewhere) to create a
+  workspace.
 - Click a workspace to switch to it.
 - Double-click a workspace (or use the pencil button) to rename it inline.
 - Drag a workspace up or down to reorder the list.

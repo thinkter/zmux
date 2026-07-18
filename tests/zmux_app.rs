@@ -17,10 +17,11 @@ use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zmux::{
     CliEndpoint, CliNotification, CliServer, JumpToLatestNotification, NOTIFY_ENDPOINT_ENV,
-    NewTerminal as ZmuxNewTerminal, NotificationSource, NotificationStore, NotifyCurrentPane,
-    OscNotificationEvent, OscNotificationParser, SplitTerminalDown, SplitTerminalRight,
-    WorkspacesPanel, configure_keybindings, configure_terminal_fonts, configure_zoom_actions,
-    init_zmux, open_zmux_workspace_at, terminal_env,
+    NewTerminal as ZmuxNewTerminal, NewWorkspace, NotificationSource, NotificationStore,
+    NotifyCurrentPane, OscNotificationEvent, OscNotificationParser, SplitTerminalDown,
+    SplitTerminalRight, ToggleWorkspacesPanel, WorkspacesPanel, configure_keybindings,
+    configure_terminal_fonts, configure_zoom_actions, init_zmux, open_zmux_workspace_at,
+    terminal_env,
 };
 
 #[test]
@@ -2134,6 +2135,18 @@ async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppCon
             "ctrl-shift-alt-d",
             &workspace::pane::SplitDown::default(),
         );
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_bound(cx, "cmd-t", &ZmuxNewTerminal);
+            assert_bound(cx, "cmd-n", &NewWorkspace);
+            assert_bound(cx, "cmd-b", &ToggleWorkspacesPanel);
+            assert_bound(cx, "cmd-shift-m", &NotifyCurrentPane);
+            assert_bound(cx, "cmd-w", &CloseActiveItem::default());
+            assert_bound(cx, "cmd-alt-w", &CloseAllItems::default());
+            assert_bound(cx, "cmd-d", &SplitTerminalRight);
+            assert_bound(cx, "cmd-shift-d", &SplitTerminalDown);
+        }
     });
 }
 

@@ -57,6 +57,10 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-n", NewTerminal, None),
         KeyBinding::new("ctrl-shift-e", NewWorkspace, None),
         #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-t", NewTerminal, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-n", NewWorkspace, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-ctrl-w", zed_actions::git::Worktree, None),
         #[cfg(target_os = "linux")]
         KeyBinding::new("alt-ctrl-shift-w", zed_actions::git::Worktree, None),
@@ -67,8 +71,16 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-{", ActivatePreviousWorkspace, None),
         KeyBinding::new("ctrl-shift-right", ActivateNextWorkspace, None),
         KeyBinding::new("ctrl-shift-left", ActivatePreviousWorkspace, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-b", ToggleWorkspacesPanel, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-}", ActivateNextWorkspace, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-{", ActivatePreviousWorkspace, None),
         KeyBinding::new("ctrl-shift-m", NotifyCurrentPane, None),
         KeyBinding::new("ctrl-shift-u", JumpToLatestNotification, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-m", NotifyCurrentPane, None),
         KeyBinding::new("cmd-shift-u", JumpToLatestNotification, None),
         KeyBinding::new("cmd-i", ToggleNotificationCenter, None),
         KeyBinding::new("ctrl-shift-i", ToggleNotificationCenter, None),
@@ -81,6 +93,10 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-w", CloseActiveItem::default(), None),
         KeyBinding::new("ctrl-shift-alt-w", CloseAllItems::default(), None),
         KeyBinding::new("ctrl-shift-o", CloseOtherItems::default(), None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-w", CloseActiveItem::default(), None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-w", CloseAllItems::default(), None),
         KeyBinding::new("alt-right", ActivateNextPane, None),
         KeyBinding::new("alt-left", ActivatePreviousPane, None),
         // These actions allocate a fresh CLI route before spawning the split.
@@ -88,6 +104,10 @@ pub fn configure_keybindings(cx: &mut App) {
         // and routed through the same provisioned spawn path.
         KeyBinding::new("ctrl-shift-d", SplitTerminalRight, None),
         KeyBinding::new("ctrl-shift-alt-d", SplitTerminalDown, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-d", SplitTerminalRight, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-d", SplitTerminalDown, None),
         KeyBinding::new("ctrl-=", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl-+", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl--", DecreaseBufferFontSize { persist: false }, None),
