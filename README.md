@@ -2,7 +2,7 @@
 
 A small GPUI terminal shell around Zed's `terminal` and `terminal_view` crates.
 
-![zmux welcome screen](assets/zmux_welcome_screen.png)
+<img width="1918" height="1163" alt="image" src="https://github.com/user-attachments/assets/539356a7-2e13-40a5-9fd5-d2988f13cf0d" />
 
 Run with:
 
