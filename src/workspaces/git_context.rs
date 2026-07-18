@@ -10,22 +10,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
 
 use gpui::{App, Context, Entity, EntityId, Global, SharedString, Task, WeakEntity, Window};
+use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
 use ui::prelude::*;
 use workspace::Workspace;
 use workspace::item::ItemHandle;
 
-use crate::metadata::{MetadataState, collect_git_metadata};
+use crate::metadata::{MetadataState, git_metadata_from_repository};
 use crate::notifications::WorkspaceId;
 
 use super::persistence::{FailedRestoreSlot, StoredLayout};
 use super::{WorkspaceEntry, WorkspacesPanel, is_shell_process, sanitize_process_label};
-
-const ACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(5);
-const INACTIVE_METADATA_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GitDiscoveryState {
@@ -269,6 +268,26 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
 }
 
 impl WorkspacesPanel {
+    /// Keep rail metadata synchronized with Zed's repository model. The Git
+    /// store already watches repository state, so this subscription replaces
+    /// zmux's independent active/inactive polling timers and subprocesses.
+    pub(super) fn subscribe_to_git_metadata(workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+        cx.subscribe(&git_store, |this, _git_store, event, cx| match event {
+            GitStoreEvent::RepositoryUpdated(_, _, _)
+            | GitStoreEvent::RepositoryAdded
+            | GitStoreEvent::RepositoryRemoved(_)
+            | GitStoreEvent::ActiveRepositoryChanged(_) => {
+                this.request_metadata_refreshes(cx);
+            }
+            GitStoreEvent::IndexWriteError(_)
+            | GitStoreEvent::JobsUpdated
+            | GitStoreEvent::ConflictsUpdated
+            | GitStoreEvent::GlobalConfigurationUpdated => {}
+        })
+        .detach();
+    }
+
     fn active_git_roots(&self) -> &[PathBuf] {
         self.entries
             .iter()
@@ -324,7 +343,7 @@ impl WorkspacesPanel {
         {
             entry.selected_git_root = Some(root);
             self.request_metadata_refreshes(cx);
-            self.persist_session(cx);
+            self.schedule_session_persistence(cx);
             cx.notify();
         }
     }
@@ -508,7 +527,7 @@ impl WorkspacesPanel {
         entry.failed_restores.clear();
         self.refresh_workspace_contexts(cx);
         self.request_metadata_refreshes(cx);
-        self.persist_session(cx);
+        self.schedule_session_persistence(cx);
     }
 
     pub(crate) fn finish_restored_git_discovery_with_failures(
@@ -529,7 +548,7 @@ impl WorkspacesPanel {
         entry.git_discovery = GitDiscoveryState::Authoritative;
         self.refresh_workspace_contexts(cx);
         self.request_metadata_refreshes(cx);
-        self.persist_session(cx);
+        self.schedule_session_persistence(cx);
     }
 
     fn activate_selected_repository(&self, cx: &mut Context<Self>) {
@@ -562,49 +581,42 @@ impl WorkspacesPanel {
     }
 
     pub(super) fn request_metadata_refreshes(&mut self, cx: &mut Context<Self>) {
-        let now = Instant::now();
-        let mut requests = Vec::new();
+        let repositories = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().read(cx).git_store().clone())
+            .map(|git_store| {
+                git_store
+                    .read(cx)
+                    .repositories()
+                    .values()
+                    .map(|repository| repository.read(cx).snapshot())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut changed = false;
         for entry in &mut self.entries {
             let root = entry.selected_git_root.clone();
             if entry.metadata_root != root {
                 entry.metadata_root = root.clone();
                 entry.metadata_refreshed_at = None;
-                entry.git = MetadataState::NotRequested;
             }
-            let Some(root) = root else {
-                continue;
-            };
-            let interval = if entry.id == self.active {
-                ACTIVE_METADATA_INTERVAL
+            let git = if let Some(root) = root {
+                let repository = repositories.iter().find(|repository| {
+                    paths_match(repository.work_directory_abs_path.as_ref(), &root)
+                });
+                git_metadata_from_repository(repository)
             } else {
-                INACTIVE_METADATA_INTERVAL
+                MetadataState::NotRequested
             };
-            let is_due = entry
-                .metadata_refreshed_at
-                .is_none_or(|refreshed| now.duration_since(refreshed) >= interval);
-            if is_due && !matches!(entry.git, MetadataState::Pending) {
-                entry.git = MetadataState::Pending;
-                entry.metadata_refreshed_at = Some(now);
-                requests.push((entry.id, root));
+            if entry.git != git {
+                entry.git = git;
+                changed = true;
             }
         }
-
-        for (id, root) in requests {
-            let requested_root = root.clone();
-            let collection = cx.background_spawn(async move { collect_git_metadata(&root) });
-            cx.spawn(async move |this, cx| {
-                let git = collection.await;
-                this.update(cx, |this, cx| {
-                    if let Some(entry) = this.entries.iter_mut().find(|entry| entry.id == id)
-                        && entry.metadata_root.as_ref() == Some(&requested_root)
-                    {
-                        entry.git = git;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })
-            .detach();
+        if changed {
+            cx.notify();
         }
     }
 }
@@ -946,8 +958,6 @@ mod tests {
                 .expect("workspaces panel should be installed")
         });
         panel.update(cx, |panel, cx| {
-            panel._context_refresh_task = Task::ready(());
-            panel._agent_refresh_task = Task::ready(());
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -1053,8 +1063,6 @@ mod tests {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
         });
         panel.update(cx, |panel, _| {
-            panel._context_refresh_task = Task::ready(());
-            panel._agent_refresh_task = Task::ready(());
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -1117,8 +1125,6 @@ mod tests {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
         });
         panel.update(cx, |panel, _| {
-            panel._context_refresh_task = Task::ready(());
-            panel._agent_refresh_task = Task::ready(());
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -1223,11 +1229,6 @@ mod tests {
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
         });
-        panel.update(cx, |panel, _| {
-            panel._context_refresh_task = Task::ready(());
-            panel._agent_refresh_task = Task::ready(());
-        });
-
         opened
             .window
             .update(cx, |_, window, cx| {
@@ -1295,10 +1296,6 @@ mod tests {
                 .expect("workspaces panel should be installed")
         });
         panel.update(cx, |panel, cx| {
-            // Keep the test's synthetic terminal contexts stable instead of
-            // letting the periodic live-terminal refresh replace them.
-            panel._context_refresh_task = Task::ready(());
-            panel._agent_refresh_task = Task::ready(());
             let active = panel
                 .entries
                 .iter_mut()
