@@ -57,16 +57,18 @@ use gpui::{
 
 #[cfg(not(windows))]
 use crate::alacritty::current_child_signal_mask;
+#[cfg(test)]
+use crate::alacritty::make_content;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
     display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
+    new_term, open_pty, pty_options, pty_term_config, resize, screen_lines, scroll_display,
+    scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode,
-    total_lines, update_selection as update_term_selection, update_selection_to_vi_cursor,
-    update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
+    total_lines, update_content, update_selection as update_term_selection,
+    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -909,6 +911,9 @@ impl TerminalBuilder {
                 terminal_bounds,
                 ..Default::default()
             },
+            renderable_content_dirty: true,
+            #[cfg(test)]
+            content_rebuild_count: 0,
             last_mouse: None,
             matches: Vec::new(),
 
@@ -1129,6 +1134,9 @@ impl TerminalBuilder {
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
+                renderable_content_dirty: true,
+                #[cfg(test)]
+                content_rebuild_count: 0,
                 last_mouse: None,
                 matches: Vec::new(),
 
@@ -1300,6 +1308,11 @@ pub struct Terminal {
     last_mouse: Option<(Point, SelectionSide)>,
     pub matches: Vec<Range>,
     pub last_content: Content,
+    /// Whether the next sync must reconstruct the visible cell vector. Cursor
+    /// blink, pointer, and focus-only paints can reuse the existing allocation.
+    renderable_content_dirty: bool,
+    #[cfg(test)]
+    content_rebuild_count: usize,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -1432,6 +1445,7 @@ impl Terminal {
                 //NOOP, Handled in render
             }
             TerminalBackendEvent::Wakeup => {
+                self.renderable_content_dirty = true;
                 cx.emit(Event::Wakeup);
 
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
@@ -1469,6 +1483,15 @@ impl Terminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !matches!(
+            event,
+            InternalEvent::Copy(_)
+                | InternalEvent::FindHyperlink(_, _)
+                | InternalEvent::ProcessHyperlink(_, _)
+        ) {
+            self.renderable_content_dirty = true;
+        }
+
         match event {
             &InternalEvent::Resize(new_bounds) => {
                 let new_bounds = normalize_terminal_bounds(new_bounds);
@@ -1717,6 +1740,7 @@ impl Terminal {
 
         let mut term = self.term.lock();
         self.output_processor.advance(&mut *term, &converted);
+        self.renderable_content_dirty = true;
         cx.emit(Event::Wakeup);
     }
 
@@ -2027,7 +2051,13 @@ impl Terminal {
             self.process_terminal_event(&e, &mut terminal, window, cx)
         }
 
-        self.last_content = make_content(&terminal, &self.last_content);
+        let rebuild_cells = self.renderable_content_dirty;
+        update_content(&terminal, &mut self.last_content, rebuild_cells);
+        #[cfg(test)]
+        if rebuild_cells {
+            self.content_rebuild_count += 1;
+        }
+        self.renderable_content_dirty = false;
     }
 
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
@@ -2611,6 +2641,7 @@ impl Terminal {
             // when Zed task finishes and no more output is made.
             // After the task summary is output once, no more text is appended to the terminal.
             unsafe { append_text_to_term(&mut self.term.lock(), &lines_to_show) };
+            self.renderable_content_dirty = true;
         }
 
         match hide {
@@ -2896,7 +2927,7 @@ mod tests {
     use gpui::MouseMoveEvent;
     use gpui::{
         ClipboardItem, Entity, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels,
-        TestAppContext, bounds, point, size,
+        TestAppContext, VisualContext, bounds, point, size,
     };
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
@@ -3469,6 +3500,68 @@ mod tests {
             terminal.events.back(),
             Some(InternalEvent::Resize(_))
         ));
+    }
+
+    #[gpui::test]
+    async fn test_sync_rebuilds_cells_only_after_renderable_content_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_empty_window();
+        let terminal = window.update(|window, cx| {
+            let builder = TerminalBuilder::new_display_only(
+                SettingsCursorShape::Block,
+                AlternateScroll::On,
+                None,
+                window.window_handle().window_id().as_u64(),
+                cx.background_executor(),
+                PathStyle::local(),
+            );
+            cx.new(|_| builder.terminal)
+        });
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 1);
+
+            // Unchanged, cursor-blink, pointer-only, and focus/configuration paints
+            // still update cheap metadata without reconstructing the grid cells.
+            terminal.sync(window, cx);
+            terminal.process_event(TerminalBackendEvent::CursorBlinkingChange, cx);
+            terminal.process_event(TerminalBackendEvent::MouseCursorDirty, cx);
+            terminal.mouse_move(&MouseMoveEvent::default(), cx);
+            terminal.set_cursor_shape(SettingsCursorShape::Hollow);
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 1);
+
+            terminal.write_output(b"rendered output", cx);
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 2);
+            assert!(terminal.get_content().contains("rendered output"));
+
+            let mut resized_bounds = terminal.last_content.terminal_bounds;
+            resized_bounds.bounds.size.height += resized_bounds.line_height;
+            terminal.set_size(resized_bounds);
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 3);
+
+            terminal.scroll_line_up();
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 4);
+
+            terminal.select_all();
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 5);
+
+            // Search-range highlights are rendered by TerminalElement and do not
+            // mutate the emulator cells until a match is activated/selected.
+            terminal.matches = vec![Range::new(Point::new(0, 0), Point::new(0, 1))];
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 5);
+
+            terminal.activate_match(0);
+            terminal.sync(window, cx);
+            assert_eq!(terminal.content_rebuild_count, 6);
+        });
     }
 
     fn get_cells(size: TerminalBounds, rng: &mut StdRng) -> Vec<Vec<char>> {

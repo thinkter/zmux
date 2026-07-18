@@ -798,38 +798,50 @@ pub(super) fn clear_saved_screen(term: &mut Term<ZedListener>) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> Content {
-    let content = term.renderable_content();
-
-    let estimated_size = content.display_iter.size_hint().0;
-    let mut cells = Vec::with_capacity(estimated_size);
-
-    cells.extend(content.display_iter.map(|ic| IndexedCell {
-        point: terminal_point_from_alacritty(ic.point),
-        cell: terminal_cell_from_alacritty(ic.cell),
-    }));
-
-    let selection_text = if content.selection.is_some() {
-        term.selection_to_string()
-    } else {
-        None
-    };
-
-    Content {
-        cells,
-        mode: terminal_modes_from_alacritty(content.mode),
-        display_offset: content.display_offset,
-        selection_text,
-        selection: content
-            .selection
-            .map(terminal_selection_range_from_alacritty),
-        cursor: Cursor::from_alacritty(content.cursor),
-        cursor_char: term.grid()[content.cursor.point].c,
+    let mut next_content = Content {
         terminal_bounds: last_content.terminal_bounds,
         last_hovered_word: last_content.last_hovered_word.clone(),
-        scrolled_to_top: content.display_offset == term.history_size(),
-        scrolled_to_bottom: content.display_offset == 0,
+        ..Default::default()
+    };
+    update_content(term, &mut next_content, true);
+    next_content
+}
+
+/// Refresh the cheap terminal metadata on every paint, but only walk and clone the
+/// visible grid when the emulator's renderable content has changed.
+pub(super) fn update_content(
+    term: &Term<ZedListener>,
+    last_content: &mut Content,
+    rebuild_cells: bool,
+) {
+    let content = term.renderable_content();
+
+    if rebuild_cells {
+        let estimated_size = content.display_iter.size_hint().0;
+        let mut cells = Vec::with_capacity(estimated_size);
+        cells.extend(content.display_iter.map(|ic| IndexedCell {
+            point: terminal_point_from_alacritty(ic.point),
+            cell: terminal_cell_from_alacritty(ic.cell),
+        }));
+        last_content.cells = cells;
+        last_content.selection_text = if content.selection.is_some() {
+            term.selection_to_string()
+        } else {
+            None
+        };
     }
+
+    last_content.mode = terminal_modes_from_alacritty(content.mode);
+    last_content.display_offset = content.display_offset;
+    last_content.selection = content
+        .selection
+        .map(terminal_selection_range_from_alacritty);
+    last_content.cursor = Cursor::from_alacritty(content.cursor);
+    last_content.cursor_char = term.grid()[content.cursor.point].c;
+    last_content.scrolled_to_top = content.display_offset == term.history_size();
+    last_content.scrolled_to_bottom = content.display_offset == 0;
 }
 
 pub(super) fn content_text(term: &Term<ZedListener>) -> String {
