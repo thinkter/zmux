@@ -120,6 +120,7 @@ editor = { workspace = true }
 gpui = { workspace = true }
 grammars = { workspace = true, features = ["load-grammars"] }
 hmac = "0.12"
+mio = { version = "1", features = ["net", "os-poll"] }
 settings = { workspace = true }
 sha2 = "0.10"
 task = { workspace = true }

@@ -55,7 +55,6 @@ use crate::notifications::{
 const DELIVERY_QUEUE_CAPACITY: usize = 64;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 const MAX_TRACKED_NATIVE_NOTIFICATIONS: usize = 64;
-const DISPATCHER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(all(unix, not(target_os = "macos")))]
 const XDG_EARLY_SIGNAL_CAPACITY: usize = MAX_TRACKED_NATIVE_NOTIFICATIONS * 2;
@@ -215,6 +214,60 @@ struct NativeCallback {
     kind: NativeCallbackKind,
 }
 
+/// Explicitly wakes the dispatcher whenever work is submitted from a native
+/// callback thread. Registration happens inside the dispatcher thread, before
+/// it first examines its queues, so submissions made during startup cannot be
+/// stranded.
+#[derive(Default)]
+struct DispatcherWaker {
+    thread: Mutex<Option<thread::Thread>>,
+    #[cfg(test)]
+    parks: AtomicUsize,
+}
+
+impl DispatcherWaker {
+    fn register_current(&self) {
+        *self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
+
+    fn wake(&self) {
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            thread.unpark();
+        }
+    }
+
+    #[cfg(test)]
+    fn park_count(&self) -> usize {
+        self.parks.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
+struct NativeCallbackSender {
+    sender: mpsc::Sender<NativeCallback>,
+    waker: Arc<DispatcherWaker>,
+}
+
+impl NativeCallbackSender {
+    fn new(sender: mpsc::Sender<NativeCallback>, waker: Arc<DispatcherWaker>) -> Self {
+        Self { sender, waker }
+    }
+
+    fn send(&self, callback: NativeCallback) -> Result<(), mpsc::SendError<NativeCallback>> {
+        self.sender.send(callback)?;
+        self.waker.wake();
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetractionSelector {
     Notification(NotificationId),
@@ -308,6 +361,7 @@ pub struct DesktopNotificationService {
     delivery_slots: Arc<AtomicUsize>,
     submission_order: Mutex<u64>,
     running: Arc<AtomicBool>,
+    dispatcher_waker: Arc<DispatcherWaker>,
     dispatcher: Option<JoinHandle<()>>,
     dispatcher_done: DispatcherReceiver<()>,
     _action_task: Option<Task<()>>,
@@ -385,11 +439,15 @@ impl DesktopNotificationService {
         let (delivery_sender, delivery_receiver) = sync_channel(DELIVERY_QUEUE_CAPACITY);
         let (control_sender, control_receiver) = sync_channel(CONTROL_QUEUE_CAPACITY);
         let (callback_sender, callback_receiver) = mpsc::channel();
+        let dispatcher_waker = Arc::new(DispatcherWaker::default());
+        let callback_sender =
+            NativeCallbackSender::new(callback_sender, Arc::clone(&dispatcher_waker));
         let (dispatcher_done_sender, dispatcher_done) = sync_channel(1);
         let delivery_slots = Arc::new(AtomicUsize::new(0));
         let coalesced_retract_all_order = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let dispatcher_running = running.clone();
+        let runner_waker = Arc::clone(&dispatcher_waker);
         let dispatcher_coalesced_retract_all_order = coalesced_retract_all_order.clone();
         let runner: DispatcherRunner = Box::new(move || {
             run_dispatcher(
@@ -403,6 +461,7 @@ impl DesktopNotificationService {
                     action_sender,
                 },
                 dispatcher_running,
+                runner_waker,
             );
             // A normal completion is distinguished from channel disconnect so
             // Drop can also recognize a panicked dispatcher as terminated.
@@ -427,6 +486,7 @@ impl DesktopNotificationService {
             delivery_slots,
             submission_order: Mutex::new(0),
             running,
+            dispatcher_waker,
             dispatcher,
             dispatcher_done,
             _action_task: action_task,
@@ -535,9 +595,7 @@ impl DesktopNotificationService {
     }
 
     fn wake_dispatcher(&self) {
-        if let Some(dispatcher) = &self.dispatcher {
-            dispatcher.thread().unpark();
-        }
+        self.dispatcher_waker.wake();
     }
 }
 
@@ -590,7 +648,7 @@ trait NativeBackend: Send + 'static {
         job: &DeliveryJob,
         generation: u64,
         replacement: Option<&Self::Token>,
-        callback_sender: &mpsc::Sender<NativeCallback>,
+        callback_sender: &NativeCallbackSender,
     ) -> Result<Self::Token, String>;
 
     /// Remove a delivered notification if the platform API supports it. An
@@ -610,7 +668,7 @@ struct NotificationDispatcher<B: NativeBackend> {
     backend: B,
     active: HashMap<NativeNotificationKey, ActiveNotification<B::Token>>,
     order: VecDeque<NativeNotificationKey>,
-    callback_sender: mpsc::Sender<NativeCallback>,
+    callback_sender: NativeCallbackSender,
     action_sender: Sender<DesktopNotificationAction>,
     #[cfg(test)]
     reported_retraction_degradation: bool,
@@ -620,7 +678,7 @@ struct NotificationDispatcher<B: NativeBackend> {
 impl<B: NativeBackend> NotificationDispatcher<B> {
     fn new(
         backend: B,
-        callback_sender: mpsc::Sender<NativeCallback>,
+        callback_sender: NativeCallbackSender,
         action_sender: Sender<DesktopNotificationAction>,
     ) -> Self {
         Self {
@@ -822,7 +880,7 @@ struct DispatcherChannels {
     control_receiver: DispatcherReceiver<DispatcherControl>,
     coalesced_retract_all_order: Arc<AtomicU64>,
     callback_receiver: mpsc::Receiver<NativeCallback>,
-    callback_sender: mpsc::Sender<NativeCallback>,
+    callback_sender: NativeCallbackSender,
     action_sender: Sender<DesktopNotificationAction>,
 }
 
@@ -830,7 +888,9 @@ fn run_dispatcher<B: NativeBackend>(
     backend: B,
     channels: DispatcherChannels,
     running: Arc<AtomicBool>,
+    waker: Arc<DispatcherWaker>,
 ) {
+    waker.register_current();
     let DispatcherChannels {
         delivery_receiver,
         control_receiver,
@@ -912,11 +972,20 @@ fn run_dispatcher<B: NativeBackend>(
         // first so a canonical retraction already waiting in both channels
         // invalidates its callback before the callback can escape to GPUI.
         // Bound each callback drain for fairness; any remainder stays queued.
+        let mut callbacks_drained = 0;
         for _ in 0..DELIVERY_QUEUE_CAPACITY {
             let Ok(callback) = callback_receiver.try_recv() else {
                 break;
             };
+            callbacks_drained += 1;
             dispatcher.handle_callback(callback);
+        }
+
+        // `unpark` tokens coalesce. If a full callback batch was drained,
+        // continue synchronously so callbacks queued behind that batch cannot
+        // be stranded after their wake tokens have merged.
+        if callbacks_drained == DELIVERY_QUEUE_CAPACITY {
+            continue;
         }
 
         // A producer can refill a bounded control slot as it is drained. Cap
@@ -933,14 +1002,16 @@ fn run_dispatcher<B: NativeBackend>(
         }
 
         // `unpark` carries a one-shot token, so a producer racing this call
-        // cannot lose its wakeup. The timeout also services native callbacks,
-        // whose platform-owned senders intentionally know nothing about this
-        // service thread.
-        thread::park_timeout(DISPATCHER_POLL_INTERVAL);
+        // cannot lose its wakeup. Every queue producer and native callback
+        // explicitly wakes this thread; quiescent dispatchers therefore have
+        // no recurring timer.
+        #[cfg(test)]
+        waker.parks.fetch_add(1, Ordering::Release);
+        thread::park();
     }
 }
 
-fn send_native_callback(sender: &mpsc::Sender<NativeCallback>, callback: NativeCallback) {
+fn send_native_callback(sender: &NativeCallbackSender, callback: NativeCallback) {
     if sender.send(callback).is_err() {
         eprintln!("native notification dispatcher stopped before callback delivery");
     }
@@ -1045,10 +1116,7 @@ impl NotifyRustBackend {
     }
 
     #[cfg(target_os = "macos")]
-    fn ensure_mac_ready(
-        &mut self,
-        callback_sender: &mpsc::Sender<NativeCallback>,
-    ) -> Result<(), String> {
+    fn ensure_mac_ready(&mut self, callback_sender: &NativeCallbackSender) -> Result<(), String> {
         if !self.mac_bundle_ready {
             return Err(format!(
                 "zmux is not running from the {ZMUX_APPLICATION_ID} macOS application bundle"
@@ -1086,7 +1154,7 @@ impl NotifyRustBackend {
         job: &DeliveryJob,
         generation: u64,
         replacement: Option<&NotifyRustToken>,
-        callback_sender: &mpsc::Sender<NativeCallback>,
+        callback_sender: &NativeCallbackSender,
     ) -> Result<NotifyRustToken, String> {
         use mac_usernotifications::InterruptionLevel;
 
@@ -1137,7 +1205,7 @@ impl NotifyRustBackend {
     #[cfg(all(unix, not(target_os = "macos")))]
     fn ensure_xdg_listener(
         &mut self,
-        callback_sender: &mpsc::Sender<NativeCallback>,
+        callback_sender: &NativeCallbackSender,
     ) -> Result<(), String> {
         self.ensure_xdg_listener_with(callback_sender, XdgSignalListener::new)
     }
@@ -1145,11 +1213,11 @@ impl NotifyRustBackend {
     #[cfg(all(unix, not(target_os = "macos")))]
     fn ensure_xdg_listener_with<Create>(
         &mut self,
-        callback_sender: &mpsc::Sender<NativeCallback>,
+        callback_sender: &NativeCallbackSender,
         create: Create,
     ) -> Result<(), String>
     where
-        Create: FnOnce(mpsc::Sender<NativeCallback>) -> Result<XdgSignalListener, String>,
+        Create: FnOnce(NativeCallbackSender) -> Result<XdgSignalListener, String>,
     {
         if self.xdg_listener.is_some() {
             return Ok(());
@@ -1273,7 +1341,7 @@ impl NativeBackend for NotifyRustBackend {
         job: &DeliveryJob,
         generation: u64,
         replacement: Option<&Self::Token>,
-        callback_sender: &mpsc::Sender<NativeCallback>,
+        callback_sender: &NativeCallbackSender,
     ) -> Result<Self::Token, String> {
         #[cfg(target_os = "macos")]
         {
@@ -1382,7 +1450,7 @@ struct MacResponseObserver {
 
 #[cfg(target_os = "macos")]
 impl MacResponseObserver {
-    fn new(callback_sender: mpsc::Sender<NativeCallback>) -> Result<Self, String> {
+    fn new(callback_sender: NativeCallbackSender) -> Result<Self, String> {
         let (sender, receiver) = async_channel::bounded(MAX_TRACKED_NATIVE_NOTIFICATIONS * 2);
         let listener = thread::Builder::new()
             .name("zmux-macos-notification-responses".to_owned())
@@ -1484,7 +1552,7 @@ fn enqueue_mac_observation(
 fn finish_mac_response(
     mut completion: MacResponseCompletion,
     aborts: &mut HashMap<String, (u64, futures_util::future::AbortHandle)>,
-    callback_sender: &mpsc::Sender<NativeCallback>,
+    callback_sender: &NativeCallbackSender,
 ) {
     let is_current = aborts
         .get(&completion.native_id)
@@ -1513,7 +1581,7 @@ fn finish_mac_response(
 #[cfg(target_os = "macos")]
 async fn run_mac_response_observer(
     receiver: async_channel::Receiver<MacObserverCommand>,
-    callback_sender: mpsc::Sender<NativeCallback>,
+    callback_sender: NativeCallbackSender,
 ) {
     use futures_util::{FutureExt, StreamExt, future::Either};
 
@@ -1576,7 +1644,7 @@ async fn run_mac_response_observer(
 struct XdgSignalListener {
     connection: Option<zbus::blocking::Connection>,
     state: Arc<Mutex<XdgSignalState>>,
-    callback_sender: mpsc::Sender<NativeCallback>,
+    callback_sender: NativeCallbackSender,
     listener: Option<JoinHandle<()>>,
 }
 
@@ -1593,7 +1661,7 @@ struct XdgSignalState {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn dispatch_xdg_signal(
     state: &Arc<Mutex<XdgSignalState>>,
-    callback_sender: &mpsc::Sender<NativeCallback>,
+    callback_sender: &NativeCallbackSender,
     native_id: u32,
     kind: NativeCallbackKind,
 ) {
@@ -1629,7 +1697,7 @@ fn dispatch_xdg_signal(
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl XdgSignalListener {
-    fn new(callback_sender: mpsc::Sender<NativeCallback>) -> Result<Self, String> {
+    fn new(callback_sender: NativeCallbackSender) -> Result<Self, String> {
         let connection = zbus::blocking::Connection::session()
             .map_err(|error| format!("opening the session bus: {error}"))?;
         let rule = zbus::MatchRule::builder()
@@ -1695,7 +1763,7 @@ impl XdgSignalListener {
     }
 
     #[cfg(test)]
-    fn for_test(callback_sender: mpsc::Sender<NativeCallback>) -> Self {
+    fn for_test(callback_sender: NativeCallbackSender) -> Self {
         Self {
             connection: None,
             state: Arc::new(Mutex::new(XdgSignalState::default())),
@@ -1940,7 +2008,7 @@ fn deliver_windows_notification(
     job: &DeliveryJob,
     generation: u64,
     replacement: Option<&WindowsToastIdentity>,
-    callback_sender: &mpsc::Sender<NativeCallback>,
+    callback_sender: &NativeCallbackSender,
 ) -> Result<WindowsToastToken, String> {
     use windows::{
         Data::Xml::Dom::XmlDocument,
@@ -2070,6 +2138,20 @@ mod tests {
 
     use super::*;
 
+    fn native_callback_channel() -> (
+        NativeCallbackSender,
+        mpsc::Receiver<NativeCallback>,
+        Arc<DispatcherWaker>,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let waker = Arc::new(DispatcherWaker::default());
+        (
+            NativeCallbackSender::new(sender, Arc::clone(&waker)),
+            receiver,
+            waker,
+        )
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum FakeOperation {
         Deliver {
@@ -2096,7 +2178,7 @@ mod tests {
             job: &DeliveryJob,
             _generation: u64,
             replacement: Option<&Self::Token>,
-            _callback_sender: &mpsc::Sender<NativeCallback>,
+            _callback_sender: &NativeCallbackSender,
         ) -> Result<Self::Token, String> {
             self.next_token += 1;
             self.operations
@@ -2141,7 +2223,7 @@ mod tests {
             _job: &DeliveryJob,
             _generation: u64,
             _replacement: Option<&Self::Token>,
-            _callback_sender: &mpsc::Sender<NativeCallback>,
+            _callback_sender: &NativeCallbackSender,
         ) -> Result<Self::Token, String> {
             self.entered_delivery
                 .send(())
@@ -2180,7 +2262,7 @@ mod tests {
             job: &DeliveryJob,
             _generation: u64,
             replacement: Option<&Self::Token>,
-            _callback_sender: &mpsc::Sender<NativeCallback>,
+            _callback_sender: &NativeCallbackSender,
         ) -> Result<Self::Token, String> {
             self.next_token += 1;
             self.operations
@@ -2281,7 +2363,7 @@ mod tests {
         async_channel::Receiver<DesktopNotificationAction>,
         mpsc::Receiver<NativeCallback>,
     ) {
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, _) = native_callback_channel();
         let (action_sender, action_receiver) = async_channel::unbounded();
         (
             NotificationDispatcher::new(backend, callback_sender, action_sender),
@@ -2493,7 +2575,7 @@ mod tests {
     #[test]
     fn xdg_successful_show_is_closed_and_rejected_when_listener_setup_fails() {
         let mut backend = NotifyRustBackend::new();
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, _) = native_callback_channel();
         let listener_status = backend.ensure_xdg_listener_with(&callback_sender, |_| {
             Err("injected XDG listener setup failure".to_owned())
         });
@@ -2525,7 +2607,7 @@ mod tests {
     #[test]
     fn xdg_close_emitted_before_show_returns_is_delivered_after_registration() {
         let mut backend = NotifyRustBackend::new();
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, _) = native_callback_channel();
         backend.xdg_listener = Some(XdgSignalListener::for_test(callback_sender.clone()));
         let listener_state = backend.xdg_listener.as_ref().unwrap().state.clone();
         let signal_sender = callback_sender.clone();
@@ -2576,7 +2658,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn xdg_early_signal_handshake_is_strictly_bounded() {
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, _) = native_callback_channel();
         let listener = XdgSignalListener::for_test(callback_sender.clone());
         listener.begin_show(None);
         for native_id in 0..(XDG_EARLY_SIGNAL_CAPACITY as u32 * 4) {
@@ -2942,7 +3024,7 @@ mod tests {
 
     #[test]
     fn platform_callbacks_are_not_dropped_when_the_public_queue_would_be_full() {
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, _) = native_callback_channel();
         let callback_count = DELIVERY_QUEUE_CAPACITY * 4;
         for index in 0..callback_count {
             send_native_callback(
@@ -2966,6 +3048,192 @@ mod tests {
             assert_eq!(callback.sequence, 10_000 + index as u64);
         }
         assert!(callback_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_callback_wakes_a_quiescent_dispatcher() {
+        let backend = FakeBackend::default();
+        let operations = Arc::clone(&backend.operations);
+        let delivery_slots = Arc::new(AtomicUsize::new(0));
+        let (delivery_sender, delivery_receiver) = sync_channel(DELIVERY_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = sync_channel(CONTROL_QUEUE_CAPACITY);
+        let coalesced_retract_all_order = Arc::new(AtomicU64::new(0));
+        let notification_id = 30_000;
+        let notification_target = target(300);
+        assert!(
+            delivery_sender
+                .try_send(QueuedDelivery {
+                    order: 1,
+                    job: job(notification_id, notification_target),
+                    permit: reserve_delivery_slot(&delivery_slots).unwrap(),
+                })
+                .is_ok()
+        );
+
+        let (callback_sender, callback_receiver, dispatcher_waker) = native_callback_channel();
+        let test_callback_sender = callback_sender.clone();
+        let shutdown_waker = Arc::clone(&dispatcher_waker);
+        let (action_sender, action_receiver) = async_channel::unbounded();
+        let running = Arc::new(AtomicBool::new(true));
+        let dispatcher_running = Arc::clone(&running);
+        let dispatcher_coalesced_retract_all_order = Arc::clone(&coalesced_retract_all_order);
+        let dispatcher = thread::spawn(move || {
+            run_dispatcher(
+                backend,
+                DispatcherChannels {
+                    delivery_receiver,
+                    control_receiver,
+                    coalesced_retract_all_order: dispatcher_coalesced_retract_all_order,
+                    callback_receiver,
+                    callback_sender,
+                    action_sender,
+                },
+                dispatcher_running,
+                dispatcher_waker,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while operations.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!operations.lock().unwrap().is_empty());
+        while shutdown_waker.park_count() == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(shutdown_waker.park_count(), 1);
+
+        test_callback_sender
+            .send(NativeCallback {
+                key: NativeNotificationKey::Target(notification_target),
+                id: notification_id,
+                sequence: notification_id,
+                generation: 1,
+                kind: NativeCallbackKind::Closed,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let action = loop {
+            if let Ok(action) = action_receiver.try_recv() {
+                break action;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "explicit callback wake did not reach the dispatcher"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(
+            action,
+            DesktopNotificationAction::Closed {
+                id: notification_id,
+                sequence: notification_id,
+            }
+        );
+
+        running.store(false, Ordering::Release);
+        let _ = control_sender.try_send(DispatcherControl::Shutdown);
+        shutdown_waker.wake();
+        dispatcher.join().unwrap();
+    }
+
+    #[test]
+    fn native_callback_burst_drains_past_one_coalesced_wake() {
+        let backend = FakeBackend::default();
+        let operations = Arc::clone(&backend.operations);
+        let delivery_slots = Arc::new(AtomicUsize::new(0));
+        let (delivery_sender, delivery_receiver) = sync_channel(DELIVERY_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = sync_channel(CONTROL_QUEUE_CAPACITY);
+        let coalesced_retract_all_order = Arc::new(AtomicU64::new(0));
+        let notification_id = 31_000;
+        let notification_target = target(310);
+        delivery_sender
+            .try_send(QueuedDelivery {
+                order: 1,
+                job: job(notification_id, notification_target),
+                permit: reserve_delivery_slot(&delivery_slots).unwrap(),
+            })
+            .unwrap();
+
+        let (callback_sender, callback_receiver, dispatcher_waker) = native_callback_channel();
+        let queued_callback_sender = callback_sender.sender.clone();
+        let shutdown_waker = Arc::clone(&dispatcher_waker);
+        let (action_sender, action_receiver) = async_channel::unbounded();
+        let running = Arc::new(AtomicBool::new(true));
+        let dispatcher_running = Arc::clone(&running);
+        let dispatcher_coalesced_retract_all_order = Arc::clone(&coalesced_retract_all_order);
+        let dispatcher = thread::spawn(move || {
+            run_dispatcher(
+                backend,
+                DispatcherChannels {
+                    delivery_receiver,
+                    control_receiver,
+                    coalesced_retract_all_order: dispatcher_coalesced_retract_all_order,
+                    callback_receiver,
+                    callback_sender,
+                    action_sender,
+                },
+                dispatcher_running,
+                dispatcher_waker,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while (operations.lock().unwrap().is_empty() || shutdown_waker.park_count() == 0)
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(!operations.lock().unwrap().is_empty());
+        assert_eq!(shutdown_waker.park_count(), 1);
+
+        for index in 0..DELIVERY_QUEUE_CAPACITY {
+            queued_callback_sender
+                .send(NativeCallback {
+                    key: NativeNotificationKey::Unique {
+                        target: notification_target,
+                        id: index as u64,
+                    },
+                    id: index as u64,
+                    sequence: index as u64,
+                    generation: 1,
+                    kind: NativeCallbackKind::Closed,
+                })
+                .unwrap();
+        }
+        queued_callback_sender
+            .send(NativeCallback {
+                key: NativeNotificationKey::Target(notification_target),
+                id: notification_id,
+                sequence: notification_id,
+                generation: 1,
+                kind: NativeCallbackKind::Closed,
+            })
+            .unwrap();
+        shutdown_waker.wake();
+
+        let action = loop {
+            if let Ok(action) = action_receiver.try_recv() {
+                break action;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "callback behind a full drain batch was stranded"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(
+            action,
+            DesktopNotificationAction::Closed {
+                id: notification_id,
+                sequence: notification_id,
+            }
+        );
+
+        running.store(false, Ordering::Release);
+        let _ = control_sender.try_send(DispatcherControl::Shutdown);
+        shutdown_waker.wake();
+        dispatcher.join().unwrap();
     }
 
     #[test]
@@ -2997,7 +3265,7 @@ mod tests {
                 })
                 .is_ok()
         );
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, dispatcher_waker) = native_callback_channel();
         let (action_sender, _action_receiver) = async_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
         let dispatcher_running = running.clone();
@@ -3014,6 +3282,7 @@ mod tests {
                     action_sender,
                 },
                 dispatcher_running,
+                dispatcher_waker,
             );
         });
         started_receiver
@@ -3125,7 +3394,7 @@ mod tests {
             "the reliable control path must accept retraction while delivery is saturated"
         );
 
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, dispatcher_waker) = native_callback_channel();
         let (action_sender, action_receiver) = async_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
         let dispatcher_running = running.clone();
@@ -3142,6 +3411,7 @@ mod tests {
                     action_sender,
                 },
                 dispatcher_running,
+                dispatcher_waker,
             );
         });
 
@@ -3240,7 +3510,7 @@ mod tests {
                 .is_ok()
         );
 
-        let (callback_sender, callback_receiver) = mpsc::channel();
+        let (callback_sender, callback_receiver, dispatcher_waker) = native_callback_channel();
         let (action_sender, action_receiver) = async_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
         let dispatcher_running = running.clone();
@@ -3257,6 +3527,7 @@ mod tests {
                     action_sender,
                 },
                 dispatcher_running,
+                dispatcher_waker,
             );
         });
 
@@ -3321,7 +3592,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn xdg_signal_listener_shutdown_joins_its_owned_thread() {
-        let (callback_sender, _callback_receiver) = mpsc::channel();
+        let (callback_sender, _callback_receiver, _) = native_callback_channel();
         let Ok(listener) = XdgSignalListener::new(callback_sender) else {
             // Most headless test environments do not expose a session bus.
             return;

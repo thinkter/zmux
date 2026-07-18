@@ -27,6 +27,7 @@ use anyhow::{Context as _, bail};
 use async_channel::{Receiver, Sender, bounded};
 use gpui::Global;
 use hmac::{Hmac, Mac};
+use mio::{Events, Interest, Poll, Token, Waker};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -49,15 +50,14 @@ const MAX_REGISTERED_ROUTES: usize = 4_096;
 const CONNECTION_QUEUE_CAPACITY: usize = 64;
 const NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 const WORKER_COUNT: usize = 4;
-// The accept socket stays nonblocking so shutdown is observable; 100ms bounds
-// idle wakeups at 10/s while adding imperceptible latency to CLI deliveries.
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESSING_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const COMPLETION_POLL_INTERVAL: Duration = IO_POLL_INTERVAL;
 const AUTH_TRANSCRIPT_DOMAIN: &[u8] = b"zmux-notify/server-auth/v3";
+const LISTENER_TOKEN: Token = Token(0);
+const SHUTDOWN_TOKEN: Token = Token(1);
 
 /// A notification submitted by the `zmux notify` command.
 ///
@@ -606,6 +606,7 @@ pub struct CliServer {
     notifications: Receiver<ReceivedCliNotification>,
     running: Arc<AtomicBool>,
     connections: Sender<AcceptedConnection>,
+    accept_waker: Arc<Waker>,
     accept_thread: Option<JoinHandle<()>>,
     worker_threads: Vec<JoinHandle<()>>,
 }
@@ -625,6 +626,15 @@ impl CliServer {
         listener
             .set_nonblocking(true)
             .context("failed to make notification listener nonblocking")?;
+        let mut listener = mio::net::TcpListener::from_std(listener);
+        let poll = Poll::new().context("failed to create notification listener poller")?;
+        poll.registry()
+            .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)
+            .context("failed to register notification listener")?;
+        let accept_waker = Arc::new(
+            Waker::new(poll.registry(), SHUTDOWN_TOKEN)
+                .context("failed to create notification listener shutdown waker")?,
+        );
 
         let routes = Arc::new(RouteRegistry::default());
         let running = Arc::new(AtomicBool::new(true));
@@ -635,7 +645,7 @@ impl CliServer {
         let accept_connections = connection_tx.clone();
         let accept_thread = thread::Builder::new()
             .name("zmux-notify-accept".to_owned())
-            .spawn(move || accept_loop(listener, accept_connections, accept_running))
+            .spawn(move || accept_loop(listener, poll, accept_connections, accept_running))
             .context("failed to start notification listener thread")?;
 
         let mut worker_threads: Vec<JoinHandle<()>> = Vec::with_capacity(WORKER_COUNT);
@@ -660,6 +670,7 @@ impl CliServer {
                     running.store(false, Ordering::Release);
                     routes.close();
                     connection_tx.close();
+                    let _ = accept_waker.wake();
                     let _ = accept_thread.join();
                     for worker in worker_threads {
                         let _ = worker.join();
@@ -677,6 +688,7 @@ impl CliServer {
             notifications: notification_rx,
             running,
             connections: connection_tx,
+            accept_waker,
             accept_thread: Some(accept_thread),
             worker_threads,
         })
@@ -854,6 +866,7 @@ impl Drop for CliServer {
         self.running.store(false, Ordering::Release);
         self.routes.close();
         self.connections.close();
+        let _ = self.accept_waker.wake();
 
         if let Some(thread) = self.accept_thread.take() {
             let _ = thread.join();
@@ -865,36 +878,59 @@ impl Drop for CliServer {
 }
 
 fn accept_loop(
-    listener: TcpListener,
+    listener: mio::net::TcpListener,
+    mut poll: Poll,
     connections: Sender<AcceptedConnection>,
     running: Arc<AtomicBool>,
 ) {
+    let mut events = Events::with_capacity(2);
     while running.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, peer_addr)) => {
-                if !peer_addr.ip().is_loopback() {
-                    continue;
+        if let Err(error) = poll.poll(&mut events, None) {
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        for event in &events {
+            if event.token() == SHUTDOWN_TOKEN || !running.load(Ordering::Acquire) {
+                return;
+            }
+            if event.token() != LISTENER_TOKEN {
+                continue;
+            }
+            loop {
+                if !running.load(Ordering::Acquire) {
+                    return;
                 }
-                if configure_server_stream(&stream).is_err() {
-                    continue;
-                }
-                let connection = AcceptedConnection {
-                    stream,
-                    read_deadline: Instant::now() + SERVER_IO_TIMEOUT,
-                };
-                match connections.try_send(connection) {
-                    Ok(()) => {}
-                    // Do not emit an unauthenticated response before the v3
-                    // server-proof handshake. Closing is a safe busy signal.
-                    Err(async_channel::TrySendError::Full(_)) => {}
-                    Err(async_channel::TrySendError::Closed(_)) => break,
+                match listener.accept() {
+                    Ok((stream, peer_addr)) => {
+                        if !peer_addr.ip().is_loopback() {
+                            continue;
+                        }
+                        let stream: TcpStream = stream.into();
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        if configure_server_stream(&stream).is_err() {
+                            continue;
+                        }
+                        let connection = AcceptedConnection {
+                            stream,
+                            read_deadline: Instant::now() + SERVER_IO_TIMEOUT,
+                        };
+                        match connections.try_send(connection) {
+                            Ok(()) => {}
+                            // Do not emit an unauthenticated response before the v3
+                            // server-proof handshake. Closing is a safe busy signal.
+                            Err(async_channel::TrySendError::Full(_)) => {}
+                            Err(async_channel::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => return,
                 }
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL_INTERVAL);
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(_) => break,
         }
     }
 }
@@ -1722,6 +1758,19 @@ mod tests {
             "server shutdown waited for socket inactivity timeouts"
         );
         drop(clients);
+    }
+
+    #[test]
+    fn shutdown_wakes_an_idle_accept_loop() {
+        let server = CliServer::start().unwrap();
+        let started = Instant::now();
+
+        drop(server);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "idle accept loop did not observe its explicit shutdown wake"
+        );
     }
 
     #[test]

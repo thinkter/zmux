@@ -15020,6 +15020,7 @@ dependencies = [
  "http_client",
  "language",
  "mac-usernotifications",
+ "mio",
  "node_runtime",
  "notify-rust",
  "paths",
