@@ -713,6 +713,20 @@ mod tests {
     use super::*;
     use crate::session::{LayoutNodeSnapshot, LayoutSnapshot, TerminalSnapshot};
 
+    /// `temp_dir()` sits behind the `/var -> /private/var` symlink on macOS,
+    /// while live shells report physical cwds. Tests that assert exact paths
+    /// against live-derived context must start from the physical temp root.
+    /// Other platforms keep the logical form: on Windows `canonicalize`
+    /// produces verbatim (`\\?\`) paths that shells never report back.
+    fn physical_temp_dir() -> PathBuf {
+        let temp = std::env::temp_dir();
+        if cfg!(target_os = "macos") {
+            temp.canonicalize().unwrap_or(temp)
+        } else {
+            temp
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_identity_matches_aliases_without_rewriting_logical_paths() {
@@ -915,7 +929,7 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let base =
-            std::env::temp_dir().join(format!("zmux-multi-repo-restore-{}", uuid::Uuid::new_v4()));
+            physical_temp_dir().join(format!("zmux-multi-repo-restore-{}", uuid::Uuid::new_v4()));
         let first = base.join("first");
         let selected = base.join("selected");
         std::fs::create_dir_all(first.join(".git")).unwrap();
@@ -1090,7 +1104,7 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let base =
-            std::env::temp_dir().join(format!("zmux-interrupted-restore-{}", uuid::Uuid::new_v4()));
+            physical_temp_dir().join(format!("zmux-interrupted-restore-{}", uuid::Uuid::new_v4()));
         let selected = base.join("selected");
         std::fs::create_dir_all(selected.join(".git")).unwrap();
 

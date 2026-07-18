@@ -1,0 +1,8 @@
+# Used by the Windows release-build job (cargo nextest run).
+
+[[profile.default.overrides]]
+# ConPTY spawns on loaded CI runners occasionally exceed the vendored GPUI
+# test scheduler's hard 15-second parking limit. Retry PTY-backed smoke
+# tests; a genuine deadlock still fails every attempt.
+filter = 'binary(zmux_app) or binary(zed_terminal_port)'
+retries = 2
