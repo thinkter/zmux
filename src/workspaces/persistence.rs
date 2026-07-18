@@ -553,7 +553,10 @@ fn snapshot_active_layout(workspace: &Workspace, cx: &App) -> LayoutSnapshot {
             focused: true,
         },
     );
-    LayoutSnapshot { root }
+    // A pane whose items were all non-terminal views (e.g. a diff view)
+    // snapshots as an empty leaf; collapse it so restore does not recreate a
+    // blank pane in its place.
+    LayoutSnapshot { root }.without_empty_panes()
 }
 
 fn snapshot_member(member: &Member, workspace: &Workspace, cx: &App) -> Option<LayoutNodeSnapshot> {
@@ -640,6 +643,7 @@ fn snapshot_stored_layout(layout: &StoredLayout, cx: &App) -> LayoutSnapshot {
     LayoutSnapshot {
         root: snapshot_node(layout, cx),
     }
+    .without_empty_panes()
 }
 
 pub(super) fn restore_snapshot_layout(

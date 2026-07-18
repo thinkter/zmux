@@ -135,6 +135,26 @@ impl LayoutSnapshot {
         }
         Ok(())
     }
+
+    /// Drop panes that carry no terminal tabs — e.g. a pane that only held a
+    /// diff view when the session was captured. A split whose side disappears
+    /// gives its space back to the surviving side; if the focused pane was
+    /// dropped, focus falls back to the first remaining pane. An entirely
+    /// empty layout collapses to a single empty focused pane.
+    pub fn without_empty_panes(&self) -> Self {
+        let mut root = self
+            .root
+            .without_empty_panes()
+            .unwrap_or(LayoutNodeSnapshot::Leaf {
+                tabs: Vec::new(),
+                active_tab: 0,
+                focused: true,
+            });
+        if !root.contains_focused_pane() {
+            root.focus_first_pane();
+        }
+        Self { root }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +228,42 @@ impl LayoutNodeSnapshot {
             }
         }
         Ok(())
+    }
+
+    fn without_empty_panes(&self) -> Option<Self> {
+        match self {
+            Self::Leaf { tabs, .. } => (!tabs.is_empty()).then(|| self.clone()),
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => match (first.without_empty_panes(), second.without_empty_panes()) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    axis: *axis,
+                    ratio: *ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (child, None) | (None, child) => child,
+            },
+        }
+    }
+
+    fn contains_focused_pane(&self) -> bool {
+        match self {
+            Self::Leaf { focused, .. } => *focused,
+            Self::Split { first, second, .. } => {
+                first.contains_focused_pane() || second.contains_focused_pane()
+            }
+        }
+    }
+
+    fn focus_first_pane(&mut self) {
+        match self {
+            Self::Leaf { focused, .. } => *focused = true,
+            Self::Split { first, .. } => first.focus_first_pane(),
+        }
     }
 }
 
@@ -544,6 +600,68 @@ mod tests {
         let snapshot = snapshot();
         store.save(&snapshot).unwrap();
         assert_eq!(store.load().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn pruning_collapses_panes_that_lost_all_tabs() {
+        let layout = LayoutSnapshot {
+            root: LayoutNodeSnapshot::Split {
+                axis: LayoutAxis::Horizontal,
+                ratio: 0.7,
+                first: Box::new(LayoutNodeSnapshot::Leaf {
+                    tabs: vec![TerminalSnapshot::fresh_shell(Some("/tmp/api".into()))],
+                    active_tab: 0,
+                    focused: false,
+                }),
+                second: Box::new(LayoutNodeSnapshot::Leaf {
+                    tabs: Vec::new(),
+                    active_tab: 0,
+                    focused: true,
+                }),
+            },
+        };
+
+        let pruned = layout.without_empty_panes();
+        assert_eq!(
+            pruned.root,
+            LayoutNodeSnapshot::Leaf {
+                tabs: vec![TerminalSnapshot::fresh_shell(Some("/tmp/api".into()))],
+                active_tab: 0,
+                focused: true,
+            }
+        );
+        pruned.validate().unwrap();
+    }
+
+    #[test]
+    fn pruning_an_entirely_empty_layout_keeps_one_focused_pane() {
+        let layout = LayoutSnapshot {
+            root: LayoutNodeSnapshot::Split {
+                axis: LayoutAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutNodeSnapshot::Leaf {
+                    tabs: Vec::new(),
+                    active_tab: 0,
+                    focused: true,
+                }),
+                second: Box::new(LayoutNodeSnapshot::Leaf {
+                    tabs: Vec::new(),
+                    active_tab: 0,
+                    focused: false,
+                }),
+            },
+        };
+
+        let pruned = layout.without_empty_panes();
+        assert_eq!(
+            pruned.root,
+            LayoutNodeSnapshot::Leaf {
+                tabs: Vec::new(),
+                active_tab: 0,
+                focused: true,
+            }
+        );
+        pruned.validate().unwrap();
     }
 
     #[test]

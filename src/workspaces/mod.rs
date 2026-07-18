@@ -221,7 +221,10 @@ impl WorkspacesPanel {
                         git: MetadataState::NotRequested,
                         metadata_root: None,
                         metadata_refreshed_at: None,
-                        restore: Some(workspace.layout.clone()),
+                        // Sessions saved before empty panes were pruned at
+                        // capture time may still carry them; prune here so the
+                        // retry snapshot and its failed-restore paths agree.
+                        restore: Some(workspace.layout.without_empty_panes()),
                         failed_restores: Vec::new(),
                         stored: None,
                     })
