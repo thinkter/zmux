@@ -2163,7 +2163,22 @@ mod tests {
         opened
             .window
             .update(cx, |_, window, cx| {
-                panel.update(cx, |panel, cx| panel.close_workspace(2, window, cx));
+                panel.update(cx, |panel, cx| {
+                    // Terminal context refreshes run asynchronously and may
+                    // have marked the active entry incomplete while the two
+                    // worktrees were attaching. Establish this test's
+                    // authoritative-root precondition in the same update as
+                    // the close so cleanup is not timing-dependent.
+                    let active = panel
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.id == panel.active)
+                        .unwrap();
+                    active.context.git_roots = vec![shared.clone()];
+                    active.context_authoritative = true;
+                    active.git_discovery = GitDiscoveryState::Authoritative;
+                    panel.close_workspace(2, window, cx);
+                });
             })
             .expect("window should remain open");
 
