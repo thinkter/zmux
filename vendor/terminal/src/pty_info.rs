@@ -18,7 +18,7 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use sysinfo::Pid;
 #[cfg(not(target_os = "macos"))]
-use sysinfo::{Process, ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use sysinfo::{Process, ProcessRefreshKind, System, UpdateKind};
 
 use crate::{Event, Terminal};
 
@@ -348,9 +348,7 @@ impl PtyProcessInfo {
             .with_cwd(UpdateKind::Always)
             .with_exe(UpdateKind::Always);
         #[cfg(not(target_os = "macos"))]
-        let refresh_kind = RefreshKind::nothing().with_processes(process_refresh_kind);
-        #[cfg(not(target_os = "macos"))]
-        let system = System::new_with_specifics(refresh_kind);
+        let system = System::new();
 
         PtyProcessInfo {
             #[cfg(not(target_os = "macos"))]
@@ -385,6 +383,11 @@ impl PtyProcessInfo {
     #[cfg(not(target_os = "macos"))]
     fn get_child(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
         let pid = self.pid_getter.fallback_pid();
+        self.system.write().refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            self.refresh_kind,
+        );
         RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
 
@@ -549,6 +552,24 @@ mod refresh_latch_tests {
 
         assert_eq!(probes, 2);
         assert_eq!(latch, ProcessRefreshLatch::default());
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod process_system_tests {
+    use super::*;
+
+    #[test]
+    fn process_system_starts_empty_and_refreshes_fallback_pid_on_demand() {
+        let pid = Pid::from_u32(std::process::id());
+        let info = PtyProcessInfo::new(ProcessIdGetter::new(-1, pid.as_u32()));
+
+        assert!(info.system.read().processes().is_empty());
+
+        let child_pid = info.get_child().map(|process| process.pid());
+
+        assert_eq!(child_pid, Some(pid));
+        assert_eq!(info.system.read().processes().len(), 1);
     }
 }
 
