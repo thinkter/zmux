@@ -1,4 +1,4 @@
-use super::{HoverTarget, HoveredWord, TerminalView};
+use super::{HoverTarget, HoveredWord, TerminalView, terminal_directory_open_handler};
 use anyhow::{Context as _, Result};
 use editor::Editor;
 use gpui::{Context, Task, TaskExt, WeakEntity, Window};
@@ -144,6 +144,25 @@ fn possibly_open_target(
         };
 
         let path_to_open = open_target.path();
+        if open_target.is_dir() {
+            let directory_handler = cx
+                .update(|_, cx| terminal_directory_open_handler(cx))
+                .ok()
+                .flatten();
+            if let Some(directory_handler) = directory_handler {
+                let handled = cx.update(|window, cx| {
+                    directory_handler(
+                        workspace.clone(),
+                        path_to_open.path.clone(),
+                        window,
+                        cx,
+                    )
+                })?;
+                if handled {
+                    return Ok(Some(open_target));
+                }
+            }
+        }
         let opened_items = workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_paths(

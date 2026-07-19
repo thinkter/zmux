@@ -295,6 +295,33 @@ pub fn set_terminal_creation_handler(handler: TerminalCreationHandler, cx: &mut 
     cx.set_global(RegisteredTerminalCreationHandler(handler));
 }
 
+/// Application-provided handling for directory links clicked in a terminal.
+///
+/// Zed normally opens a directory as a visible worktree. Terminal-focused
+/// embedders can instead give directory navigation their own meaning without
+/// making `terminal_view` depend on the embedding application.
+pub type TerminalDirectoryOpenHandler = Arc<
+    dyn Fn(WeakEntity<Workspace>, PathBuf, &mut gpui::Window, &mut App) -> bool,
+>;
+
+struct RegisteredTerminalDirectoryOpenHandler(TerminalDirectoryOpenHandler);
+
+impl Global for RegisteredTerminalDirectoryOpenHandler {}
+
+pub fn set_terminal_directory_open_handler(
+    handler: TerminalDirectoryOpenHandler,
+    cx: &mut App,
+) {
+    cx.set_global(RegisteredTerminalDirectoryOpenHandler(handler));
+}
+
+pub(crate) fn terminal_directory_open_handler(
+    cx: &App,
+) -> Option<TerminalDirectoryOpenHandler> {
+    cx.try_global::<RegisteredTerminalDirectoryOpenHandler>()
+        .map(|handler| Arc::clone(&handler.0))
+}
+
 /// Application-provided unread-state lookup for task-backed terminal tabs.
 ///
 /// Zed normally uses `Item::is_dirty` to show a running-task indicator. An
