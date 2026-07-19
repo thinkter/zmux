@@ -9,15 +9,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use gpui::{App, Axis, Context, Entity, EntityId, Focusable, Global, Window};
+use gpui::{App, Axis, Context, Entity, EntityId, Focusable, Global, WeakEntity, Window};
 use terminal_view::TerminalView;
 use ui::prelude::*;
 use workspace::item::ItemHandle;
 use workspace::{Member, Pane, SplitDirection, Workspace};
 
 use crate::session::{
-    LayoutAxis, LayoutNodeSnapshot, LayoutSnapshot, SESSION_VERSION, SessionSnapshot,
-    SessionWriteOutcome, TerminalSnapshot, WorkspaceSnapshot,
+    LayoutAxis, LayoutNodeSnapshot, LayoutSnapshot, SESSION_VERSION, SessionOwnerGeneration,
+    SessionSnapshot, SessionStore, SessionWriteOutcome, TerminalSnapshot, WorkspaceSnapshot,
 };
 
 use super::WorkspacesPanel;
@@ -40,10 +40,128 @@ pub(super) enum StoredLayout {
     },
 }
 
-#[derive(Default)]
-pub(super) struct SessionOwnerClaimed(pub(super) bool);
+struct RegisteredSessionPanel {
+    id: EntityId,
+    panel: WeakEntity<WorkspacesPanel>,
+}
 
-impl Global for SessionOwnerClaimed {}
+struct SessionOwnership {
+    store: SessionStore,
+    enabled: bool,
+    owner: Option<EntityId>,
+    panels: Vec<RegisteredSessionPanel>,
+}
+
+impl SessionOwnership {
+    fn new(store: SessionStore) -> Self {
+        Self {
+            store,
+            enabled: false,
+            owner: None,
+            panels: Vec::new(),
+        }
+    }
+
+    fn claim(&mut self, id: EntityId) -> anyhow::Result<SessionOwnerGeneration> {
+        let generation = self.store.begin_owner_generation()?;
+        self.owner = Some(id);
+        Ok(generation)
+    }
+}
+
+impl Global for SessionOwnership {}
+
+pub(super) struct SessionOwnershipClaim {
+    pub(super) store: SessionStore,
+    pub(super) owner_generation: Option<SessionOwnerGeneration>,
+    pub(super) restore_from_disk: bool,
+}
+
+pub(super) fn register_session_panel(
+    panel: WeakEntity<WorkspacesPanel>,
+    restore_from_disk: bool,
+    cx: &mut Context<WorkspacesPanel>,
+) -> SessionOwnershipClaim {
+    if !cx.has_global::<SessionOwnership>() {
+        cx.set_global(SessionOwnership::new(SessionStore::from_environment()));
+    }
+
+    let id = panel.entity_id();
+    let ownership = cx.global_mut::<SessionOwnership>();
+    ownership.panels.retain(|registered| registered.id != id);
+    ownership.panels.push(RegisteredSessionPanel { id, panel });
+    if restore_from_disk {
+        ownership.enabled = true;
+    }
+
+    let owner_generation = if ownership.owner.is_none() && (restore_from_disk || ownership.enabled)
+    {
+        match ownership.claim(id) {
+            Ok(generation) => Some(generation),
+            Err(error) => {
+                eprintln!("failed to claim zmux session persistence: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    SessionOwnershipClaim {
+        store: ownership.store.clone(),
+        owner_generation,
+        restore_from_disk: restore_from_disk && owner_generation.is_some(),
+    }
+}
+
+pub(super) fn release_session_panel(id: EntityId, cx: &mut App) {
+    if !cx.has_global::<SessionOwnership>() {
+        return;
+    }
+
+    {
+        let ownership = cx.global_mut::<SessionOwnership>();
+        ownership.panels.retain(|registered| registered.id != id);
+        if ownership.owner != Some(id) {
+            return;
+        }
+        ownership.owner = None;
+    }
+
+    let adoption = {
+        let ownership = cx.global_mut::<SessionOwnership>();
+        ownership
+            .panels
+            .retain(|registered| registered.panel.upgrade().is_some());
+        let Some((id, panel)) = ownership.panels.iter().find_map(|registered| {
+            registered
+                .panel
+                .upgrade()
+                .map(|panel| (registered.id, panel))
+        }) else {
+            return;
+        };
+        match ownership.claim(id) {
+            Ok(generation) => Some((panel, ownership.store.clone(), generation)),
+            Err(error) => {
+                eprintln!("failed to transfer zmux session persistence: {error:#}");
+                None
+            }
+        }
+    };
+
+    let Some((panel, store, generation)) = adoption else {
+        return;
+    };
+    panel.update(cx, |panel, cx| {
+        panel.adopt_session_ownership(store, generation, cx);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn install_session_store_for_test(store: SessionStore, cx: &mut App) {
+    cx.set_global(SessionOwnership::new(store));
+}
 
 pub(crate) struct RestoredTerminal {
     pub(crate) pane: Entity<Pane>,
@@ -233,7 +351,7 @@ impl WorkspacesPanel {
     /// Replacing the task resets the debounce window, so a burst of split,
     /// resize, tab, and workspace changes produces one detached snapshot.
     pub(super) fn schedule_session_persistence(&mut self, cx: &mut Context<Self>) {
-        if !self.owns_session {
+        if self.session_owner_generation.is_none() {
             return;
         }
         self.session_persist_task = Some(cx.spawn(async move |this, cx| {
@@ -249,7 +367,7 @@ impl WorkspacesPanel {
     }
 
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
-        if !self.owns_session {
+        if self.session_owner_generation.is_none() {
             return;
         }
         let Some(workspace) = self.workspace.upgrade() else {
@@ -304,12 +422,15 @@ impl WorkspacesPanel {
     }
 
     fn start_session_write(&mut self, cx: &mut Context<Self>) {
+        let Some(owner_generation) = self.session_owner_generation else {
+            return;
+        };
         let Some(snapshot) = self.session_persistence.start_next() else {
             return;
         };
 
         let store = self.session_store.clone();
-        let write = match store.prepare_save(&snapshot) {
+        let write = match store.prepare_save(&snapshot, owner_generation) {
             Ok(write) => write,
             Err(error) => {
                 eprintln!("failed to prepare zmux session persistence: {error:#}");

@@ -303,6 +303,7 @@ pub enum ResumePolicy {
 struct SessionWriter {
     next_sequence: AtomicU64,
     newest_sequence: AtomicU64,
+    owner_generation: AtomicU64,
     write_lock: Mutex<()>,
 }
 
@@ -320,9 +321,13 @@ pub struct SessionStore {
 
 #[derive(Debug)]
 pub struct SessionWrite {
+    owner_generation: SessionOwnerGeneration,
     sequence: u64,
     snapshot: SessionSnapshot,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionOwnerGeneration(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionWriteOutcome {
@@ -363,10 +368,30 @@ impl SessionStore {
         Ok(Some(snapshot))
     }
 
+    /// Start a new persistence-owner epoch. Writes prepared by every previous
+    /// owner become stale immediately, even if the new owner has not prepared
+    /// its first snapshot yet.
+    pub fn begin_owner_generation(&self) -> Result<SessionOwnerGeneration> {
+        let generation = self
+            .writer
+            .owner_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+            .context("zmux session owner generation overflowed")?;
+        Ok(SessionOwnerGeneration(generation))
+    }
+
     /// Reserve this write's place in the newest-wins order. Validation and
     /// serialization are deferred to `commit` so callers on the UI thread
-    /// only pay for an atomic increment here.
-    pub fn prepare_save(&self, snapshot: &SessionSnapshot) -> Result<SessionWrite> {
+    /// only pay for atomic increments here.
+    pub fn prepare_save(
+        &self,
+        snapshot: &SessionSnapshot,
+        owner_generation: SessionOwnerGeneration,
+    ) -> Result<SessionWrite> {
         let sequence = self
             .writer
             .next_sequence
@@ -380,6 +405,7 @@ impl SessionStore {
             .newest_sequence
             .fetch_max(sequence, Ordering::Release);
         Ok(SessionWrite {
+            owner_generation,
             sequence,
             snapshot: snapshot.clone(),
         })
@@ -445,12 +471,16 @@ impl SessionStore {
 
     #[cfg(test)]
     pub fn save(&self, snapshot: &SessionSnapshot) -> Result<SessionWriteOutcome> {
-        let write = self.prepare_save(snapshot)?;
+        let generation =
+            SessionOwnerGeneration(self.writer.owner_generation.load(Ordering::Acquire));
+        let write = self.prepare_save(snapshot, generation)?;
         self.commit(&write)
     }
 
     fn is_superseded(&self, write: &SessionWrite) -> bool {
-        write.sequence < self.writer.newest_sequence.load(Ordering::Acquire)
+        write.owner_generation
+            != SessionOwnerGeneration(self.writer.owner_generation.load(Ordering::Acquire))
+            || write.sequence < self.writer.newest_sequence.load(Ordering::Acquire)
     }
 }
 
@@ -728,13 +758,14 @@ mod tests {
     #[test]
     fn newest_valid_snapshot_wins_concurrent_save_stress() {
         let store = test_store("concurrent-newest-wins");
+        let generation = store.begin_owner_generation().unwrap();
         let mut newest = snapshot();
         let writes = (0..64)
             .map(|index| {
                 let mut candidate = snapshot();
                 candidate.workspaces[0].manual_name = Some(format!("snapshot-{index}"));
                 newest = candidate.clone();
-                store.prepare_save(&candidate).unwrap()
+                store.prepare_save(&candidate, generation).unwrap()
             })
             .collect::<Vec<_>>();
 
@@ -766,10 +797,11 @@ mod tests {
     #[test]
     fn failed_write_can_retry_without_a_new_request() {
         let store = test_store("retry");
+        let generation = store.begin_owner_generation().unwrap();
         let parent = store.path().parent().unwrap();
         fs::write(parent, b"blocks directory creation").unwrap();
         let expected = snapshot();
-        let write = store.prepare_save(&expected).unwrap();
+        let write = store.prepare_save(&expected, generation).unwrap();
 
         assert!(store.commit(&write).is_err());
         fs::remove_file(parent).unwrap();
@@ -783,15 +815,44 @@ mod tests {
     #[test]
     fn write_sequences_start_nonzero_and_fail_closed_at_overflow() {
         let store = test_store("sequence-bounds");
-        let first = store.prepare_save(&snapshot()).unwrap();
+        let generation = store.begin_owner_generation().unwrap();
+        let first = store.prepare_save(&snapshot(), generation).unwrap();
         assert_eq!(first.sequence, 1);
 
         store
             .writer
             .next_sequence
             .store(u64::MAX, Ordering::Relaxed);
-        assert!(store.prepare_save(&snapshot()).is_err());
+        assert!(store.prepare_save(&snapshot(), generation).is_err());
         assert_eq!(store.writer.next_sequence.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn stale_owner_generation_is_superseded_before_the_new_owner_writes() {
+        let store = test_store("stale-owner-generation");
+        let first_generation = store.begin_owner_generation().unwrap();
+        let stale_snapshot = snapshot();
+        let stale_write = store
+            .prepare_save(&stale_snapshot, first_generation)
+            .unwrap();
+
+        let second_generation = store.begin_owner_generation().unwrap();
+        assert_eq!(
+            store.commit(&stale_write).unwrap(),
+            SessionWriteOutcome::Superseded
+        );
+        assert_eq!(store.load().unwrap(), None);
+
+        let mut current_snapshot = snapshot();
+        current_snapshot.workspaces[0].manual_name = Some("new owner".into());
+        let current_write = store
+            .prepare_save(&current_snapshot, second_generation)
+            .unwrap();
+        assert_eq!(
+            store.commit(&current_write).unwrap(),
+            SessionWriteOutcome::Installed
+        );
+        assert_eq!(store.load().unwrap(), Some(current_snapshot));
     }
 
     #[test]

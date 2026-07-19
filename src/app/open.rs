@@ -42,7 +42,7 @@ pub fn open_zmux_workspace_at(
 fn open_zmux_workspace_for_directory(
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
     initial_directory: Option<PathBuf>,
-    session_enabled: bool,
+    restore_persisted_session: bool,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
     let app_state = AppState::global(cx);
@@ -76,7 +76,7 @@ fn open_zmux_workspace_for_directory(
                 WorkspacesPanel::new(
                     workspace.weak_handle(),
                     initial_directory,
-                    session_enabled,
+                    restore_persisted_session,
                     window,
                     cx,
                 )
@@ -136,4 +136,248 @@ fn open_zmux_workspace_for_directory(
         })?;
         anyhow::Ok(result)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use gpui::{Action, TestAppContext};
+    use terminal_view::TerminalView;
+    use workspace::{OpenResult, Workspace};
+
+    use crate::session::{LayoutNodeSnapshot, SessionSnapshot, SessionStore};
+    use crate::workspaces::install_session_store_for_test;
+    use crate::{SplitTerminalRight, init_zmux};
+
+    use super::open_zmux_workspace_for_directory;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zmux-{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create isolated session test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn terminal_count(workspace: &Workspace, cx: &gpui::App) -> usize {
+        workspace
+            .panes()
+            .iter()
+            .map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .filter(|item| item.act_as::<TerminalView>(cx).is_some())
+                    .count()
+            })
+            .sum()
+    }
+
+    fn snapshot_terminal_count(snapshot: &SessionSnapshot) -> usize {
+        fn layout_terminal_count(node: &LayoutNodeSnapshot) -> usize {
+            match node {
+                LayoutNodeSnapshot::Leaf { tabs, .. } => tabs.len(),
+                LayoutNodeSnapshot::Split { first, second, .. } => {
+                    layout_terminal_count(first) + layout_terminal_count(second)
+                }
+            }
+        }
+
+        snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| layout_terminal_count(&workspace.layout.root))
+            .sum()
+    }
+
+    async fn wait_for_terminal_count(
+        opened: &OpenResult,
+        expected: usize,
+        cx: &mut TestAppContext,
+    ) {
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if opened.workspace.read_with(cx, terminal_count) == expected {
+                return;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert_eq!(opened.workspace.read_with(cx, terminal_count), expected);
+    }
+
+    async fn wait_for_persisted_terminal_count(
+        store: &SessionStore,
+        expected: usize,
+        cx: &mut TestAppContext,
+    ) -> SessionSnapshot {
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if let Some(snapshot) = store.load().expect("load test session")
+                && snapshot_terminal_count(&snapshot) == expected
+            {
+                return snapshot;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        let snapshot = store
+            .load()
+            .expect("load test session")
+            .expect("session should have been persisted");
+        assert_eq!(snapshot_terminal_count(&snapshot), expected);
+        snapshot
+    }
+
+    fn close_window(opened: OpenResult, cx: &mut TestAppContext) {
+        let window = opened.window;
+        drop(opened);
+        window
+            .update(cx, |_, window, _cx| window.remove_window())
+            .expect("test window should remain open until removal");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn survivor_adopts_session_persistence_and_restores_its_latest_layout(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let state = TestDirectory::new("session-handoff-state");
+        let primary_directory = TestDirectory::new("session-handoff-primary");
+        let transient_directory = TestDirectory::new("session-handoff-transient");
+        let survivor_directory = TestDirectory::new("session-handoff-survivor");
+        let session_path = state.path().join("session.json");
+        let store = SessionStore::at(session_path.clone());
+
+        let primary_task = cx.update(|cx| {
+            init_zmux(cx);
+            install_session_store_for_test(store.clone(), cx);
+            open_zmux_workspace_for_directory(
+                None,
+                Some(primary_directory.path().to_path_buf()),
+                true,
+                cx,
+            )
+        });
+        let primary = primary_task.await.expect("open persistence owner");
+        wait_for_terminal_count(&primary, 1, cx).await;
+        wait_for_persisted_terminal_count(&store, 1, cx).await;
+
+        let transient_task = cx.update(|cx| {
+            open_zmux_workspace_for_directory(
+                Some(primary.window),
+                Some(transient_directory.path().to_path_buf()),
+                false,
+                cx,
+            )
+        });
+        let transient = transient_task.await.expect("open non-owner window");
+        wait_for_terminal_count(&transient, 1, cx).await;
+        close_window(transient, cx);
+        let still_primary = store
+            .load()
+            .expect("load owner session after non-owner close")
+            .expect("owner session should remain persisted");
+        assert_eq!(
+            still_primary.workspaces[0].default_directory.as_deref(),
+            Some(primary_directory.path()),
+            "closing a non-owner must not transfer persistence"
+        );
+
+        let survivor_task = cx.update(|cx| {
+            open_zmux_workspace_for_directory(
+                Some(primary.window),
+                Some(survivor_directory.path().to_path_buf()),
+                false,
+                cx,
+            )
+        });
+        let survivor = survivor_task.await.expect("open survivor window");
+        wait_for_terminal_count(&survivor, 1, cx).await;
+
+        close_window(primary, cx);
+        let adopted = wait_for_persisted_terminal_count(&store, 1, cx).await;
+        assert_eq!(
+            adopted.workspaces[0].default_directory.as_deref(),
+            Some(survivor_directory.path()),
+            "handoff must snapshot the survivor instead of reloading the old owner"
+        );
+
+        survivor
+            .window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(SplitTerminalRight.boxed_clone(), cx);
+            })
+            .expect("survivor window should remain open");
+        wait_for_terminal_count(&survivor, 2, cx).await;
+        let persisted = wait_for_persisted_terminal_count(&store, 2, cx).await;
+        assert!(matches!(
+            persisted.workspaces[0].layout.root,
+            LayoutNodeSnapshot::Split { .. }
+        ));
+
+        close_window(survivor, cx);
+        let restarted_store = SessionStore::at(session_path);
+        let restarted_task = cx.update(|cx| {
+            install_session_store_for_test(restarted_store, cx);
+            open_zmux_workspace_for_directory(
+                None,
+                Some(primary_directory.path().to_path_buf()),
+                true,
+                cx,
+            )
+        });
+        let restarted = restarted_task.await.expect("reopen persisted session");
+        wait_for_terminal_count(&restarted, 2, cx).await;
+        close_window(restarted, cx);
+    }
+
+    #[gpui::test]
+    async fn standalone_explicit_window_does_not_enable_session_persistence(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let state = TestDirectory::new("session-disabled-state");
+        let workspace_directory = TestDirectory::new("session-disabled-workspace");
+        let store = SessionStore::at(state.path().join("session.json"));
+
+        let open_task = cx.update(|cx| {
+            init_zmux(cx);
+            install_session_store_for_test(store.clone(), cx);
+            open_zmux_workspace_for_directory(
+                None,
+                Some(workspace_directory.path().to_path_buf()),
+                false,
+                cx,
+            )
+        });
+        let opened = open_task.await.expect("open explicit test window");
+        wait_for_terminal_count(&opened, 1, cx).await;
+        cx.background_executor
+            .timer(Duration::from_millis(700))
+            .await;
+        cx.run_until_parked();
+        assert_eq!(store.load().expect("load disabled session store"), None);
+        close_window(opened, cx);
+    }
 }

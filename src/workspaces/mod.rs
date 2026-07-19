@@ -20,6 +20,8 @@ mod panel;
 mod persistence;
 
 pub use self::git_context::{install_git_repository_scope, register_git_repository_scope};
+#[cfg(test)]
+pub(crate) use self::persistence::install_session_store_for_test;
 pub(crate) use self::persistence::{RestoredTerminal, restore_startup_layout};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -44,7 +46,7 @@ use crate::app::{
 use crate::metadata::{GitMetadata, MetadataState};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{NotificationStore, WorkspaceId};
-use crate::session::{LayoutSnapshot, SessionStore};
+use crate::session::{LayoutSnapshot, SessionOwnerGeneration, SessionStore};
 use crate::welcome::ZmuxWelcome;
 
 use self::agent_chat::{
@@ -55,9 +57,9 @@ use self::git_context::{
     workspace_context_for_active_workspace, workspace_context_for_stored_layout,
 };
 use self::persistence::{
-    FailedRestoreSlot, SessionOwnerClaimed, SessionPersistence, StoredLayout, UnitRect,
-    apply_restored_flexes, capture_layout, center_has_provisioned_terminal, clear_center,
-    restore_layout, restore_snapshot_layout, stored_layout_contains_item,
+    FailedRestoreSlot, SessionPersistence, StoredLayout, UnitRect, apply_restored_flexes,
+    capture_layout, center_has_provisioned_terminal, clear_center, register_session_panel,
+    release_session_panel, restore_layout, restore_snapshot_layout, stored_layout_contains_item,
 };
 
 actions!(
@@ -356,7 +358,7 @@ pub struct WorkspacesPanel {
     agent_refresh_task: Option<Task<()>>,
     session_persist_task: Option<Task<()>>,
     session_store: SessionStore,
-    owns_session: bool,
+    session_owner_generation: Option<SessionOwnerGeneration>,
     session_persistence: SessionPersistence,
     attached_worktrees: HashMap<PathBuf, Entity<project::Worktree>>,
     pending_worktrees: BTreeSet<PathBuf>,
@@ -371,20 +373,15 @@ impl WorkspacesPanel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         initial_directory: Option<PathBuf>,
-        session_enabled: bool,
+        restore_persisted_session: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        if !cx.has_global::<SessionOwnerClaimed>() {
-            cx.set_global(SessionOwnerClaimed::default());
-        }
-        let owns_session = session_enabled && !cx.global::<SessionOwnerClaimed>().0;
-        if owns_session {
-            cx.global_mut::<SessionOwnerClaimed>().0 = true;
-        }
-        let session_store = SessionStore::from_environment();
-        let restored = if owns_session {
+        let session_claim = register_session_panel(cx.weak_entity(), restore_persisted_session, cx);
+        let session_store = session_claim.store;
+        let session_owner_generation = session_claim.owner_generation;
+        let restored = if session_claim.restore_from_disk {
             match session_store.load() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -464,6 +461,11 @@ impl WorkspacesPanel {
                 this.handle_workspace_event(event, window, cx);
             },
         );
+        cx.on_release(|this, cx| {
+            this.session_owner_generation = None;
+            release_session_panel(this.scope_id, cx);
+        })
+        .detach();
         // Panels can be constructed from inside a Workspace update. Subscribe
         // after that update completes so reading the Project or its Git store
         // does not re-enter the Workspace entity.
@@ -510,7 +512,7 @@ impl WorkspacesPanel {
             agent_refresh_task: None,
             session_persist_task: None,
             session_store,
-            owns_session,
+            session_owner_generation,
             session_persistence: SessionPersistence::new(restored),
             attached_worktrees: HashMap::new(),
             pending_worktrees: BTreeSet::new(),
@@ -528,6 +530,19 @@ impl WorkspacesPanel {
 
     pub(crate) fn active_workspace_generation(&self) -> u64 {
         self.activation_generation
+    }
+
+    fn adopt_session_ownership(
+        &mut self,
+        store: SessionStore,
+        generation: SessionOwnerGeneration,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_persist_task.take();
+        self.session_store = store;
+        self.session_owner_generation = Some(generation);
+        self.session_persistence = SessionPersistence::new(None);
+        self.persist_session(cx);
     }
 
     pub(crate) fn active_default_directory(&self) -> Option<PathBuf> {
