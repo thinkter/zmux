@@ -61,7 +61,7 @@ fn open_zmux_workspace_for_directory(
         // project-wide environment inherited by every shell.
         Some(terminal_env()),
         Some(Box::new(move |workspace, window, cx| {
-            crate::visual_power::MacVisualPowerMonitor::attach(window, cx);
+            crate::visual_power::VisualPowerMonitor::attach(window, cx);
             let welcome = cx.new(ZmuxWelcome::new);
             let center_pane = workspace.active_pane().clone();
             center_pane.update(cx, |pane, cx| {

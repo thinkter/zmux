@@ -79,7 +79,7 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
-const LOW_POWER_FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_334);
+const UNFOCUSED_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const ZMUX_SHELL_TASK_ID_PREFIX: &str = "zmux-shell-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +94,7 @@ enum OutputPacingAction {
 pub struct TerminalVisualPowerState {
     pub low_power: bool,
     hidden_windows: Arc<HashSet<u64>>,
+    throttled_windows: Arc<HashSet<u64>>,
 }
 
 impl Global for TerminalVisualPowerState {}
@@ -109,16 +110,26 @@ pub fn set_visual_power_state(state: TerminalVisualPowerState, cx: &mut App) {
 
 impl TerminalVisualPowerState {
     #[doc(hidden)]
-    pub fn new(hidden_windows: impl IntoIterator<Item = u64>, low_power: bool) -> Self {
+    pub fn new(
+        hidden_windows: impl IntoIterator<Item = u64>,
+        throttled_windows: impl IntoIterator<Item = u64>,
+        low_power: bool,
+    ) -> Self {
         Self {
             low_power,
             hidden_windows: Arc::new(hidden_windows.into_iter().collect()),
+            throttled_windows: Arc::new(throttled_windows.into_iter().collect()),
         }
     }
 
     #[doc(hidden)]
     pub fn window_hidden(&self, window_id: u64) -> bool {
         self.hidden_windows.contains(&window_id)
+    }
+
+    #[doc(hidden)]
+    pub fn window_throttled(&self, window_id: u64) -> bool {
+        self.low_power || self.throttled_windows.contains(&window_id)
     }
 }
 
@@ -139,7 +150,7 @@ impl TerminalVisualPowerState {
     fn for_window(&self, window_id: u64) -> TerminalVisualPowerWindowState {
         TerminalVisualPowerWindowState {
             hidden: self.window_hidden(window_id),
-            low_power: self.low_power,
+            low_power: self.window_throttled(window_id),
         }
     }
 }
@@ -213,6 +224,13 @@ fn cursor_blink_allowed(
         }
 }
 
+fn output_frame_interval(
+    state: TerminalVisualPowerWindowState,
+    focused: bool,
+) -> Option<Duration> {
+    (state.low_power || !focused).then_some(UNFOCUSED_FRAME_INTERVAL)
+}
+
 /// Coalesces terminal output invalidations to the display cadence without
 /// adding latency to the first output after an idle period.
 #[derive(Default)]
@@ -262,6 +280,15 @@ impl TerminalOutputFramePacer {
 enum TerminalTabIcon {
     Named(IconName),
     Embedded(&'static str),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TerminalTabSnapshot {
+    title: String,
+    foreground_process_icon: Option<TerminalTabIcon>,
+    working_directory: Option<PathBuf>,
+    task_status: Option<TaskStatus>,
+    has_bell: bool,
 }
 
 impl TerminalTabIcon {
@@ -411,6 +438,7 @@ pub struct TerminalView {
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
     pub(crate) render_cache: RefCell<TerminalRenderCache>,
+    last_tab_snapshot: TerminalTabSnapshot,
     output_frame_pacer: TerminalOutputFramePacer,
     window_id: u64,
     visual_power_state: TerminalVisualPowerWindowState,
@@ -475,6 +503,42 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
+    fn tab_snapshot_for(
+        terminal: &Terminal,
+        custom_title: Option<&str>,
+        has_bell: bool,
+    ) -> TerminalTabSnapshot {
+        TerminalTabSnapshot {
+            title: Self::select_tab_title(
+                custom_title,
+                terminal.task().map(|task| &task.spawned_task.id),
+                || terminal.foreground_process_command_name(),
+                || Self::working_directory_title(terminal),
+                || terminal.title(true),
+            ),
+            foreground_process_icon: Self::select_foreground_process_icon(
+                custom_title,
+                terminal.task().map(|task| &task.spawned_task.id),
+                terminal.foreground_process_command_name().as_deref(),
+            ),
+            working_directory: terminal.working_directory(),
+            task_status: terminal.task().map(|task| task.status),
+            has_bell,
+        }
+    }
+
+    fn tab_snapshot(&self, cx: &App) -> TerminalTabSnapshot {
+        Self::tab_snapshot_for(self.terminal.read(cx), self.custom_title.as_deref(), self.has_bell)
+    }
+
+    fn emit_tab_update_if_changed(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.tab_snapshot(cx);
+        if snapshot != self.last_tab_snapshot {
+            self.last_tab_snapshot = snapshot;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+    }
+
     fn tab_title(&self, terminal: &Terminal, truncate: bool) -> String {
         Self::select_tab_title(
             self.custom_title.as_deref(),
@@ -663,6 +727,7 @@ impl TerminalView {
             cx.observe_global::<TerminalVisualPowerState>(Self::visual_power_changed),
         ];
         let focused = focus_handle.is_focused(window);
+        let last_tab_snapshot = Self::tab_snapshot_for(terminal.read(cx), None, false);
 
         Self {
             terminal,
@@ -687,6 +752,7 @@ impl TerminalView {
             custom_title: None,
             ime_state: None,
             render_cache: RefCell::new(TerminalRenderCache::default()),
+            last_tab_snapshot,
             output_frame_pacer: TerminalOutputFramePacer::default(),
             window_id: window.window_handle().window_id().as_u64(),
             visual_power_state: visual_power_state(cx)
@@ -800,7 +866,7 @@ impl TerminalView {
         if self.custom_title != label {
             self.custom_title = label;
             self.needs_serialize = true;
-            cx.emit(ItemEvent::UpdateTab);
+            self.emit_tab_update_if_changed(cx);
             cx.notify();
         }
     }
@@ -888,6 +954,7 @@ impl TerminalView {
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
         self.has_bell = false;
+        self.emit_tab_update_if_changed(cx);
         cx.emit(Event::Wakeup);
     }
 
@@ -1504,6 +1571,7 @@ impl TerminalView {
         self._terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, self.workspace.clone(), window, cx);
         self.terminal = terminal;
+        self.emit_tab_update_if_changed(cx);
         self.render_cache.borrow_mut().clear();
         self.output_frame_pacer.reset();
     }
@@ -1535,20 +1603,20 @@ impl TerminalView {
 
     fn emit_output_invalidation(&mut self, cx: &mut Context<Self>) {
         cx.notify();
+        self.emit_tab_update_if_changed(cx);
         cx.emit(Event::Wakeup);
-        cx.emit(ItemEvent::UpdateTab);
         cx.emit(SearchEvent::MatchesInvalidated);
     }
 
     fn schedule_output_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let generation = self.output_frame_pacer.generation();
-        if self.visual_power_state.low_power {
+        if let Some(interval) = output_frame_interval(self.visual_power_state, self.focused) {
             cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor()
-                    .timer(LOW_POWER_FRAME_INTERVAL)
-                    .await;
-                this.update_in(cx, |this, window, cx| {
-                    this.output_frame_rendered(generation, window, cx);
+                cx.background_executor().timer(interval).await;
+                this.update_in(cx, |_this, window, cx| {
+                    cx.on_next_frame(window, move |this, window, cx| {
+                        this.output_frame_rendered(generation, window, cx);
+                    });
                 })
                 .ok();
             })
@@ -1626,6 +1694,7 @@ fn subscribe_for_terminal_events(
                     if terminal_view.visual_power_state.hidden {
                         terminal_view.hidden_output_invalidated = true;
                     } else {
+                        terminal_view.emit_tab_update_if_changed(cx);
                         cx.emit(Event::Wakeup);
                     }
                 }
@@ -1655,7 +1724,7 @@ fn subscribe_for_terminal_events(
                     if terminal_view.visual_power_state.hidden {
                         terminal_view.hidden_output_invalidated = true;
                     } else {
-                        cx.emit(ItemEvent::UpdateTab);
+                        terminal_view.emit_tab_update_if_changed(cx);
                     }
                 }
 
@@ -2803,6 +2872,25 @@ mod tests {
             TerminalBlink::On,
             false
         ));
+    }
+
+    #[test]
+    fn unfocused_and_low_power_terminals_are_capped_at_ten_fps() {
+        let visible = TerminalVisualPowerWindowState::default();
+        let low_power = TerminalVisualPowerWindowState {
+            hidden: false,
+            low_power: true,
+        };
+
+        assert_eq!(output_frame_interval(visible, true), None);
+        assert_eq!(
+            output_frame_interval(visible, false),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            output_frame_interval(low_power, true),
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[test]

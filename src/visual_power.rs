@@ -1,4 +1,4 @@
-//! Event-driven macOS window visibility and Low Power Mode projection.
+//! Event-driven window visibility, activation, and Low Power Mode projection.
 
 use gpui::{App, Global, Window};
 
@@ -50,7 +50,7 @@ mod macos {
         visible: bool,
     }
 
-    pub(crate) struct MacVisualPowerMonitor {
+    pub(crate) struct VisualPowerMonitor {
         center: objc2::rc::Retained<NSNotificationCenter>,
         power_observer: objc2::rc::Retained<ProtocolObject<dyn NSObjectProtocol>>,
         windows: HashMap<u64, ObservedWindow>,
@@ -59,9 +59,9 @@ mod macos {
         sender: async_channel::Sender<NativeVisualPowerEvent>,
     }
 
-    impl Global for MacVisualPowerMonitor {}
+    impl Global for VisualPowerMonitor {}
 
-    impl Drop for MacVisualPowerMonitor {
+    impl Drop for VisualPowerMonitor {
         fn drop(&mut self) {
             unsafe {
                 self.center
@@ -75,7 +75,7 @@ mod macos {
         }
     }
 
-    impl MacVisualPowerMonitor {
+    impl VisualPowerMonitor {
         pub(crate) fn init(cx: &mut App) {
             if cx.has_global::<Self>() {
                 return;
@@ -109,7 +109,7 @@ mod macos {
                 sender,
             });
             terminal_view::set_visual_power_state(
-                terminal_view::TerminalVisualPowerState::new([], low_power),
+                terminal_view::TerminalVisualPowerState::new([], [], low_power),
                 cx,
             );
 
@@ -221,6 +221,7 @@ mod macos {
                 self.windows
                     .iter()
                     .filter_map(|(id, window)| (!window.visible).then_some(*id)),
+                [],
                 self.low_power,
             )
         }
@@ -261,35 +262,89 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::MacVisualPowerMonitor;
+pub(crate) use macos::VisualPowerMonitor;
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) struct MacVisualPowerMonitor;
+pub(crate) struct VisualPowerMonitor {
+    windows: std::collections::HashMap<u64, ObservedWindow>,
+}
 
 #[cfg(not(target_os = "macos"))]
-impl Global for MacVisualPowerMonitor {}
+struct ObservedWindow {
+    active: bool,
+    _activation: gpui::Subscription,
+}
 
 #[cfg(not(target_os = "macos"))]
-impl MacVisualPowerMonitor {
+impl Global for VisualPowerMonitor {}
+
+#[cfg(not(target_os = "macos"))]
+impl VisualPowerMonitor {
     pub(crate) fn init(cx: &mut App) {
         if !cx.has_global::<Self>() {
-            cx.set_global(Self);
+            cx.set_global(Self {
+                windows: std::collections::HashMap::new(),
+            });
         }
         terminal_view::set_visual_power_state(Default::default(), cx);
     }
 
-    pub(crate) fn attach(_window: &Window, _cx: &mut App) {}
+    pub(crate) fn attach<T: 'static>(window: &mut Window, cx: &mut gpui::Context<T>) {
+        use gpui::UpdateGlobal as _;
+
+        let id = window.window_handle().window_id().as_u64();
+        let active = window.is_window_active();
+        let activation = cx.observe_window_activation(window, move |_owner, window, cx| {
+            let throttled = Self::update_global(cx, |monitor, _cx| {
+                if let Some(observed) = monitor.windows.get_mut(&id) {
+                    observed.active = window.is_window_active();
+                }
+                monitor
+                    .windows
+                    .iter()
+                    .filter_map(|(id, window)| (!window.active).then_some(*id))
+                    .collect::<Vec<_>>()
+            });
+            terminal_view::set_visual_power_state(
+                terminal_view::TerminalVisualPowerState::new([], throttled, false),
+                cx,
+            );
+        });
+        let throttled = Self::update_global(cx, |monitor, _cx| {
+            monitor.windows.insert(
+                id,
+                ObservedWindow {
+                    active,
+                    _activation: activation,
+                },
+            );
+            monitor
+                .windows
+                .iter()
+                .filter_map(|(id, window)| (!window.active).then_some(*id))
+                .collect::<Vec<_>>()
+        });
+        terminal_view::set_visual_power_state(
+            terminal_view::TerminalVisualPowerState::new([], throttled, false),
+            cx,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn terminal_power_state_tracks_each_window_independently() {
-        let state = terminal_view::TerminalVisualPowerState::new([2, 4], true);
+        let state = terminal_view::TerminalVisualPowerState::new([2, 4], [3], false);
         assert!(!state.window_hidden(1));
         assert!(state.window_hidden(2));
         assert!(!state.window_hidden(3));
         assert!(state.window_hidden(4));
-        assert!(state.low_power);
+        assert!(!state.window_throttled(2));
+        assert!(state.window_throttled(3));
+        assert!(!state.low_power);
+
+        let low_power = terminal_view::TerminalVisualPowerState::new([], [], true);
+        assert!(low_power.window_throttled(1));
     }
 }

@@ -36,6 +36,7 @@ use workspace::Workspace;
 use workspace::dock::PanelEvent;
 use workspace::item::ItemHandle;
 
+use crate::agent_detection::AgentKind;
 use crate::app::{
     create_center_terminal_at_for_workspace, create_center_terminal_for_workspace,
     create_restored_terminals_for_workspace,
@@ -73,8 +74,24 @@ actions!(
 const MAX_WORKSPACE_NAME_CHARS: usize = 64;
 const AGENT_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const EVENT_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+const OUTPUT_SIDEBAR_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const SESSION_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 const MAX_INCOMPLETE_CONTEXT_REFRESHES: u8 = 3;
+
+fn terminal_event_needs_agent_refresh(
+    event: &terminal::Event,
+    context_changed: bool,
+    has_agent_process: bool,
+    has_agent_chat: bool,
+) -> bool {
+    matches!(
+        event,
+        terminal::Event::TitleChanged
+            | terminal::Event::BreadcrumbsChanged
+            | terminal::Event::CloseTerminal
+    ) || (matches!(event, terminal::Event::Wakeup)
+        && (context_changed || has_agent_process || has_agent_chat))
+}
 
 /// One logical workspace: identity, naming, discovered context, and parked
 /// layout. Exactly one entry is active at a time; every other entry keeps its
@@ -688,25 +705,24 @@ impl WorkspacesPanel {
             .get(&item_id)
             .map(|terminal| terminal.workspace_id)
             .unwrap_or(self.active);
-        let event_delay = self.event_coalesce_interval(workspace_id, cx);
+        let event_delay = if matches!(event, terminal::Event::Wakeup) {
+            self.event_coalesce_interval(workspace_id, cx)
+                .max(OUTPUT_SIDEBAR_REFRESH_INTERVAL)
+        } else {
+            self.event_coalesce_interval(workspace_id, cx)
+        };
         if matches!(event, terminal::Event::Wakeup)
             && let Some(directory) = terminal.read(cx).working_directory()
         {
             self.schedule_negative_git_root_recheck(directory, cx);
         }
 
-        if matches!(
-            event,
-            terminal::Event::Wakeup
-                | terminal::Event::TitleChanged
-                | terminal::Event::BreadcrumbsChanged
-                | terminal::Event::CloseTerminal
-        ) {
-            self.dirty_agent_terminals.insert(item_id);
-            self.schedule_agent_refresh_for(item_id, event_delay, cx);
-        }
-
         let next = Self::terminal_context_fingerprint(terminal.read(cx));
+        let has_agent_process = next
+            .foreground_process
+            .as_deref()
+            .and_then(AgentKind::from_process)
+            .is_some();
         let context_changed = self
             .terminal_registry
             .get_mut(&item_id)
@@ -718,6 +734,15 @@ impl WorkspacesPanel {
                     true
                 }
             });
+        let has_agent_chat = self.agent_chats.contains_key(&(workspace_id, item_id));
+        if terminal_event_needs_agent_refresh(
+            event,
+            context_changed,
+            has_agent_process,
+            has_agent_chat,
+        ) {
+            self.schedule_agent_refresh_for(item_id, event_delay, cx);
+        }
         if context_changed {
             self.schedule_context_refresh_for(workspace_id, event_delay, cx);
         }
@@ -1707,6 +1732,34 @@ fn is_shell_process(process: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_terminal_output_does_not_rebuild_agent_sidebar_state() {
+        assert!(!terminal_event_needs_agent_refresh(
+            &terminal::Event::Wakeup,
+            false,
+            false,
+            false,
+        ));
+        assert!(terminal_event_needs_agent_refresh(
+            &terminal::Event::Wakeup,
+            false,
+            true,
+            false,
+        ));
+        assert!(terminal_event_needs_agent_refresh(
+            &terminal::Event::Wakeup,
+            true,
+            false,
+            false,
+        ));
+        assert!(terminal_event_needs_agent_refresh(
+            &terminal::Event::TitleChanged,
+            false,
+            false,
+            false,
+        ));
+    }
 
     #[test]
     fn automatic_names_prioritize_a_shared_git_project() {
