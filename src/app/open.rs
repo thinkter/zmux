@@ -19,10 +19,12 @@ pub fn open_zmux_workspace(
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
-    let initial_dir = crate::env::current_working_directory()
-        .map(|path| vec![path])
-        .unwrap_or_default();
-    open_zmux_workspace_for_paths(requesting_window, initial_dir, true, cx)
+    open_zmux_workspace_for_directory(
+        requesting_window,
+        crate::env::current_working_directory(),
+        true,
+        cx,
+    )
 }
 
 /// Open a zmux window rooted at an explicit directory.
@@ -34,19 +36,25 @@ pub fn open_zmux_workspace_at(
     initial_dir: PathBuf,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
-    open_zmux_workspace_for_paths(requesting_window, vec![initial_dir], false, cx)
+    open_zmux_workspace_for_directory(requesting_window, Some(initial_dir), false, cx)
 }
 
-fn open_zmux_workspace_for_paths(
+fn open_zmux_workspace_for_directory(
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
-    initial_dirs: Vec<PathBuf>,
+    initial_directory: Option<PathBuf>,
     session_enabled: bool,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
     let app_state = AppState::global(cx);
 
-    Workspace::new_local(
-        initial_dirs,
+    // A terminal's working directory is not a Zed project root. In particular,
+    // desktop launchers commonly start zmux in the user's home directory; using
+    // that path here causes Zed's worktree scanner to recursively index and
+    // watch the entire home tree. Start with a pathless project and let
+    // WorkspacesPanel attach only exact, admitted Git roots discovered from
+    // live terminal directories.
+    let open = Workspace::new_local(
+        Vec::new(),
         app_state,
         requesting_window,
         // Route capabilities are per terminal and must never enter the
@@ -65,7 +73,13 @@ fn open_zmux_workspace_for_paths(
                 .update(cx, |dock, cx| dock.set_open(false, window, cx));
 
             let panel = cx.new(|cx| {
-                WorkspacesPanel::new(workspace.weak_handle(), session_enabled, window, cx)
+                WorkspacesPanel::new(
+                    workspace.weak_handle(),
+                    initial_directory,
+                    session_enabled,
+                    window,
+                    cx,
+                )
             });
             workspace.add_panel(panel.clone(), window, cx);
             register_git_repository_scope(workspace.project(), &panel, cx);
@@ -75,6 +89,10 @@ fn open_zmux_workspace_for_paths(
                     git_ui::git_panel::GitPanel::load(workspace_handle.clone(), cx.clone()).await?;
                 workspace_handle.update_in(cx, |workspace, window, cx| {
                     workspace.add_panel(git_panel, window, cx);
+                    // Adding a panel to an already-open dock can make the new
+                    // panel active. Keep Zmux's workspace switcher visible;
+                    // the Git panel remains available through its action.
+                    workspace.open_panel::<WorkspacesPanel>(window, cx);
                 })?;
                 anyhow::Ok(())
             })
@@ -103,5 +121,19 @@ fn open_zmux_workspace_for_paths(
         })),
         OpenMode::NewWindow,
         cx,
-    )
+    );
+    cx.spawn(async move |cx| {
+        let result = open.await?;
+        let workspace = result.workspace.clone();
+        result.window.update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                // `new_local` restores Zed's persisted dock visibility after
+                // the initializer runs. Reassert Zmux's primary panel once
+                // that lifecycle is complete, especially for pathless
+                // projects where startup finishes immediately.
+                workspace.open_panel::<WorkspacesPanel>(window, cx);
+            });
+        })?;
+        anyhow::Ok(result)
+    })
 }

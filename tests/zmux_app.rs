@@ -17,12 +17,13 @@ use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
 use workspace::{ActivateNextPane, ActivatePreviousPane};
 use zmux::{
     CliEndpoint, CliNotification, CliServer, JumpToLatestNotification, NOTIFY_ENDPOINT_ENV,
-    NewTerminal as ZmuxNewTerminal, NewWorkspace, NotificationSource, NotificationStore,
-    NotifyCurrentPane, OscNotificationEvent, OscNotificationParser, SplitTerminalDown,
-    SplitTerminalRight, ToggleWorkspacesPanel, WorkspacesPanel, configure_keybindings,
-    configure_terminal_fonts, configure_zoom_actions, init_zmux, open_zmux_workspace_at,
-    terminal_env,
+    NewTerminal as ZmuxNewTerminal, NotificationSource, NotificationStore, NotifyCurrentPane,
+    OscNotificationEvent, OscNotificationParser, SplitTerminalDown, SplitTerminalRight,
+    WorkspacesPanel, configure_keybindings, configure_terminal_fonts, configure_zoom_actions,
+    init_zmux, open_zmux_workspace_at, terminal_env,
 };
+#[cfg(target_os = "macos")]
+use zmux::{NewWorkspace, ToggleWorkspacesPanel};
 
 #[test]
 fn terminal_bounds_round_down_to_complete_cells() {
@@ -70,6 +71,50 @@ async fn display_only_terminal_output_is_available_to_zmux(cx: &mut TestAppConte
 
     let output = terminal.read_with(cx, |terminal, _| terminal.get_content());
     assert!(output.contains("hello zmux"), "{output:?}");
+}
+
+#[gpui::test]
+async fn non_repository_startup_keeps_the_project_pathless(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    let expected_directory = root.path().canonicalize().unwrap();
+    let open_task = cx.update(|cx| {
+        init_zmux(cx);
+        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
+    });
+    let opened = open_task.await.expect("workspace should open");
+
+    let mut terminal_directory = None;
+    for _ in 0..100 {
+        cx.run_until_parked();
+        terminal_directory = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panes().iter().find_map(|pane| {
+                pane.read(cx).items().find_map(|item| {
+                    item.act_as::<TerminalView>(cx)
+                        .and_then(|view| view.read(cx).terminal().read(cx).working_directory())
+                })
+            })
+        });
+        if terminal_directory.is_some() {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+
+    assert_eq!(
+        terminal_directory.and_then(|directory| directory.canonicalize().ok()),
+        Some(expected_directory),
+        "the launch directory should remain the terminal cwd"
+    );
+    let worktree_count = opened.workspace.read_with(cx, |workspace, cx| {
+        workspace.project().read(cx).worktrees(cx).count()
+    });
+    assert_eq!(
+        worktree_count, 0,
+        "a terminal cwd must not become a recursively watched project root"
+    );
 }
 
 #[gpui::test]
@@ -377,7 +422,6 @@ async fn workspace_metadata_click_activates_the_workspace(cx: &mut TestAppContex
         origin,
         "the new workspace should be active before the click",
     );
-
     let mut cx = VisualTestContext::from_window(opened.window.into(), cx);
     let selector = Box::leak(format!("WORKSPACE_METADATA-{origin}").into_boxed_str());
     let mut metadata_bounds = None;

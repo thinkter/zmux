@@ -326,6 +326,7 @@ pub struct WorkspacesPanel {
     notification_filter: Option<WorkspaceId>,
     _notification_subscription: Subscription,
     _workspace_subscription: Subscription,
+    _project_subscription: Option<Subscription>,
     terminal_registry: HashMap<EntityId, RegisteredTerminal>,
     dirty_agent_terminals: HashSet<EntityId>,
     agent_refresh_queue: DeadlineQueue<EntityId>,
@@ -342,6 +343,8 @@ pub struct WorkspacesPanel {
     session_persistence: SessionPersistence,
     attached_worktrees: HashMap<PathBuf, Entity<project::Worktree>>,
     pending_worktrees: BTreeSet<PathBuf>,
+    audited_blocked_roots: BTreeSet<PathBuf>,
+    warned_scan_roots: BTreeSet<PathBuf>,
     path_context_cache: std::sync::Mutex<PathContextCache>,
     agent_chats: HashMap<(WorkspaceId, EntityId), AgentChat>,
     next_agent_activity_sequence: u64,
@@ -350,6 +353,7 @@ pub struct WorkspacesPanel {
 impl WorkspacesPanel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
+        initial_directory: Option<PathBuf>,
         session_enabled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -418,7 +422,7 @@ impl WorkspacesPanel {
                     context: WorkspaceContext::default(),
                     context_authoritative: true,
                     incomplete_context_refreshes: 0,
-                    default_directory: None,
+                    default_directory: initial_directory,
                     selected_git_root: None,
                     git_discovery: GitDiscoveryState::Authoritative,
                     git: MetadataState::NotRequested,
@@ -444,13 +448,22 @@ impl WorkspacesPanel {
             },
         );
         // Panels can be constructed from inside a Workspace update. Subscribe
-        // after that update completes so reading the project's Git store does
-        // not re-enter the Workspace entity.
+        // after that update completes so reading the Project or its Git store
+        // does not re-enter the Workspace entity.
         let panel = cx.weak_entity();
         cx.defer(move |cx| {
             panel
-                .update(cx, |_, cx| {
-                    Self::subscribe_to_git_metadata(&workspace_entity, cx)
+                .update(cx, |this, cx| {
+                    let project = workspace_entity.read(cx).project().clone();
+                    this._project_subscription = Some(cx.subscribe(
+                        &project,
+                        |this, project, event: &project::Event, cx| {
+                            if let project::Event::WorktreeAdded(id) = event {
+                                this.schedule_worktree_admission_audit(project.clone(), *id, cx);
+                            }
+                        },
+                    ));
+                    Self::subscribe_to_git_metadata(&workspace_entity, cx);
                 })
                 .ok();
         });
@@ -467,6 +480,7 @@ impl WorkspacesPanel {
             notification_filter: None,
             _notification_subscription: notification_subscription,
             _workspace_subscription: workspace_subscription,
+            _project_subscription: None,
             terminal_registry: HashMap::new(),
             dirty_agent_terminals: HashSet::new(),
             agent_refresh_queue: DeadlineQueue::default(),
@@ -483,6 +497,8 @@ impl WorkspacesPanel {
             session_persistence: SessionPersistence::new(restored),
             attached_worktrees: HashMap::new(),
             pending_worktrees: BTreeSet::new(),
+            audited_blocked_roots: BTreeSet::new(),
+            warned_scan_roots: BTreeSet::new(),
             path_context_cache: std::sync::Mutex::new(PathContextCache::default()),
             agent_chats: HashMap::new(),
             next_agent_activity_sequence: 0,
@@ -1030,6 +1046,22 @@ impl WorkspacesPanel {
             Some(())
         })
         .detach();
+    }
+
+    /// Treat terminal directory links as logical workspace navigation. The
+    /// directory remains a shell cwd; it is never promoted to a recursive Zed
+    /// worktree merely because the user clicked it.
+    pub(crate) fn open_directory_workspace(
+        &mut self,
+        directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.workspace_id_for_directory(&directory) {
+            self.activate_workspace(id, window, cx);
+        } else {
+            self.create_workspace_at(Some(directory), None, window, cx);
+        }
     }
 
     fn create_workspace_at(
@@ -1684,6 +1716,7 @@ mod tests {
                 PathBuf::from("/tmp/zmux/tests"),
             ],
             git_roots: vec![PathBuf::from("/tmp/zmux")],
+            blocked_git_roots: Vec::new(),
             git_root: Some(PathBuf::from("/tmp/zmux")),
             foreground_processes: vec!["cargo".into()],
             shell_count: 2,

@@ -144,6 +144,7 @@ git = { workspace = true }
 git_ui = { path = "vendor/git_ui", features = ["zmux-core"] }
 http_client = { workspace = true }
 language = { workspace = true }
+log = { workspace = true }
 node_runtime = { workspace = true }
 paths = { workspace = true }
 session = { workspace = true }

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use gpui::{App, Context, Entity, EntityId, Global, SharedString, Task, WeakEntity, Window};
 use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
-use workspace::Workspace;
 use workspace::item::ItemHandle;
+use workspace::{Toast, Workspace, notifications::NotificationId};
 
 use crate::metadata::{MetadataState, git_metadata_from_repository};
 use crate::notifications::WorkspaceId;
@@ -157,10 +157,66 @@ pub(super) enum GitDiscoveryState {
 pub(super) struct WorkspaceContext {
     pub(super) working_directories: Vec<PathBuf>,
     pub(super) git_roots: Vec<PathBuf>,
+    pub(super) blocked_git_roots: Vec<PathBuf>,
     pub(super) git_root: Option<PathBuf>,
     pub(super) foreground_processes: Vec<String>,
     pub(super) shell_count: usize,
     pub(super) reported_directories: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IndexRootBlockReason {
+    NotGitRepository,
+    ProtectedLocation,
+    Unverifiable,
+}
+
+impl IndexRootBlockReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NotGitRepository => "it is not an exact Git repository root",
+            Self::ProtectedLocation => {
+                "it contains your home directory or Zmux's own data directory"
+            }
+            Self::Unverifiable => "its canonical location could not be verified",
+        }
+    }
+}
+
+fn index_root_block_reason(root: &Path) -> Option<IndexRootBlockReason> {
+    index_root_block_reason_with(
+        root,
+        paths::home_dir().as_path(),
+        paths::data_dir().as_path(),
+        |path| path.join(".git").exists(),
+        |path| std::fs::canonicalize(path),
+    )
+}
+
+fn index_root_block_reason_with(
+    root: &Path,
+    home: &Path,
+    data_dir: &Path,
+    is_git_root: impl Fn(&Path) -> bool,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<IndexRootBlockReason> {
+    if !is_git_root(root) {
+        return Some(IndexRootBlockReason::NotGitRepository);
+    }
+    let Ok(root) = canonicalize(root) else {
+        return Some(IndexRootBlockReason::Unverifiable);
+    };
+    if root.parent().is_none() {
+        return Some(IndexRootBlockReason::ProtectedLocation);
+    }
+
+    for protected in [home, data_dir] {
+        let protected = canonicalize(protected).unwrap_or_else(|_| protected.to_path_buf());
+        if protected.starts_with(&root) {
+            return Some(IndexRootBlockReason::ProtectedLocation);
+        }
+    }
+    None
 }
 
 impl WorkspaceContext {
@@ -485,6 +541,7 @@ impl WorkspacesPanel {
                         })
                     })
             })
+            .filter(|root| index_root_block_reason(root).is_none())
     }
 
     fn open_git_roots(&self) -> Vec<PathBuf> {
@@ -498,12 +555,15 @@ impl WorkspacesPanel {
                 .chain(&entry.worktree_paths)
                 .cloned()
             {
-                push_unique_logical_path(&mut roots, root, &self.path_context_cache);
+                if index_root_block_reason(&root).is_none() {
+                    push_unique_logical_path(&mut roots, root, &self.path_context_cache);
+                }
             }
             if let Some(root) = entry
                 .default_directory
                 .as_deref()
                 .and_then(|directory| nearest_git_root(&self.path_context_cache, directory))
+                && index_root_block_reason(&root).is_none()
             {
                 push_unique_logical_path(&mut roots, root, &self.path_context_cache);
             }
@@ -546,6 +606,25 @@ impl WorkspacesPanel {
                     .git_roots
                     .iter()
                     .any(|root| paths_match(&self.path_context_cache, root, path)))
+            .then_some(entry.id)
+        })
+    }
+
+    pub(super) fn workspace_id_for_directory(&self, path: &Path) -> Option<WorkspaceId> {
+        self.entries.iter().find_map(|entry| {
+            (entry
+                .default_directory
+                .as_deref()
+                .is_some_and(|directory| paths_match(&self.path_context_cache, directory, path))
+                || entry
+                    .worktree_paths
+                    .iter()
+                    .any(|directory| paths_match(&self.path_context_cache, directory, path))
+                || entry
+                    .context
+                    .working_directories
+                    .iter()
+                    .any(|directory| paths_match(&self.path_context_cache, directory, path)))
             .then_some(entry.id)
         })
     }
@@ -601,6 +680,8 @@ impl WorkspacesPanel {
                 &self.path_context_cache,
             );
         }
+
+        self.sync_blocked_root_notifications(cx);
 
         let reference_counts = git_root_reference_counts(
             self.entries
@@ -702,6 +783,135 @@ impl WorkspacesPanel {
             .detach();
         }
         self.activate_selected_repository(cx);
+    }
+
+    pub(super) fn schedule_worktree_admission_audit(
+        &mut self,
+        project: Entity<project::Project>,
+        id: project::WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.audit_added_worktree(&project, id, cx);
+                })
+                .ok();
+        });
+    }
+
+    fn audit_added_worktree(
+        &mut self,
+        project: &Entity<project::Project>,
+        id: project::WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worktree) = project.read(cx).worktree_for_id(id, cx) else {
+            return;
+        };
+        let (root, is_directory) = {
+            let worktree = worktree.read(cx);
+            (
+                worktree.abs_path().to_path_buf(),
+                worktree
+                    .root_entry()
+                    .map_or_else(|| worktree.abs_path().is_dir(), |entry| entry.is_dir()),
+            )
+        };
+        if !is_directory {
+            return;
+        }
+
+        if let Some(reason) = index_root_block_reason(&root) {
+            log::warn!(
+                "removing inadmissible Zmux worktree {}: {}",
+                root.display(),
+                reason.message()
+            );
+            self.audited_blocked_roots.insert(root.clone());
+            self.show_blocked_root_notification(root, reason, cx);
+            project.update(cx, |project, cx| project.remove_worktree(id, cx));
+        } else {
+            if self.audited_blocked_roots.remove(&root) {
+                let notification_id = blocked_root_notification_id(&root);
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.dismiss_notification(&notification_id, cx);
+                    });
+                }
+                self.warned_scan_roots.remove(&root);
+            }
+            log::info!("admitted Zmux Git worktree {}", root.display());
+        }
+    }
+
+    fn sync_blocked_root_notifications(&mut self, cx: &mut Context<Self>) {
+        let mut referenced = self
+            .entries
+            .iter()
+            .flat_map(|entry| entry.context.blocked_git_roots.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        referenced.extend(self.audited_blocked_roots.iter().cloned());
+
+        let removed = self
+            .warned_scan_roots
+            .difference(&referenced)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(workspace) = self.workspace.upgrade() {
+            for root in removed {
+                let id = blocked_root_notification_id(&root);
+                workspace.update(cx, |workspace, cx| {
+                    workspace.dismiss_notification(&id, cx);
+                });
+                self.warned_scan_roots.remove(&root);
+            }
+        }
+
+        for root in referenced {
+            if self.warned_scan_roots.contains(&root) {
+                continue;
+            }
+            let reason =
+                index_root_block_reason(&root).unwrap_or(IndexRootBlockReason::Unverifiable);
+            self.show_blocked_root_notification(root, reason, cx);
+        }
+    }
+
+    fn show_blocked_root_notification(
+        &mut self,
+        root: PathBuf,
+        reason: IndexRootBlockReason,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.warned_scan_roots.insert(root.clone()) {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.weak_entity();
+        let message = format!(
+            "Git indexing is disabled for {} because {}. Terminals remain fully usable.",
+            root.display(),
+            reason.message()
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(blocked_root_notification_id(&root), message).on_click(
+                    "Choose a narrower folder",
+                    move |window, cx| {
+                        if let Some(panel) = panel.upgrade() {
+                            panel.update(cx, |panel, cx| {
+                                panel.prompt_for_workspace(window, cx);
+                            });
+                        }
+                    },
+                ),
+                cx,
+            );
+        });
     }
 
     pub(crate) fn finish_restored_git_discovery(
@@ -895,20 +1105,28 @@ fn finalize_workspace_context(
     context.foreground_processes = processes.into_iter().take(8).collect();
 
     let mut roots: Vec<PathBuf> = Vec::new();
+    let mut blocked_roots: Vec<PathBuf> = Vec::new();
     for root in context
         .working_directories
         .iter()
         .filter_map(|directory| nearest_git_root(cache, directory))
     {
-        if !roots
+        let destination = if index_root_block_reason(&root).is_some() {
+            &mut blocked_roots
+        } else {
+            &mut roots
+        };
+        if !destination
             .iter()
             .any(|existing| paths_match(cache, existing, &root))
         {
-            roots.push(root);
+            destination.push(root);
         }
     }
     roots.sort();
+    blocked_roots.sort();
     context.git_roots = roots;
+    context.blocked_git_roots = blocked_roots;
     if context.git_roots.len() == 1 {
         context.git_root = context.git_roots.first().cloned();
     }
@@ -920,6 +1138,10 @@ fn nearest_git_root(cache: &Mutex<PathContextCache>, directory: &Path) -> Option
         .lock()
         .expect("path context cache poisoned")
         .nearest_git_root(directory)
+}
+
+fn blocked_root_notification_id(root: &Path) -> NotificationId {
+    NotificationId::named(format!("zmux-blocked-index-root:{}", root.display()).into())
 }
 
 /// Compare existing filesystem paths without replacing their user-visible form.
@@ -956,6 +1178,62 @@ mod tests {
 
     fn path_cache() -> Mutex<PathContextCache> {
         Mutex::new(PathContextCache::default())
+    }
+
+    #[test]
+    fn index_root_policy_requires_an_exact_git_root() {
+        let root = Path::new("/users/me/project");
+        assert_eq!(
+            index_root_block_reason_with(
+                root,
+                Path::new("/users/me"),
+                Path::new("/users/me/.local/share/zmux"),
+                |_| false,
+                |path| Ok(path.to_path_buf()),
+            ),
+            Some(IndexRootBlockReason::NotGitRepository)
+        );
+    }
+
+    #[test]
+    fn index_root_policy_blocks_filesystem_home_and_data_ancestors() {
+        let home = Path::new("/users/me");
+        let data = Path::new("/users/me/.local/share/zmux");
+        let classify = |root: &Path| {
+            index_root_block_reason_with(root, home, data, |_| true, |path| Ok(path.to_path_buf()))
+        };
+
+        assert_eq!(
+            classify(Path::new("/")),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(
+            classify(home),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(
+            classify(Path::new("/users")),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(
+            classify(Path::new("/users/me/.local")),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(classify(Path::new("/users/me/project")), None);
+    }
+
+    #[test]
+    fn index_root_policy_fails_closed_when_canonicalization_fails() {
+        assert_eq!(
+            index_root_block_reason_with(
+                Path::new("/users/me/project"),
+                Path::new("/users/me"),
+                Path::new("/users/me/.local/share/zmux"),
+                |_| true,
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ),
+            Some(IndexRootBlockReason::Unverifiable)
+        );
     }
 
     #[cfg(unix)]
@@ -1654,8 +1932,8 @@ mod tests {
             std::env::temp_dir().join(format!("zmux-logical-worktree-{}", uuid::Uuid::new_v4()));
         let first = base.join("feature").join("repo");
         let second = base.join("feature").join("docs");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
+        std::fs::create_dir_all(first.join(".git")).unwrap();
+        std::fs::create_dir_all(second.join(".git")).unwrap();
 
         let open = cx.update(|cx| {
             crate::app::init_zmux(cx);
@@ -1712,6 +1990,106 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn directory_navigation_creates_a_logical_workspace_without_a_worktree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let base = std::env::temp_dir().join(format!(
+            "zmux-directory-navigation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let directory = base.join("nested");
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorkspacesPanel>(cx).unwrap()
+        });
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.open_directory_workspace(directory.clone(), window, cx);
+                    panel.open_directory_workspace(directory.clone(), window, cx);
+                });
+            })
+            .unwrap();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.entries.len(), 2, "the same directory was duplicated");
+            let active = panel
+                .entries
+                .iter()
+                .find(|entry| entry.id == panel.active)
+                .unwrap();
+            assert_eq!(
+                active.default_directory.as_deref(),
+                Some(directory.as_path())
+            );
+        });
+        let worktree_count = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).count()
+        });
+        assert_eq!(worktree_count, 0);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
+    async fn project_event_audit_removes_an_unadmitted_directory_worktree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-unadmitted-worktree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        cx.run_until_parked();
+
+        let project = opened
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let create = project.update(cx, |project, cx| project.create_worktree(&base, true, cx));
+        let inadmissible = create.await.expect("test worktree should be created");
+        let inadmissible_id = inadmissible.read_with(cx, |worktree, _| worktree.id());
+
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if project.read_with(cx, |project, cx| {
+                project.worktree_for_id(inadmissible_id, cx).is_none()
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+
+        assert!(
+            project.read_with(cx, |project, cx| {
+                project.worktree_for_id(inadmissible_id, cx).is_none()
+            }),
+            "a non-Git directory added through a bypass path must be detached"
+        );
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorkspacesPanel>(cx).unwrap()
+        });
+        panel.update(cx, |panel, cx| panel.reconcile_git_context(cx));
+        assert!(panel.read_with(cx, |panel, _| {
+            panel.audited_blocked_roots.contains(&base) && panel.warned_scan_roots.contains(&base)
+        }));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
     async fn closing_workspace_removes_only_its_project_worktree(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
         let base =
@@ -1723,7 +2101,7 @@ mod tests {
 
         let open = cx.update(|cx| {
             crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+            crate::app::open_zmux_workspace_at(None, shared.clone(), cx)
         });
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {

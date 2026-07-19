@@ -15054,6 +15054,7 @@ dependencies = [
  "http_client",
  "image",
  "language",
+ "log",
  "mac-usernotifications",
  "mio",
  "node_runtime",

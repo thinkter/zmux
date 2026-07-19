@@ -33,7 +33,7 @@ use crate::keymap::{Quit, configure_keybindings, configure_zoom_actions};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::NotificationStore;
 use crate::theme::{DEFAULT_THEME, configure_terminal_fonts};
-use crate::workspaces::install_git_repository_scope;
+use crate::workspaces::{WorkspacesPanel, install_git_repository_scope};
 
 use self::terminal::create_terminal_with_cli_route;
 
@@ -102,6 +102,21 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
                     create_terminal_with_cli_route(project, working_directory, cx)
                 })
                 .unwrap_or_else(|error| Task::ready(Err(error)))
+        }),
+        cx,
+    );
+    terminal_view::set_terminal_directory_open_handler(
+        Arc::new(|workspace, directory, window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return false;
+            };
+            let Some(panel) = workspace.read(cx).panel::<WorkspacesPanel>(cx) else {
+                return false;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.open_directory_workspace(directory, window, cx);
+            });
+            true
         }),
         cx,
     );
