@@ -265,71 +265,407 @@ mod macos {
 pub(crate) use macos::VisualPowerMonitor;
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) struct VisualPowerMonitor {
-    windows: std::collections::HashMap<u64, ObservedWindow>,
-}
+mod non_macos {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "macos"))]
-struct ObservedWindow {
-    active: bool,
-    _activation: gpui::Subscription,
-}
+    use gpui::UpdateGlobal as _;
 
-#[cfg(not(target_os = "macos"))]
-impl Global for VisualPowerMonitor {}
+    use super::*;
 
-#[cfg(not(target_os = "macos"))]
-impl VisualPowerMonitor {
-    pub(crate) fn init(cx: &mut App) {
-        if !cx.has_global::<Self>() {
-            cx.set_global(Self {
-                windows: std::collections::HashMap::new(),
-            });
+    /// Keep the probe infrequent enough to be negligible while still restoring an
+    /// uncovered window before a human can notice stale terminal output.
+    const VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+    const FRAME_STARVATION_TIMEOUT: Duration = Duration::from_millis(750);
+
+    pub(crate) struct VisualPowerMonitor {
+        windows: HashMap<u64, ObservedWindow>,
+        test_mode: bool,
+        log_transitions: bool,
+    }
+
+    struct ObservedWindow {
+        active: bool,
+        hidden: bool,
+        frame_fallback: bool,
+        frame_probe: FrameVisibilityProbe,
+        last_reported: Option<(bool, bool)>,
+        _activation: gpui::Subscription,
+    }
+
+    #[derive(Debug)]
+    struct FrameVisibilityProbe {
+        next_generation: u64,
+        pending: Option<(u64, Instant)>,
+        starved: bool,
+    }
+
+    impl Default for FrameVisibilityProbe {
+        fn default() -> Self {
+            Self {
+                next_generation: 1,
+                pending: None,
+                starved: false,
+            }
         }
-        terminal_view::set_visual_power_state(Default::default(), cx);
     }
 
-    pub(crate) fn attach<T: 'static>(window: &mut Window, cx: &mut gpui::Context<T>) {
-        use gpui::UpdateGlobal as _;
-
-        let id = window.window_handle().window_id().as_u64();
-        let active = window.is_window_active();
-        let activation = cx.observe_window_activation(window, move |_owner, window, cx| {
-            let throttled = Self::update_global(cx, |monitor, _cx| {
-                if let Some(observed) = monitor.windows.get_mut(&id) {
-                    observed.active = window.is_window_active();
+    impl FrameVisibilityProbe {
+        fn poll(&mut self, now: Instant) -> Option<u64> {
+            if let Some((_, requested_at)) = self.pending {
+                if now.duration_since(requested_at) >= FRAME_STARVATION_TIMEOUT {
+                    self.starved = true;
                 }
-                monitor
-                    .windows
-                    .iter()
-                    .filter_map(|(id, window)| (!window.active).then_some(*id))
-                    .collect::<Vec<_>>()
+                return None;
+            }
+
+            let generation = self.next_generation;
+            self.next_generation = self.next_generation.wrapping_add(1).max(1);
+            self.pending = Some((generation, now));
+            Some(generation)
+        }
+
+        fn presented(&mut self, generation: u64) {
+            if self
+                .pending
+                .is_some_and(|(pending_generation, _)| pending_generation == generation)
+            {
+                self.pending = None;
+                self.starved = false;
+            }
+        }
+
+        fn restore_visible(&mut self) {
+            self.pending = None;
+            self.starved = false;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum NativeVisibilityConfig {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        Xcb {
+            window: u32,
+        },
+        #[cfg(target_os = "windows")]
+        Win32 {
+            hwnd: isize,
+        },
+        FrameCallbacks,
+    }
+
+    impl NativeVisibilityConfig {
+        fn for_window(window: &Window) -> Self {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            if let Ok(window) = raw_window_handle::HasWindowHandle::window_handle(window)
+                && let raw_window_handle::RawWindowHandle::Xcb(window) = window.as_raw()
+            {
+                return Self::Xcb {
+                    window: window.window.get(),
+                };
+            }
+
+            #[cfg(target_os = "windows")]
+            if let Ok(window) = raw_window_handle::HasWindowHandle::window_handle(window)
+                && let raw_window_handle::RawWindowHandle::Win32(window) = window.as_raw()
+            {
+                return Self::Win32 {
+                    hwnd: window.hwnd.get(),
+                };
+            }
+
+            Self::FrameCallbacks
+        }
+
+        fn needs_frame_fallback(&self) -> bool {
+            matches!(self, Self::FrameCallbacks)
+        }
+    }
+
+    struct NativeVisibilityWorker {
+        config: NativeVisibilityConfig,
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        xcb: Option<xcb::Connection>,
+    }
+
+    impl NativeVisibilityWorker {
+        fn new(config: NativeVisibilityConfig) -> Self {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            let xcb = matches!(config, NativeVisibilityConfig::Xcb { .. })
+                .then(|| {
+                    xcb::Connection::connect(None)
+                        .ok()
+                        .map(|(connection, _)| connection)
+                })
+                .flatten();
+            Self {
+                config,
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                xcb,
+            }
+        }
+
+        fn hidden(&self) -> Option<bool> {
+            match self.config {
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                NativeVisibilityConfig::Xcb { window } => {
+                    use xcb::XidNew as _;
+
+                    let connection = self.xcb.as_ref()?;
+                    let cookie = connection.send_request(&xcb::x::GetWindowAttributes {
+                        window: xcb::x::Window::new(window),
+                    });
+                    connection
+                        .wait_for_reply(cookie)
+                        .ok()
+                        .map(|attributes| attributes.map_state() != xcb::x::MapState::Viewable)
+                }
+                #[cfg(target_os = "windows")]
+                NativeVisibilityConfig::Win32 { hwnd } => {
+                    use windows::Win32::Foundation::HWND;
+                    use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+
+                    Some(unsafe { IsIconic(HWND(hwnd as *mut _)).as_bool() })
+                }
+                NativeVisibilityConfig::FrameCallbacks => None,
+            }
+        }
+    }
+
+    impl Global for VisualPowerMonitor {}
+
+    impl VisualPowerMonitor {
+        pub(crate) fn init(cx: &mut App) {
+            if !cx.has_global::<Self>() {
+                #[cfg(debug_assertions)]
+                let test_mode = cx.get_name().is_some();
+                #[cfg(not(debug_assertions))]
+                let test_mode = false;
+                cx.set_global(Self {
+                    windows: HashMap::new(),
+                    test_mode,
+                    log_transitions: std::env::var_os("ZMUX_LOG_VISUAL_POWER").is_some(),
+                });
+            }
+            terminal_view::set_visual_power_state(Default::default(), cx);
+        }
+
+        pub(crate) fn attach<T: 'static>(window: &mut Window, cx: &mut gpui::Context<T>) {
+            if cx.global::<Self>().test_mode {
+                return;
+            }
+
+            let id = window.window_handle().window_id().as_u64();
+            let handle = window.window_handle();
+            let active = window.is_window_active();
+            // GPUI's TestWindow deliberately has no raw platform handle and
+            // panics when one is requested. Production backends can also lose
+            // a handle during teardown, so keep the same visible/frame-callback
+            // fallback boundary as the macOS native attachment path.
+            let native_config = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                NativeVisibilityConfig::for_window(window)
+            }))
+            .unwrap_or(NativeVisibilityConfig::FrameCallbacks);
+            let activation = cx.observe_window_activation(window, move |_owner, window, cx| {
+                Self::update_window(id, window.is_window_active(), None, cx);
+                // Activation changes are also the fastest restoration signal on
+                // compositors that do not expose an explicit mapped state.
+                Self::poll_window(id, None, window, cx);
             });
-            terminal_view::set_visual_power_state(
-                terminal_view::TerminalVisualPowerState::new([], throttled, false),
-                cx,
+
+            let state = Self::update_global(cx, |monitor, _cx| {
+                monitor.windows.insert(
+                    id,
+                    ObservedWindow {
+                        active,
+                        hidden: false,
+                        frame_fallback: native_config.needs_frame_fallback(),
+                        frame_probe: FrameVisibilityProbe::default(),
+                        last_reported: None,
+                        _activation: activation,
+                    },
+                );
+                monitor.state()
+            });
+            terminal_view::set_visual_power_state(state, cx);
+
+            let (sample_sender, sample_receiver) = async_channel::bounded(1);
+            let background_executor = cx.background_executor().clone();
+            background_executor
+                .clone()
+                .spawn(async move {
+                    let worker = NativeVisibilityWorker::new(native_config);
+                    loop {
+                        background_executor.timer(VISIBILITY_PROBE_INTERVAL).await;
+                        if sample_sender.send(worker.hidden()).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+
+            cx.spawn(async move |_owner, cx| {
+                while let Ok(native_hidden) = sample_receiver.recv().await {
+                    if handle
+                        .update(cx, |_, window, cx| {
+                            Self::poll_window(id, native_hidden, window, cx)
+                        })
+                        .is_err()
+                    {
+                        cx.update(|cx| Self::remove_window(id, cx));
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+
+        fn poll_window(id: u64, native_hidden: Option<bool>, window: &mut Window, cx: &mut App) {
+            let now = Instant::now();
+            let (frame_generation, state) = Self::update_global(cx, |monitor, _cx| {
+                let Some(observed) = monitor.windows.get_mut(&id) else {
+                    return (None, monitor.state());
+                };
+                if let Some(hidden) = native_hidden {
+                    observed.hidden = hidden;
+                    observed.frame_fallback = false;
+                } else {
+                    observed.frame_fallback = true;
+                }
+                // Wayland has no portable occlusion API. Probe compositor
+                // callbacks only after deactivation: continuously forcing
+                // frames for the active window would itself waste power.
+                let frame_generation = (observed.frame_fallback && !observed.active)
+                    .then(|| observed.frame_probe.poll(now))
+                    .flatten();
+                if observed.frame_fallback {
+                    observed.hidden = observed.frame_probe.starved;
+                }
+                let state = monitor.state();
+                monitor.log_window_state(id);
+                (frame_generation, state)
+            });
+            terminal_view::set_visual_power_state(state, cx);
+
+            if let Some(generation) = frame_generation {
+                window.on_next_frame(move |_window, cx| {
+                    Self::frame_presented(id, generation, cx);
+                });
+                window.refresh();
+            }
+        }
+
+        fn frame_presented(id: u64, generation: u64, cx: &mut App) {
+            let state = Self::update_global(cx, |monitor, _cx| {
+                if let Some(observed) = monitor.windows.get_mut(&id) {
+                    observed.frame_probe.presented(generation);
+                    if observed.frame_fallback {
+                        observed.hidden = observed.frame_probe.starved;
+                    }
+                }
+                monitor.log_window_state(id);
+                monitor.state()
+            });
+            terminal_view::set_visual_power_state(state, cx);
+        }
+
+        fn update_window(id: u64, active: bool, hidden: Option<bool>, cx: &mut App) {
+            let state = Self::update_global(cx, |monitor, _cx| {
+                if let Some(observed) = monitor.windows.get_mut(&id) {
+                    observed.active = active;
+                    if active && observed.frame_fallback {
+                        // Activation is the fastest reliable restore signal on
+                        // Wayland, and also cancels a pending starvation probe.
+                        observed.frame_probe.restore_visible();
+                        observed.hidden = false;
+                    }
+                    if let Some(hidden) = hidden {
+                        observed.hidden = hidden;
+                    }
+                }
+                monitor.log_window_state(id);
+                monitor.state()
+            });
+            terminal_view::set_visual_power_state(state, cx);
+        }
+
+        fn remove_window(id: u64, cx: &mut App) {
+            let state = Self::update_global(cx, |monitor, _cx| {
+                monitor.windows.remove(&id);
+                monitor.state()
+            });
+            terminal_view::set_visual_power_state(state, cx);
+        }
+
+        fn state(&self) -> terminal_view::TerminalVisualPowerState {
+            terminal_view::TerminalVisualPowerState::new(
+                self.windows
+                    .iter()
+                    .filter_map(|(id, window)| window.hidden.then_some(*id)),
+                self.windows
+                    .iter()
+                    .filter_map(|(id, window)| (!window.active && !window.hidden).then_some(*id)),
+                false,
+            )
+        }
+
+        fn log_window_state(&mut self, id: u64) {
+            if self.log_transitions
+                && let Some(window) = self.windows.get_mut(&id)
+            {
+                let state = (window.hidden, !window.active && !window.hidden);
+                if window.last_reported == Some(state) {
+                    return;
+                }
+                window.last_reported = Some(state);
+                eprintln!(
+                    "visual-power window={id} hidden={} throttled={}",
+                    state.0, state.1
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn frame_starvation_tracks_hidden_visible_hidden_transitions() {
+            let start = Instant::now();
+            let mut probe = FrameVisibilityProbe::default();
+
+            let first = probe.poll(start).expect("first frame probe");
+            assert!(!probe.starved);
+            assert_eq!(
+                probe.poll(start + FRAME_STARVATION_TIMEOUT),
+                None,
+                "a pending callback is never duplicated"
             );
-        });
-        let throttled = Self::update_global(cx, |monitor, _cx| {
-            monitor.windows.insert(
-                id,
-                ObservedWindow {
-                    active,
-                    _activation: activation,
-                },
+            assert!(probe.starved, "callback starvation marks the window hidden");
+
+            probe.presented(first);
+            assert!(!probe.starved, "a compositor callback restores visibility");
+
+            let second = probe
+                .poll(start + FRAME_STARVATION_TIMEOUT + VISIBILITY_PROBE_INTERVAL)
+                .expect("second frame probe");
+            assert_ne!(second, first);
+            probe.poll(start + FRAME_STARVATION_TIMEOUT * 2 + VISIBILITY_PROBE_INTERVAL);
+            assert!(probe.starved, "later starvation hides the window again");
+
+            probe.restore_visible();
+            assert!(!probe.starved, "activation restores visibility immediately");
+            assert!(
+                probe.pending.is_none(),
+                "activation cancels the old callback"
             );
-            monitor
-                .windows
-                .iter()
-                .filter_map(|(id, window)| (!window.active).then_some(*id))
-                .collect::<Vec<_>>()
-        });
-        terminal_view::set_visual_power_state(
-            terminal_view::TerminalVisualPowerState::new([], throttled, false),
-            cx,
-        );
+        }
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) use non_macos::VisualPowerMonitor;
 
 #[cfg(test)]
 mod tests {

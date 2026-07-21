@@ -15087,6 +15087,7 @@ dependencies = [
  "windows 0.61.3",
  "winresource",
  "workspace",
+ "xcb",
  "zbus",
  "zed_actions",
 ]
