@@ -26,6 +26,7 @@ pub(crate) use self::persistence::{RestoredTerminal, restore_startup_layout};
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
@@ -54,7 +55,9 @@ use self::agent_chat::{
 };
 use self::git_context::{
     GitDiscoveryState, GitRootRecheck, PathContextCache, WorkspaceContext,
-    workspace_context_for_active_workspace, workspace_context_for_stored_layout,
+    accept_workspace_context_probe_result, finalize_workspace_context,
+    warm_workspace_git_root_candidates, workspace_context_for_active_workspace,
+    workspace_context_for_stored_layout,
 };
 use self::persistence::{
     FailedRestoreSlot, SessionPersistence, StoredLayout, UnitRect, apply_restored_flexes,
@@ -216,6 +219,25 @@ impl<K: Copy + Eq + std::hash::Hash> DeadlineQueue<K> {
     }
 }
 
+fn purge_workspace_keyed_entries<K, V>(
+    registry: &mut HashMap<K, V>,
+    dirty: &mut HashSet<K>,
+    queue: &mut DeadlineQueue<K>,
+    belongs_to_workspace: impl Fn(&V) -> bool,
+) -> HashSet<K>
+where
+    K: Copy + Eq + std::hash::Hash,
+{
+    let removed = registry
+        .iter()
+        .filter_map(|(key, value)| belongs_to_workspace(value).then_some(*key))
+        .collect::<HashSet<_>>();
+    registry.retain(|key, _| !removed.contains(key));
+    dirty.retain(|key| !removed.contains(key));
+    queue.deadlines.retain(|key, _| !removed.contains(key));
+    removed
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GitRootRecheckTimerUpdate {
     Keep,
@@ -349,6 +371,7 @@ pub struct WorkspacesPanel {
     rename: Option<RenameState>,
     notifications_expanded: bool,
     notification_filter: Option<WorkspaceId>,
+    notification_cache: Option<panel::NotificationPanelCache>,
     _notification_subscription: Subscription,
     _workspace_subscription: Subscription,
     _project_subscription: Option<Subscription>,
@@ -359,6 +382,8 @@ pub struct WorkspacesPanel {
     context_refresh_task: Option<Task<()>>,
     context_refresh_queue: DeadlineQueue<WorkspaceId>,
     context_refresh_deadline: Option<Instant>,
+    context_probe_tasks: HashMap<WorkspaceId, Task<()>>,
+    context_probe_generations: HashMap<WorkspaceId, u64>,
     git_root_recheck_task: Option<Task<()>>,
     git_root_recheck_schedule: GitRootRecheckSchedule,
     metadata_probe_tasks: HashMap<WorkspaceId, Task<()>>,
@@ -371,7 +396,7 @@ pub struct WorkspacesPanel {
     pending_worktrees: BTreeSet<PathBuf>,
     audited_blocked_roots: BTreeSet<PathBuf>,
     warned_scan_roots: BTreeSet<PathBuf>,
-    path_context_cache: std::sync::Mutex<PathContextCache>,
+    path_context_cache: Arc<Mutex<PathContextCache>>,
     agent_chats: HashMap<(WorkspaceId, EntityId), AgentChat>,
     next_agent_activity_sequence: u64,
 }
@@ -465,7 +490,10 @@ impl WorkspacesPanel {
             )
         };
         let notification_store = NotificationStore::global(cx);
-        let notification_subscription = cx.observe(&notification_store, |_, _, cx| cx.notify());
+        let notification_subscription = cx.observe(&notification_store, |this, _, cx| {
+            panel::NotificationPanelCache::invalidate(&mut this.notification_cache);
+            cx.notify();
+        });
         let workspace_entity = workspace
             .upgrade()
             .expect("WorkspacesPanel must be created for a live workspace");
@@ -512,6 +540,7 @@ impl WorkspacesPanel {
             rename: None,
             notifications_expanded: false,
             notification_filter: None,
+            notification_cache: None,
             _notification_subscription: notification_subscription,
             _workspace_subscription: workspace_subscription,
             _project_subscription: None,
@@ -522,6 +551,8 @@ impl WorkspacesPanel {
             context_refresh_task: None,
             context_refresh_queue: DeadlineQueue::default(),
             context_refresh_deadline: None,
+            context_probe_tasks: HashMap::new(),
+            context_probe_generations: HashMap::new(),
             git_root_recheck_task: None,
             git_root_recheck_schedule: GitRootRecheckSchedule::default(),
             metadata_probe_tasks: HashMap::new(),
@@ -534,7 +565,7 @@ impl WorkspacesPanel {
             pending_worktrees: BTreeSet::new(),
             audited_blocked_roots: BTreeSet::new(),
             warned_scan_roots: BTreeSet::new(),
-            path_context_cache: std::sync::Mutex::new(PathContextCache::default()),
+            path_context_cache: Arc::new(Mutex::new(PathContextCache::default())),
             agent_chats: HashMap::new(),
             next_agent_activity_sequence: 0,
         }
@@ -1018,6 +1049,13 @@ impl WorkspacesPanel {
         delay: Duration,
         cx: &mut Context<Self>,
     ) {
+        // A terminal/workspace event means any in-flight filesystem result was
+        // observed from an older foreground snapshot, even if the debounced
+        // replacement probe has not started yet.
+        self.context_probe_generations
+            .entry(workspace_id)
+            .and_modify(|generation| *generation = generation.wrapping_add(1))
+            .or_insert(1);
         let delay =
             if terminal_view::visual_power_state(cx).low_power && workspace_id != self.active {
                 delay.max(Duration::from_secs(1))
@@ -1345,8 +1383,8 @@ impl WorkspacesPanel {
                         }
                     }
                     (None, None) => {
-                        //spawning a new terminal sometimes fails...
-                        // this a good workarround for now. gotta add some sorta retry logic
+                        // Keep the welcome item visible while the shared center
+                        // terminal path performs its bounded spawn retries.
                         let welcome = cx.new(ZmuxWelcome::new);
                         let target_pane = workspace.active_pane().clone();
                         target_pane.update(cx, |pane, cx| {
@@ -1441,12 +1479,25 @@ impl WorkspacesPanel {
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
         self.metadata_probe_tasks.remove(&id);
+        self.context_probe_tasks.remove(&id);
+        self.context_probe_generations.remove(&id);
         self.context_refresh_queue.remove(&id);
         self.context_refresh_task.take();
         self.context_refresh_deadline.take();
         self.arm_context_refresh(cx);
         self.agent_chats
             .retain(|(workspace_id, _), _| *workspace_id != id);
+        let removed_terminals = purge_workspace_keyed_entries(
+            &mut self.terminal_registry,
+            &mut self.dirty_agent_terminals,
+            &mut self.agent_refresh_queue,
+            |terminal| terminal.workspace_id == id,
+        );
+        if !removed_terminals.is_empty() {
+            self.agent_refresh_task.take();
+            self.agent_refresh_deadline.take();
+            self.arm_agent_refresh(cx);
+        }
         self.reconcile_git_context(cx);
         self.request_metadata_refreshes(cx);
         if self.notification_filter == Some(id) {
@@ -1506,69 +1557,113 @@ impl WorkspacesPanel {
         let active_context = workspace_ids
             .contains(&self.active)
             .then(|| {
-                self.workspace.upgrade().map(|workspace| {
-                    workspace_context_for_active_workspace(
-                        workspace.read(cx),
-                        &self.path_context_cache,
-                        cx,
-                    )
-                })
+                self.workspace
+                    .upgrade()
+                    .map(|workspace| workspace_context_for_active_workspace(workspace.read(cx), cx))
             })
             .flatten();
-        let mut changed = false;
+        let raw_contexts = self
+            .entries
+            .iter()
+            .filter(|entry| workspace_ids.contains(&entry.id))
+            .map(|entry| {
+                let context = if entry.id == self.active {
+                    active_context.clone().unwrap_or_default()
+                } else {
+                    entry
+                        .stored
+                        .as_ref()
+                        .map(|layout| workspace_context_for_stored_layout(layout, cx))
+                        .unwrap_or_default()
+                };
+                let admission_roots = entry
+                    .context
+                    .git_roots
+                    .iter()
+                    .chain(entry.selected_git_root.iter())
+                    .chain(entry.pinned_git_root.iter())
+                    .chain(entry.promoted_git_roots.iter())
+                    .chain(entry.worktree_paths.iter())
+                    .chain(entry.default_directory.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (entry.id, context, admission_roots)
+            })
+            .collect::<Vec<_>>();
 
-        for entry in &mut self.entries {
-            if !workspace_ids.contains(&entry.id) {
+        for (workspace_id, context, admission_roots) in raw_contexts {
+            let generation = *self
+                .context_probe_generations
+                .entry(workspace_id)
+                .and_modify(|generation| *generation = generation.wrapping_add(1))
+                .or_insert(1);
+            if self.context_probe_tasks.contains_key(&workspace_id) {
+                // A blocked stat/canonicalize call cannot be cancelled by
+                // dropping its GPUI task. Keep at most one filesystem probe
+                // in flight per logical workspace and queue the newest raw
+                // context for another pass after a bounded delay.
+                self.schedule_context_refresh_for(workspace_id, AGENT_REFRESH_INTERVAL, cx);
                 continue;
             }
-            let observed = if entry.id == self.active {
-                active_context.clone().unwrap_or_default()
-            } else {
-                entry
-                    .stored
-                    .as_ref()
-                    .map(|layout| {
-                        workspace_context_for_stored_layout(layout, &self.path_context_cache, cx)
-                    })
-                    .unwrap_or_default()
-            };
-            let previous_context = entry.context.clone();
-            let previous_authoritative = entry.context_authoritative;
-            entry.observe_context(observed);
-            let automatic_name = entry
-                .worktree_name
-                .clone()
-                .unwrap_or_else(|| automatic_workspace_name(&entry.context));
-            if entry.context != previous_context
-                || entry.context_authoritative != previous_authoritative
-                || entry.automatic_name != automatic_name
-            {
-                entry.automatic_name = automatic_name;
-                changed = true;
-            }
+            let cache = self.path_context_cache.clone();
+            let background = cx.background_spawn(async move {
+                warm_workspace_git_root_candidates(&admission_roots, cache.as_ref());
+                finalize_workspace_context(context, cache.as_ref())
+            });
+            let task = cx.spawn(async move |this, cx| {
+                let observed = background.await;
+                this.update(cx, |this, cx| {
+                    this.context_probe_tasks.remove(&workspace_id);
+                    let Some(observed) = accept_workspace_context_probe_result(
+                        this.context_probe_generations.get(&workspace_id).copied(),
+                        generation,
+                        observed,
+                    ) else {
+                        this.schedule_context_refresh_for(workspace_id, Duration::ZERO, cx);
+                        return;
+                    };
+                    this.apply_workspace_context_probe(workspace_id, observed, cx);
+                })
+                .ok();
+            });
+            self.context_probe_tasks.insert(workspace_id, task);
         }
+    }
+
+    fn apply_workspace_context_probe(
+        &mut self,
+        workspace_id: WorkspaceId,
+        observed: WorkspaceContext,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == workspace_id)
+        else {
+            return;
+        };
+        let previous_context = entry.context.clone();
+        let previous_authoritative = entry.context_authoritative;
+        entry.observe_context(observed);
+        let automatic_name = entry
+            .worktree_name
+            .clone()
+            .unwrap_or_else(|| automatic_workspace_name(&entry.context));
+        let changed = entry.context != previous_context
+            || entry.context_authoritative != previous_authoritative
+            || entry.automatic_name != automatic_name;
+        entry.automatic_name = automatic_name;
+        let incomplete = !entry.context_authoritative;
 
         let discovery_changed = self.promote_restored_git_discovery();
         if changed || discovery_changed {
             cx.notify();
         }
         self.reconcile_git_context(cx);
-        if self
-            .entries
-            .iter()
-            .any(|entry| workspace_ids.contains(&entry.id) && !entry.context_authoritative)
-        {
-            let incomplete = self
-                .entries
-                .iter()
-                .filter_map(|entry| {
-                    (workspace_ids.contains(&entry.id) && !entry.context_authoritative)
-                        .then_some(entry.id)
-                })
-                .collect::<Vec<_>>();
-            for id in incomplete {
-                self.schedule_context_refresh_for(id, AGENT_REFRESH_INTERVAL, cx);
-            }
+        self.request_metadata_refreshes(cx);
+        if incomplete {
+            self.schedule_context_refresh_for(workspace_id, AGENT_REFRESH_INTERVAL, cx);
         }
     }
 
@@ -1810,6 +1905,27 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn closing_workspace_purges_all_item_keyed_bookkeeping() {
+        let mut registry = HashMap::from([(10_u32, 1_u32), (20, 2), (30, 1)]);
+        let mut dirty = HashSet::from([10_u32, 20, 30]);
+        let mut queue = DeadlineQueue::default();
+        let now = Instant::now();
+        queue.schedule(10, now);
+        queue.schedule(20, now);
+        queue.schedule(30, now);
+
+        let removed =
+            purge_workspace_keyed_entries(&mut registry, &mut dirty, &mut queue, |workspace_id| {
+                *workspace_id == 1
+            });
+
+        assert_eq!(removed, HashSet::from([10, 30]));
+        assert_eq!(registry, HashMap::from([(20, 2)]));
+        assert_eq!(dirty, HashSet::from([20]));
+        assert_eq!(queue.deadlines.keys().copied().collect::<Vec<_>>(), [20]);
     }
 
     #[test]

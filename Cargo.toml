@@ -163,6 +163,8 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+xcb = "1.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit"] }
@@ -176,6 +178,7 @@ block2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform = { workspace = true }
+raw-window-handle = "0.6"
 windows = { version = "0.61", features = [
     "Data_Xml_Dom",
     "Foundation",
@@ -183,6 +186,7 @@ windows = { version = "0.61", features = [
     "UI_Notifications",
     "Win32_System_WinRT",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]

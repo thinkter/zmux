@@ -288,6 +288,21 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
     builder.env("HOME", user.home);
     // Set Window ID for clients relying on X11 hacks.
     builder.env("WINDOWID", window_id);
+    // A nested terminal must not inherit identity/capability variables from
+    // the terminal emulator (or zmux instance) that launched this process.
+    // Apply explicit terminal overrides afterwards so a freshly minted zmux
+    // notification capability can still be advertised to its exact child.
+    for key in [
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+        "KITTY_PUBLIC_KEY",
+        "KITTY_INSTALLATION_DIR",
+        "WEZTERM_PANE",
+        "GHOSTTY_RESOURCES_DIR",
+        "ZMUX_NOTIFY_ENDPOINT",
+    ] {
+        builder.env_remove(key);
+    }
     for (key, value) in &config.env {
         builder.env(key, value);
     }

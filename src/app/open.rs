@@ -257,6 +257,11 @@ mod tests {
         cx.run_until_parked();
     }
 
+    async fn initialize_zmux(cx: &mut TestAppContext) {
+        let initialization = cx.update(init_zmux);
+        initialization.await;
+    }
+
     #[gpui::test]
     async fn survivor_adopts_session_persistence_and_restores_its_latest_layout(
         cx: &mut TestAppContext,
@@ -269,8 +274,8 @@ mod tests {
         let session_path = state.path().join("session.json");
         let store = SessionStore::at(session_path.clone());
 
+        initialize_zmux(cx).await;
         let primary_task = cx.update(|cx| {
-            init_zmux(cx);
             install_session_store_for_test(store.clone(), cx);
             open_zmux_workspace_for_directory(
                 None,
@@ -360,8 +365,8 @@ mod tests {
         let store = SessionStore::at(state.path().join("session.json"));
         let flusher = crate::session::CrashSessionFlusher::start(store.clone()).unwrap();
 
+        initialize_zmux(cx).await;
         let open_task = cx.update(|cx| {
-            init_zmux(cx);
             install_session_store_for_test(store.clone(), cx);
             open_zmux_workspace_for_directory(
                 None,
@@ -404,8 +409,8 @@ mod tests {
         let workspace_directory = TestDirectory::new("session-disabled-workspace");
         let store = SessionStore::at(state.path().join("session.json"));
 
+        initialize_zmux(cx).await;
         let open_task = cx.update(|cx| {
-            init_zmux(cx);
             install_session_store_for_test(store.clone(), cx);
             open_zmux_workspace_for_directory(
                 None,

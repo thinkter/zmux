@@ -4,6 +4,8 @@
 //! Pure presentation over state owned by [`WorkspacesPanel`]; mutations run
 //! through the panel methods invoked from event listeners.
 
+use std::sync::Arc;
+
 use gpui::{
     Anchor, App, Context, FontWeight, IntoElement, KeyDownEvent, Pixels, Render, SharedString,
     Window, div, px,
@@ -16,6 +18,7 @@ use crate::agent_detection::AgentKind;
 use crate::metadata::{GitMetadata, MetadataState};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{Notification, NotificationStore, WorkspaceId};
+use crate::theme::DEFAULT_MONO_FONT;
 
 use super::agent_chat::{
     AgentChatState, agent_chat_detail, agent_chat_display_title, agent_chat_tooltip,
@@ -26,8 +29,61 @@ use super::{ToggleWorkspacesPanel, WorkspacesPanel, path_display_name, workspace
 
 const PANEL_WIDTH_REMS: f32 = 15.0;
 const PANEL_MIN_WIDTH_REMS: f32 = 12.0;
-const WORKSPACES_FONT_FAMILY: &str = "Lilex";
 const NOTIFICATION_DRAWER_HEIGHT_REMS: f32 = 17.5;
+
+pub(super) struct NotificationPanelCache {
+    filter: Option<WorkspaceId>,
+    latest_unread_index: Option<usize>,
+    unread_count: usize,
+    notifications: Arc<[Notification]>,
+}
+
+impl NotificationPanelCache {
+    pub(super) fn invalidate(cache: &mut Option<Self>) {
+        *cache = None;
+    }
+
+    fn refresh(
+        store: &NotificationStore,
+        scope_id: gpui::EntityId,
+        filter: Option<WorkspaceId>,
+    ) -> Self {
+        let notifications = store
+            .notifications()
+            .filter(|notification| {
+                notification.target.scope_id == scope_id
+                    && filter
+                        .is_none_or(|workspace_id| notification.target.workspace_id == workspace_id)
+            })
+            .cloned()
+            .collect::<Arc<[_]>>();
+        let latest_unread_index = notifications
+            .iter()
+            .position(|notification| !notification.read);
+        let unread_count = notifications
+            .iter()
+            .filter(|notification| !notification.read)
+            .count();
+        Self {
+            filter,
+            latest_unread_index,
+            unread_count,
+            notifications,
+        }
+    }
+
+    fn get_or_refresh<'a>(
+        cache: &'a mut Option<Self>,
+        store: &NotificationStore,
+        scope_id: gpui::EntityId,
+        filter: Option<WorkspaceId>,
+    ) -> &'a Self {
+        if cache.as_ref().is_none_or(|cached| cached.filter != filter) {
+            *cache = Some(Self::refresh(store, scope_id, filter));
+        }
+        cache.as_ref().expect("notification cache was populated")
+    }
+}
 
 fn scaled_panel_size(rem_size: Pixels, rems: f32) -> Pixels {
     px(f32::from(rem_size) * rems)
@@ -65,7 +121,7 @@ struct DraggedWorkspace {
 impl Render for DraggedWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .font_family(WORKSPACES_FONT_FAMILY)
+            .font_family(DEFAULT_MONO_FONT)
             .px_2()
             .py_1()
             .gap_2()
@@ -627,45 +683,31 @@ impl Render for WorkspacesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let scope_id = cx.entity_id();
         let notification_filter = self.notification_filter;
-        let (rows, latest, unread_count, notifications) = {
+        let rows = self
+            .entries
+            .iter()
+            .map(|entry| WorkspaceRow {
+                id: entry.id,
+                name: entry.display_name().to_string(),
+                uses_manual_name: entry.manual_name.is_some(),
+                context: entry.context.clone(),
+                git: entry.git.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (latest_unread_index, unread_count, notifications) = {
             let store = NotificationStore::global(cx);
             let store = store.read(cx);
-            let rows = self
-                .entries
-                .iter()
-                .map(|entry| WorkspaceRow {
-                    id: entry.id,
-                    name: entry.display_name().to_string(),
-                    uses_manual_name: entry.manual_name.is_some(),
-                    context: entry.context.clone(),
-                    git: entry.git.clone(),
-                })
-                .collect::<Vec<_>>();
-            let latest = store
-                .notifications()
-                .find(|notification| {
-                    notification.target.scope_id == scope_id
-                        && notification_filter.is_none_or(|workspace_id| {
-                            notification.target.workspace_id == workspace_id
-                        })
-                        && !notification.read
-                })
-                .cloned();
-            let unread_count = notification_filter.map_or_else(
-                || store.scope_unread_count(scope_id),
-                |workspace_id| store.workspace_unread_count(scope_id, workspace_id),
+            let cached = NotificationPanelCache::get_or_refresh(
+                &mut self.notification_cache,
+                store,
+                scope_id,
+                notification_filter,
             );
-            let notifications = store
-                .notifications()
-                .filter(|notification| {
-                    notification.target.scope_id == scope_id
-                        && notification_filter.is_none_or(|workspace_id| {
-                            notification.target.workspace_id == workspace_id
-                        })
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            (rows, latest, unread_count, notifications)
+            (
+                cached.latest_unread_index,
+                cached.unread_count,
+                cached.notifications.clone(),
+            )
         };
         let notification_heading = notification_filter
             .and_then(|workspace_id| rows.iter().find(|row| row.id == workspace_id))
@@ -833,7 +875,7 @@ impl Render for WorkspacesPanel {
 
         v_flex()
             .key_context("WorkspacesPanel")
-            .font_family(WORKSPACES_FONT_FAMILY)
+            .font_family(DEFAULT_MONO_FONT)
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().panel_background)
@@ -962,7 +1004,8 @@ impl Render for WorkspacesPanel {
                 )
             })
             .when(!self.notifications_expanded, |this| {
-                this.when_some(latest, |this, notification| {
+                this.when_some(latest_unread_index, |this, latest_unread_index| {
+                    let notification = &notifications[latest_unread_index];
                     let id = notification.id;
                     this.child(
                         v_flex()
@@ -1097,6 +1140,100 @@ mod tests {
         assert_eq!(scaled_panel_size(px(16.0), PANEL_WIDTH_REMS), px(240.0));
         assert_eq!(scaled_panel_size(px(22.4), PANEL_WIDTH_REMS), px(336.0));
         assert_eq!(scaled_panel_size(px(22.4), PANEL_MIN_WIDTH_REMS), px(268.8));
+    }
+
+    #[test]
+    fn notification_panel_cache_reuses_rows_until_refiltered() {
+        let scope_id = gpui::EntityId::from(1);
+        let mut store = NotificationStore::with_capacity(10);
+        let target = crate::notifications::NotificationTarget {
+            scope_id,
+            workspace_id: 7,
+            item_id: gpui::EntityId::from(10),
+        };
+        store
+            .record(crate::notifications::NotificationRequest::new(
+                target,
+                crate::notifications::NotificationSource::Manual,
+                "first",
+                "body",
+            ))
+            .unwrap();
+
+        let mut cache = None;
+        let first_rows = NotificationPanelCache::get_or_refresh(&mut cache, &store, scope_id, None)
+            .notifications
+            .clone();
+        let second_rows =
+            NotificationPanelCache::get_or_refresh(&mut cache, &store, scope_id, None)
+                .notifications
+                .clone();
+        assert!(Arc::ptr_eq(&first_rows, &second_rows));
+
+        let filtered_rows =
+            NotificationPanelCache::get_or_refresh(&mut cache, &store, scope_id, Some(7))
+                .notifications
+                .clone();
+        assert!(!Arc::ptr_eq(&second_rows, &filtered_rows));
+    }
+
+    #[gpui::test]
+    async fn notification_store_observer_invalidates_the_panel_cache(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+
+        struct CacheOwner {
+            cache: Option<NotificationPanelCache>,
+            _subscription: gpui::Subscription,
+        }
+
+        let owner = cx.update(|cx| {
+            NotificationStore::init(cx);
+            let store = NotificationStore::global(cx);
+            cx.new(|cx| {
+                let mut cache = None;
+                NotificationPanelCache::get_or_refresh(
+                    &mut cache,
+                    store.read(cx),
+                    gpui::EntityId::from(1),
+                    None,
+                );
+                let subscription = cx.observe(&store, |this: &mut CacheOwner, _, _| {
+                    NotificationPanelCache::invalidate(&mut this.cache);
+                });
+                CacheOwner {
+                    cache,
+                    _subscription: subscription,
+                }
+            })
+        });
+        owner.read_with(cx, |owner, _| assert!(owner.cache.is_some()));
+
+        cx.update(|cx| {
+            NotificationStore::global(cx).update(cx, |store, store_cx| {
+                store
+                    .record(crate::notifications::NotificationRequest::new(
+                        crate::notifications::NotificationTarget {
+                            scope_id: gpui::EntityId::from(1),
+                            workspace_id: 1,
+                            item_id: gpui::EntityId::from(99),
+                        },
+                        crate::notifications::NotificationSource::Manual,
+                        "cache invalidation",
+                        "body",
+                    ))
+                    .unwrap();
+                store_cx.notify();
+            });
+        });
+
+        owner.read_with(cx, |owner, _| {
+            assert!(
+                owner.cache.is_none(),
+                "the store observer must invalidate cached filtered rows"
+            );
+        });
     }
 
     #[test]

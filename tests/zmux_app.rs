@@ -25,6 +25,11 @@ use zmux::{
 #[cfg(target_os = "macos")]
 use zmux::{NewWorkspace, ToggleWorkspacesPanel};
 
+async fn initialize_zmux(cx: &mut TestAppContext) {
+    let initialization = cx.update(init_zmux);
+    initialization.await;
+}
+
 #[test]
 fn terminal_bounds_round_down_to_complete_cells() {
     let bounds = TerminalBounds::new(
@@ -78,10 +83,8 @@ async fn non_repository_startup_keeps_the_project_pathless(cx: &mut TestAppConte
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
     let expected_directory = root.path().canonicalize().unwrap();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     let mut terminal_directory = None;
@@ -180,10 +183,8 @@ async fn batched_terminal_osc_notifications_survive_the_title_event_bridge(
 async fn kitty_runtime_responses_bypass_terminal_user_input(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -252,10 +253,8 @@ async fn kitty_runtime_responses_bypass_terminal_user_input(cx: &mut TestAppCont
 async fn notification_shell_tab_indicator_tracks_unread_state(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     let terminal_view = loop {
@@ -319,10 +318,8 @@ async fn notification_shell_tab_indicator_tracks_unread_state(cx: &mut TestAppCo
 async fn notification_shell_tab_title_tracks_foreground_process(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     let terminal_view = loop {
@@ -390,10 +387,8 @@ async fn notification_shell_tab_title_tracks_foreground_process(cx: &mut TestApp
 async fn workspace_metadata_click_activates_the_workspace(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
     let panel = opened.workspace.read_with(cx, |workspace, cx| {
         workspace
@@ -568,10 +563,8 @@ async fn zoom_actions_adjust_terminal_effective_font_size(cx: &mut TestAppContex
 async fn workspace_shell_opens_first_terminal_as_center_tab(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
 
     let opened = open_task
         .await
@@ -633,10 +626,8 @@ async fn every_custom_or_generic_new_terminal_is_centered_and_credentialed(
 ) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
 
     let opened = open_task
         .await
@@ -794,10 +785,8 @@ async fn every_custom_or_generic_new_terminal_is_centered_and_credentialed(
 async fn tab_bar_plus_creates_a_terminal_without_opening_a_menu(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -852,10 +841,8 @@ async fn tab_bar_plus_creates_a_terminal_without_opening_a_menu(cx: &mut TestApp
 async fn missing_workspace_pane_action_creates_a_credentialed_split(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -944,10 +931,8 @@ async fn missing_workspace_pane_action_creates_a_credentialed_split(cx: &mut Tes
 async fn direct_terminal_clone_is_credentialed_before_it_is_mounted(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     let initial_item_id = loop {
@@ -1080,10 +1065,8 @@ async fn deserialized_terminal_is_credentialed_before_mount_and_routes_exactly(
 ) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -1225,10 +1208,8 @@ async fn deserialized_terminal_is_credentialed_before_mount_and_routes_exactly(
 async fn cli_route_is_revoked_when_shell_exits_while_its_tab_stays_open(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     let (terminal, endpoint) = loop {
@@ -1324,10 +1305,8 @@ async fn cli_route_is_revoked_when_shell_exits_while_its_tab_stays_open(cx: &mut
 async fn terminal_splits_never_share_notification_capabilities(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -1480,10 +1459,8 @@ async fn delayed_split_completion_never_leaks_into_a_different_logical_workspace
 ) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -1577,10 +1554,8 @@ async fn delayed_center_completion_never_leaks_or_retains_its_staged_route(
 ) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -1699,10 +1674,8 @@ async fn fast_round_trip_to_welcome_only_workspace_provisions_exactly_one_termin
 ) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -1798,8 +1771,8 @@ async fn no_cli_server_fallback_survives_workspace_round_trips_without_duplicate
 ) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
+    initialize_zmux(cx).await;
     let open_task = cx.update(|cx| {
-        init_zmux(cx);
         // Exercise the legitimate fallback used when listener/thread startup
         // fails. The project-wide terminal environment still scrubs any outer
         // capability, but these ordinary shells intentionally have no task
@@ -1898,10 +1871,8 @@ async fn no_cli_server_fallback_survives_workspace_round_trips_without_duplicate
 async fn notification_action_records_and_navigates_the_exact_terminal(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
     let opened = open_task.await.expect("workspace should open");
 
     for _ in 0..50 {
@@ -2138,26 +2109,43 @@ async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppCon
             "ctrl-0",
             &zed_actions::ResetBufferFontSize { persist: false },
         );
-        assert_bound(
-            cx,
-            "cmd-=",
-            &zed_actions::IncreaseBufferFontSize { persist: false },
-        );
-        assert_bound(
-            cx,
-            "cmd-+",
-            &zed_actions::IncreaseBufferFontSize { persist: false },
-        );
-        assert_bound(
-            cx,
-            "cmd--",
-            &zed_actions::DecreaseBufferFontSize { persist: false },
-        );
-        assert_bound(
-            cx,
-            "cmd-0",
-            &zed_actions::ResetBufferFontSize { persist: false },
-        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_bound(
+                cx,
+                "cmd-=",
+                &zed_actions::IncreaseBufferFontSize { persist: false },
+            );
+            assert_bound(
+                cx,
+                "cmd-+",
+                &zed_actions::IncreaseBufferFontSize { persist: false },
+            );
+            assert_bound(
+                cx,
+                "cmd--",
+                &zed_actions::DecreaseBufferFontSize { persist: false },
+            );
+            assert_bound(
+                cx,
+                "cmd-0",
+                &zed_actions::ResetBufferFontSize { persist: false },
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_not_bound(
+                cx,
+                "cmd-=",
+                &zed_actions::IncreaseBufferFontSize { persist: false },
+            );
+            assert_not_bound(
+                cx,
+                "cmd-0",
+                &zed_actions::ResetBufferFontSize { persist: false },
+            );
+            assert_not_bound(cx, "cmd-shift-u", &JumpToLatestNotification);
+        }
         assert_bound(cx, "ctrl-shift-t", &ZmuxNewTerminal);
         assert_bound(cx, "ctrl-shift-n", &ZmuxNewTerminal);
         assert_bound(cx, "ctrl-tab", &tab_switcher::Toggle::default());
@@ -2186,6 +2174,7 @@ async fn zmux_keybindings_cover_terminal_copy_paste_and_zoom(cx: &mut TestAppCon
             assert_bound(cx, "cmd-n", &NewWorkspace);
             assert_bound(cx, "cmd-b", &ToggleWorkspacesPanel);
             assert_bound(cx, "cmd-shift-m", &NotifyCurrentPane);
+            assert_bound(cx, "cmd-shift-u", &JumpToLatestNotification);
             assert_bound(cx, "cmd-w", &CloseActiveItem::default());
             assert_bound(cx, "cmd-alt-w", &CloseAllItems::default());
             assert_bound(cx, "cmd-d", &SplitTerminalRight);
@@ -2340,9 +2329,9 @@ fn terminal_env_scrubs_outer_image_protocol_hints() {
 
     assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("zmux"));
     assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
-    assert_eq!(env.get(NOTIFY_ENDPOINT_ENV).map(String::as_str), Some(""));
-    assert_eq!(env.get("KITTY_WINDOW_ID").map(String::as_str), Some(""));
-    assert_eq!(env.get("KITTY_PUBLIC_KEY").map(String::as_str), Some(""));
+    assert!(!env.contains_key(NOTIFY_ENDPOINT_ENV));
+    assert!(!env.contains_key("KITTY_WINDOW_ID"));
+    assert!(!env.contains_key("KITTY_PUBLIC_KEY"));
 }
 
 #[test]
@@ -2472,10 +2461,8 @@ async fn ui_font_size_setting_scales_the_ui_rem_size(cx: &mut TestAppContext) {
 async fn open_settings_opens_a_single_reused_settings_tab(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
-    let open_task = cx.update(|cx| {
-        init_zmux(cx);
-        open_zmux_workspace_at(None, root.path().to_path_buf(), cx)
-    });
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
 
     let opened = open_task
         .await

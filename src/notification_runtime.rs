@@ -11,9 +11,7 @@ use std::{
 };
 
 use alacritty_terminal::term::{build_zmux_notification_replay_ack, build_zmux_pty_response};
-use gpui::{
-    AnyWindowHandle, App, Entity, EntityId, Focusable, Global, Subscription, WeakEntity, Window,
-};
+use gpui::{AnyWindowHandle, App, Entity, EntityId, Focusable, Global, WeakEntity, Window};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use workspace::{Workspace, item::ItemHandle};
@@ -63,17 +61,48 @@ fn take_cached_unread_route(
     Some(focused_route.key)
 }
 
+fn affected_registered_route_keys(
+    registered: impl IntoIterator<Item = (EntityId, EntityId)>,
+    targets: impl IntoIterator<Item = NotificationTarget>,
+) -> HashSet<(EntityId, EntityId)> {
+    let affected = targets
+        .into_iter()
+        .map(|target| (target.scope_id, target.item_id))
+        .collect::<HashSet<_>>();
+    registered
+        .into_iter()
+        .filter(|key| affected.contains(key))
+        .collect()
+}
+
+fn notify_route_entities<T: 'static>(
+    routes: impl IntoIterator<Item = ((EntityId, EntityId), WeakEntity<T>)>,
+    affected: &HashSet<(EntityId, EntityId)>,
+    cx: &mut App,
+) -> usize {
+    routes
+        .into_iter()
+        .filter(|(key, _)| affected.contains(key))
+        .filter(|(_, entity)| {
+            entity
+                .update(cx, |_entity, entity_cx| entity_cx.notify())
+                .is_ok()
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, collections::HashSet, rc::Rc};
 
-    use gpui::{EntityId, TestAppContext};
+    use gpui::{AppContext, EntityId, TestAppContext};
 
     use super::{
         FocusedRouteState, KittyRegistry, KittyRuntimeState, MAX_KITTY_PLAIN_CHUNK_BYTES,
-        NotificationRuntime, NotificationSequence, NotificationTarget, joined_identifier_bytes,
-        native_delivery_absorbs_removed_retraction, sequence_is_after, should_deliver_native,
-        take_cached_unread_route, unread_notification_ids_for_scope,
+        NotificationRuntime, NotificationSequence, NotificationTarget,
+        affected_registered_route_keys, joined_identifier_bytes,
+        native_delivery_absorbs_removed_retraction, notify_route_entities, sequence_is_after,
+        should_deliver_native, take_cached_unread_route, unread_notification_ids_for_scope,
     };
     use crate::{
         notifications::{
@@ -123,6 +152,96 @@ mod tests {
             None,
             "a second key before observer refresh cannot rescan the store",
         );
+    }
+
+    #[test]
+    fn store_change_selects_only_registered_affected_routes() {
+        let route_a = (EntityId::from(1), EntityId::from(10));
+        let route_b = (EntityId::from(1), EntityId::from(20));
+        let route_c = (EntityId::from(2), EntityId::from(30));
+        let selected = affected_registered_route_keys(
+            [route_a, route_b, route_c],
+            [target(1, 7, 20), target(1, 9, 20), target(3, 7, 40)],
+        );
+
+        assert_eq!(selected, HashSet::from([route_b]));
+    }
+
+    #[test]
+    fn repeated_producer_changes_never_select_unrelated_routes() {
+        let producer = (EntityId::from(1), EntityId::from(10));
+        let unrelated = (EntityId::from(1), EntityId::from(20));
+        let mut producer_notifies = 0;
+        let mut unrelated_notifies = 0;
+
+        for _ in 0..10 {
+            let selected =
+                affected_registered_route_keys([producer, unrelated], [target(1, 7, 10)]);
+            producer_notifies += usize::from(selected.contains(&producer));
+            unrelated_notifies += usize::from(selected.contains(&unrelated));
+        }
+
+        assert_eq!(producer_notifies, 10);
+        assert_eq!(unrelated_notifies, 0);
+    }
+
+    #[gpui::test]
+    async fn repeated_store_changes_notify_only_the_affected_gpui_entity(cx: &mut TestAppContext) {
+        struct NotifyProbe;
+
+        let producer_notifies = Rc::new(Cell::new(0));
+        let unrelated_notifies = Rc::new(Cell::new(0));
+        let (producer, unrelated) = cx.update(|cx| {
+            let producer = cx.new(|_| NotifyProbe);
+            let unrelated = cx.new(|_| NotifyProbe);
+            cx.observe(&producer, {
+                let count = producer_notifies.clone();
+                move |_, _| count.set(count.get() + 1)
+            })
+            .detach();
+            cx.observe(&unrelated, {
+                let count = unrelated_notifies.clone();
+                move |_, _| count.set(count.get() + 1)
+            })
+            .detach();
+            (producer, unrelated)
+        });
+        let producer_key = (EntityId::from(1), EntityId::from(10));
+        let unrelated_key = (EntityId::from(1), EntityId::from(20));
+        let owner = target(1, 7, 10);
+        let mut store = NotificationStore::with_capacity(20);
+
+        for sequence in 0..10 {
+            cx.update(|cx| {
+                let mut request = NotificationRequest::new(
+                    owner,
+                    NotificationSource::Manual,
+                    format!("event-{sequence}"),
+                    "body",
+                );
+                request.identity = NotificationIdentity::Unique;
+                let outcome = store.record(request).unwrap();
+                let affected = affected_registered_route_keys(
+                    [producer_key, unrelated_key],
+                    outcome.unread_count_changed_targets(),
+                );
+                assert_eq!(
+                    notify_route_entities(
+                        [
+                            (producer_key, producer.downgrade()),
+                            (unrelated_key, unrelated.downgrade()),
+                        ],
+                        &affected,
+                        cx,
+                    ),
+                    1,
+                );
+            });
+            cx.run_until_parked();
+        }
+
+        assert_eq!(producer_notifies.get(), 10);
+        assert_eq!(unrelated_notifies.get(), 0);
     }
 
     fn state(
@@ -464,7 +583,6 @@ pub struct NotificationRuntime {
     osc_parsers: HashMap<(EntityId, EntityId), OscNotificationParser>,
     osc_bridge_sequences: HashMap<(EntityId, EntityId), u64>,
     kitty: KittyRegistry,
-    _notification_subscription: Option<Subscription>,
 }
 
 #[derive(Clone)]
@@ -709,14 +827,9 @@ impl Global for NotificationRuntime {}
 
 impl NotificationRuntime {
     pub fn init(cx: &mut App) {
-        let notification_store = crate::notifications::NotificationStore::init(cx);
+        crate::notifications::NotificationStore::init(cx);
         if !cx.has_global::<Self>() {
             cx.set_global(Self::default());
-            let subscription = cx.observe(&notification_store, |_store, cx| {
-                Self::refresh_focused_route_unread(cx);
-                Self::notify_terminal_tabs(cx);
-            });
-            cx.global_mut::<Self>()._notification_subscription = Some(subscription);
             cx.observe_keystrokes(|_, window, cx| {
                 let target = take_cached_unread_route(
                     cx.global_mut::<Self>()
@@ -758,16 +871,28 @@ impl NotificationRuntime {
         }
     }
 
-    fn notify_terminal_tabs(cx: &mut App) {
-        let views = cx
+    fn notify_terminal_tabs(targets: impl IntoIterator<Item = NotificationTarget>, cx: &mut App) {
+        let route_keys =
+            affected_registered_route_keys(cx.global::<Self>().routes.keys().copied(), targets);
+        Self::notify_terminal_tab_keys(route_keys, cx);
+    }
+
+    fn notify_terminal_tab_keys(
+        route_keys: impl IntoIterator<Item = (EntityId, EntityId)>,
+        cx: &mut App,
+    ) {
+        let route_keys = route_keys.into_iter().collect::<HashSet<_>>();
+        if route_keys.is_empty() {
+            return;
+        }
+        Self::refresh_focused_route_unread(cx);
+        let routes = cx
             .global::<Self>()
             .routes
-            .values()
-            .map(|route| route.view.clone())
+            .iter()
+            .map(|(key, route)| (*key, route.view.clone()))
             .collect::<Vec<_>>();
-        for view in views {
-            let _ = view.update(cx, |_view, view_cx| view_cx.notify());
-        }
+        notify_route_entities(routes, &route_keys, cx);
     }
 
     fn refresh_focused_route_unread(cx: &mut App) {
@@ -1193,7 +1318,9 @@ impl NotificationRuntime {
                 outcome
             });
         let outcome = outcome?;
+        let unread_count_changed_targets = outcome.unread_count_changed_targets();
         let notification = outcome.notification;
+        Self::notify_terminal_tabs(unread_count_changed_targets, cx);
         let should_deliver = should_deliver_native(exact_target_is_focused, force_native_delivery);
 
         let native_alive = if should_deliver {
@@ -1434,11 +1561,7 @@ impl NotificationRuntime {
 
         Self::report_kitty_activation(id, notification.sequence, cx);
         DesktopNotificationService::retract(id, cx);
-        crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
-            if store.mark_read(id) {
-                store_cx.notify();
-            }
-        });
+        Self::mark_notification_read(id, cx);
         true
     }
 
@@ -1459,11 +1582,7 @@ impl NotificationRuntime {
 
         Self::report_kitty_activation(id, sequence, cx);
         DesktopNotificationService::retract(id, cx);
-        crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
-            if store.mark_read(id) {
-                store_cx.notify();
-            }
-        });
+        Self::mark_notification_read(id, cx);
     }
 
     fn native_notification_closed(
@@ -1475,11 +1594,7 @@ impl NotificationRuntime {
             return;
         }
         Self::report_kitty_closed(id, sequence, cx);
-        crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
-            if store.mark_read(id) {
-                store_cx.notify();
-            }
-        });
+        Self::mark_notification_read(id, cx);
     }
 
     fn native_notification_expired(
@@ -1532,6 +1647,26 @@ impl NotificationRuntime {
         Self::report_kitty_closed(notification.id, notification.sequence, cx);
     }
 
+    fn mark_notification_read(id: NotificationId, cx: &mut App) -> bool {
+        let target = crate::notifications::NotificationStore::global(cx)
+            .read(cx)
+            .get(id)
+            .filter(|notification| !notification.read)
+            .map(|notification| notification.target);
+        let changed =
+            crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
+                let changed = store.mark_read(id);
+                if changed {
+                    store_cx.notify();
+                }
+                changed
+            });
+        if changed {
+            Self::notify_terminal_tabs(target, cx);
+        }
+        changed
+    }
+
     pub fn jump_to_latest_unread(scope_id: EntityId, cx: &mut App) -> bool {
         let store = crate::notifications::NotificationStore::global(cx);
         let ids = unread_notification_ids_for_scope(store.read(cx), scope_id);
@@ -1560,6 +1695,9 @@ impl NotificationRuntime {
         for (id, sequence) in ids {
             DesktopNotificationService::retract(id, cx);
             Self::report_kitty_closed(id, sequence, cx);
+        }
+        if changed > 0 {
+            Self::notify_terminal_tab_keys([(scope_id, item_id)], cx);
         }
         changed
     }
@@ -1593,6 +1731,9 @@ impl NotificationRuntime {
             DesktopNotificationService::retract(id, cx);
             Self::report_kitty_closed(id, sequence, cx);
         }
+        if changed > 0 {
+            Self::notify_terminal_tab_keys([(scope_id, item_id)], cx);
+        }
         changed
     }
 
@@ -1622,10 +1763,10 @@ impl NotificationRuntime {
     }
 
     pub fn dismiss_notification(id: NotificationId, cx: &mut App) -> bool {
-        let sequence = crate::notifications::NotificationStore::global(cx)
+        let notification = crate::notifications::NotificationStore::global(cx)
             .read(cx)
             .get(id)
-            .map(|notification| notification.sequence);
+            .cloned();
         let changed =
             crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
                 let changed = store.dismiss(id);
@@ -1636,8 +1777,11 @@ impl NotificationRuntime {
             });
         if changed {
             DesktopNotificationService::retract(id, cx);
-            if let Some(sequence) = sequence {
-                Self::report_kitty_closed(id, sequence, cx);
+            if let Some(notification) = notification {
+                Self::report_kitty_closed(id, notification.sequence, cx);
+                if !notification.read {
+                    Self::notify_terminal_tabs([notification.target], cx);
+                }
             }
         }
         changed
@@ -1648,17 +1792,20 @@ impl NotificationRuntime {
             .read(cx)
             .notifications()
             .filter(|notification| notification.target.scope_id == scope_id && !notification.read)
-            .map(|notification| (notification.id, notification.sequence))
+            .map(|notification| (notification.id, notification.sequence, notification.target))
             .collect::<Vec<_>>();
         let changed =
             crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
-                let changed = ids.iter().filter(|(id, _)| store.mark_read(*id)).count();
+                let changed = ids.iter().filter(|(id, _, _)| store.mark_read(*id)).count();
                 if changed > 0 {
                     store_cx.notify();
                 }
                 changed
             });
-        for (id, sequence) in ids {
+        if changed > 0 {
+            Self::notify_terminal_tabs(ids.iter().map(|(_, _, target)| *target), cx);
+        }
+        for (id, sequence, _) in ids {
             DesktopNotificationService::retract(id, cx);
             Self::report_kitty_closed(id, sequence, cx);
         }
@@ -1678,17 +1825,20 @@ impl NotificationRuntime {
                     && notification.target.workspace_id == workspace_id
                     && !notification.read
             })
-            .map(|notification| (notification.id, notification.sequence))
+            .map(|notification| (notification.id, notification.sequence, notification.target))
             .collect::<Vec<_>>();
         let changed =
             crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
-                let changed = ids.iter().filter(|(id, _)| store.mark_read(*id)).count();
+                let changed = ids.iter().filter(|(id, _, _)| store.mark_read(*id)).count();
                 if changed > 0 {
                     store_cx.notify();
                 }
                 changed
             });
-        for (id, sequence) in ids {
+        if changed > 0 {
+            Self::notify_terminal_tabs(ids.iter().map(|(_, _, target)| *target), cx);
+        }
+        for (id, sequence, _) in ids {
             DesktopNotificationService::retract(id, cx);
             Self::report_kitty_closed(id, sequence, cx);
         }
@@ -1710,6 +1860,15 @@ impl NotificationRuntime {
                 }
                 changed
             });
+        if changed > 0 {
+            Self::notify_terminal_tabs(
+                removed
+                    .iter()
+                    .filter(|notification| !notification.read)
+                    .map(|notification| notification.target),
+                cx,
+            );
+        }
         for notification in removed {
             Self::reconcile_removed_notification(notification, cx);
         }
@@ -2116,12 +2275,19 @@ impl NotificationRuntime {
             .read(cx)
             .get(id)
             .cloned();
-        crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
-            if store.dismiss(id) {
-                store_cx.notify();
-            }
-        });
+        let changed =
+            crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
+                if store.dismiss(id) {
+                    store_cx.notify();
+                    true
+                } else {
+                    false
+                }
+            });
         if let Some(notification) = notification {
+            if changed && !notification.read {
+                Self::notify_terminal_tabs([notification.target], cx);
+            }
             Self::reconcile_removed_notification(notification, cx);
         }
     }

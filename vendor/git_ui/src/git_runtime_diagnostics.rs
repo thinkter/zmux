@@ -115,8 +115,9 @@ fn collect_process_tree() -> anyhow::Result<Value> {
 /// values. sysinfo's `Process::cmd()` on macOS goes through `KERN_PROCARGS2`
 /// and can include envp in addition to argv for some processes, which means
 /// the raw output can contain things like `ANTHROPIC_API_KEY=…`. We replace
-/// any entry that matches a conservative env-var pattern (uppercase
-/// identifier ending in `=`) with `KEY=<redacted>`. If *every* entry got
+/// any entry that matches an environment-variable assignment with
+/// `KEY=<redacted>`. Values that independently look like credentials are also
+/// redacted when they appear after a non-environment-looking key. If *every* entry got
 /// redacted then sysinfo's data for this process is too garbled to trust as
 /// argv, so we return `None` so the caller emits a JSON null rather than
 /// something misleading.
@@ -130,23 +131,61 @@ fn sanitize_cmd(cmd: impl IntoIterator<Item = String>) -> Option<Vec<String>> {
 }
 
 fn redact_env_var_entry(entry: String) -> String {
-    // Match `IDENT=...` where IDENT is at least two characters starting with
-    // an uppercase letter or underscore and otherwise uppercase/digit/under.
-    // CLI flags (`--foo=bar`, `-x=y`, `/path=value`) don't match.
     let Some(eq_index) = entry.find('=') else {
         return entry;
     };
     let key = &entry[..eq_index];
-    if !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        && key.starts_with(|c: char| c.is_ascii_uppercase() || c == '_')
-    {
+    let value = &entry[eq_index + 1..];
+    let is_env_assignment = !key.is_empty()
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+    if is_env_assignment || value_contains_url_credentials(value) || looks_like_long_token(value) {
         format!("{key}=<redacted>")
     } else {
         entry
     }
+}
+
+fn value_contains_url_credentials(value: &str) -> bool {
+    let Some((_, authority_and_path)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    authority.split_once('@').is_some_and(|(userinfo, _)| {
+        userinfo
+            .split_once(':')
+            .is_some_and(|(_, password)| !password.is_empty())
+    })
+}
+
+fn looks_like_long_token(value: &str) -> bool {
+    if value.len() < 32 || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    let has_lower = value.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = value.bytes().any(|byte| byte.is_ascii_uppercase());
+    let has_digit = value.bytes().any(|byte| byte.is_ascii_digit());
+    let has_symbol = value
+        .bytes()
+        .any(|byte| matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+' | b'='));
+    let character_classes = [has_lower, has_upper, has_digit, has_symbol]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    let mut seen = [false; 128];
+    let distinct_ascii = value
+        .bytes()
+        .filter(|byte| byte.is_ascii())
+        .filter(|byte| {
+            let first = !seen[usize::from(*byte)];
+            seen[usize::from(*byte)] = true;
+            first
+        })
+        .count();
+    character_classes >= 2 || distinct_ascii >= 12
 }
 
 #[cfg(test)]
@@ -175,6 +214,36 @@ mod tests {
         assert_redacts("TOKEN=abc=def=ghi", "TOKEN=<redacted>");
         // Empty value still redacts (and importantly, doesn't pretend to be a flag).
         assert_redacts("PASSWORD=", "PASSWORD=<redacted>");
+        assert_redacts(
+            "http_proxy=http://user:password@host",
+            "http_proxy=<redacted>",
+        );
+        assert_redacts("npm_config__auth=token", "npm_config__auth=<redacted>");
+        assert_redacts("Github_Token=token", "Github_Token=<redacted>");
+        assert_redacts(
+            "AwsSecretAccessKey=anything-at-all",
+            "AwsSecretAccessKey=<redacted>",
+        );
+        assert_redacts(
+            "--endpoint=https://user:password@example.com/path",
+            "--endpoint=<redacted>",
+        );
+        assert_redacts(
+            "--opaque=aBcdEFghIJklMNopQRstUVwxYZ0123456789_-",
+            "--opaque=<redacted>",
+        );
+        assert_redacts(
+            "--token=0123456789abcdef0123456789abcdef01234567",
+            "--token=<redacted>",
+        );
+        assert_redacts(
+            "--token=ABCDEF0123456789ABCDEF0123456789",
+            "--token=<redacted>",
+        );
+        assert_redacts(
+            "--opaque=abcdefghijklmnopqrstuvwxyzabcdefghijklmno",
+            "--opaque=<redacted>",
+        );
     }
 
     #[test]
@@ -182,6 +251,10 @@ mod tests {
         // CLI flags that happen to contain `=`.
         assert_redacts("--max-old-space-size=8092", "--max-old-space-size=8092");
         assert_redacts("-Dfoo=bar", "-Dfoo=bar");
+        assert_redacts(
+            "--endpoint=https://example.com/path",
+            "--endpoint=https://example.com/path",
+        );
         // Paths.
         assert_redacts("/opt/homebrew/bin/node", "/opt/homebrew/bin/node");
         // Bare strings without `=`.
@@ -190,11 +263,19 @@ mod tests {
             "npm exec mcp-remote https://example.com",
             "npm exec mcp-remote https://example.com",
         );
-        // Lowercase / mixed-case identifiers aren't env vars by convention; leave them.
-        assert_redacts("foo=bar", "foo=bar");
-        assert_redacts("camelCase=value", "camelCase=value");
+        // Lowercase and mixed-case assignments are valid environment entries.
+        assert_redacts("foo=bar", "foo=<redacted>");
+        assert_redacts("camelCase=value", "camelCase=<redacted>");
         // Pathological: `=value` with no key.
         assert_redacts("=value", "=value");
+    }
+
+    #[test]
+    fn drops_a_command_vector_when_every_entry_is_redacted() {
+        assert_eq!(
+            sanitize_cmd(["http_proxy=http://user:password@host".to_owned()]),
+            None
+        );
     }
 
     #[test]

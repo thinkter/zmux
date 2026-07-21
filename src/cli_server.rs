@@ -730,10 +730,7 @@ impl CliServer {
     /// Send through the per-terminal endpoint inherited in
     /// [`NOTIFY_ENDPOINT_ENV`].
     pub fn notify(notification: CliNotification) -> anyhow::Result<()> {
-        let endpoint = std::env::var(NOTIFY_ENDPOINT_ENV).with_context(|| {
-            format!("{NOTIFY_ENDPOINT_ENV} is not set; run `zmux notify` inside a zmux terminal")
-        })?;
-        let endpoint = endpoint.parse::<CliEndpoint>()?;
+        let endpoint = notification_endpoint_from_env(std::env::var(NOTIFY_ENDPOINT_ENV).ok())?;
         Self::send_to(&endpoint, notification)
     }
 
@@ -854,6 +851,15 @@ impl CliServer {
             ),
         }
     }
+}
+
+fn notification_endpoint_from_env(value: Option<String>) -> anyhow::Result<CliEndpoint> {
+    let endpoint = value
+        .filter(|endpoint| !endpoint.is_empty())
+        .with_context(|| {
+            format!("{NOTIFY_ENDPOINT_ENV} is not set; run `zmux notify` inside a zmux terminal")
+        })?;
+    endpoint.parse()
 }
 
 enum SendAttempt {
@@ -1429,6 +1435,17 @@ mod tests {
         assert!(!format!("{parsed:?}").contains(&parsed.token));
         assert!(!format!("{registration:?}").contains(&encode_hex(&parsed.proof_key)));
         assert!(!format!("{registration:?}").contains(&parsed.token));
+    }
+
+    #[test]
+    fn empty_inherited_endpoint_is_reported_as_unset() {
+        let error = notification_endpoint_from_env(Some(String::new())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ZMUX_NOTIFY_ENDPOINT is not set"),
+            "{error:#}"
+        );
     }
 
     #[test]

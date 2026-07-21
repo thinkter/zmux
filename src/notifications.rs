@@ -6,7 +6,7 @@
 //! as a GPUI entity gives every window a single observable source of truth.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::SystemTime,
 };
 
@@ -140,6 +140,34 @@ pub struct Notification {
 pub struct RecordOutcome {
     pub notification: Notification,
     pub removed: Vec<Notification>,
+    replaced_unread: bool,
+}
+
+impl RecordOutcome {
+    /// Terminal routes whose unread count changed as a result of this record.
+    ///
+    /// Replacements can remove an unread row and insert its unread successor,
+    /// while capacity eviction can affect a different route. Computing the
+    /// net delta keeps both cases exact and avoids repainting a route whose
+    /// badge/count is unchanged.
+    pub fn unread_count_changed_targets(&self) -> HashSet<NotificationTarget> {
+        let mut deltas = HashMap::<NotificationTarget, isize>::new();
+        *deltas.entry(self.notification.target).or_default() += 1;
+        if self.replaced_unread {
+            *deltas.entry(self.notification.target).or_default() -= 1;
+        }
+        for notification in self
+            .removed
+            .iter()
+            .filter(|notification| !notification.read)
+        {
+            *deltas.entry(notification.target).or_default() -= 1;
+        }
+        deltas
+            .into_iter()
+            .filter_map(|(target, delta)| (delta != 0).then_some(target))
+            .collect()
+    }
 }
 
 /// Observable app-global notification history.
@@ -218,7 +246,7 @@ impl NotificationStore {
         };
 
         let mut removed = Vec::new();
-        let reused_id = match &request.identity {
+        let (reused_id, replaced_unread) = match &request.identity {
             NotificationIdentity::Target => {
                 let mut retained = VecDeque::with_capacity(self.notifications.len());
                 while let Some(notification) = self.notifications.pop_front() {
@@ -229,7 +257,7 @@ impl NotificationStore {
                     }
                 }
                 self.notifications = retained;
-                None
+                (None, false)
             }
             NotificationIdentity::KittyNamed(identifier) => self
                 .notifications
@@ -242,8 +270,10 @@ impl NotificationStore {
                         )
                 })
                 .and_then(|index| self.notifications.remove(index))
-                .map(|notification| notification.id),
-            NotificationIdentity::Unique => None,
+                .map_or((None, false), |notification| {
+                    (Some(notification.id), !notification.read)
+                }),
+            NotificationIdentity::Unique => (None, false),
         };
 
         let id = reused_id.unwrap_or_else(|| {
@@ -273,6 +303,7 @@ impl NotificationStore {
         Some(RecordOutcome {
             notification,
             removed,
+            replaced_unread,
         })
     }
 
@@ -573,6 +604,7 @@ mod tests {
         let target = target(1, 1, 1);
         let first = record(&mut store, request(target, "first"));
         let outcome = store.record(request(target, "second")).unwrap();
+        let changed_targets = outcome.unread_count_changed_targets();
         let second = outcome.notification;
 
         assert_ne!(first.id, second.id);
@@ -583,6 +615,10 @@ mod tests {
         assert_eq!(store.notifications().count(), 1);
         assert_eq!(store.notifications().next().unwrap().title, "second");
         assert!(store.get(first.id).is_none());
+        assert!(
+            changed_targets.is_empty(),
+            "an unread replacement leaves the route's badge count unchanged"
+        );
     }
 
     #[test]
@@ -591,6 +627,7 @@ mod tests {
         let first = record(&mut store, request(target(1, 1, 1), "one"));
         record(&mut store, request(target(1, 1, 2), "two"));
         let outcome = store.record(request(target(1, 2, 3), "three")).unwrap();
+        let changed_targets = outcome.unread_count_changed_targets();
         let third = outcome.notification;
 
         assert_eq!(store.notifications().count(), 2);
@@ -599,6 +636,11 @@ mod tests {
         assert_eq!(
             outcome.removed.iter().map(|row| row.id).collect::<Vec<_>>(),
             [first.id]
+        );
+        assert_eq!(
+            changed_targets,
+            HashSet::from([third.target, first.target]),
+            "recording and cross-route eviction both change badge counts"
         );
     }
 
@@ -639,12 +681,27 @@ mod tests {
         let mut update_a = request(target, "a2");
         update_a.identity = NotificationIdentity::KittyNamed("a".to_owned());
         let outcome = store.record(update_a).unwrap();
+        let changed_targets = outcome.unread_count_changed_targets();
 
         assert_eq!(outcome.notification.id, a.id);
         assert!(outcome.removed.is_empty());
+        assert!(
+            changed_targets.is_empty(),
+            "an unread named update must not change the route's unread count"
+        );
         assert_eq!(store.notifications().count(), 2);
         assert_eq!(store.get(a.id).unwrap().title, "a2");
         assert_eq!(store.get(b.id).unwrap().title, "b");
+
+        assert!(store.mark_read(a.id));
+        let mut update_read_a = request(target, "a3");
+        update_read_a.identity = NotificationIdentity::KittyNamed("a".to_owned());
+        let outcome = store.record(update_read_a).unwrap();
+        assert_eq!(
+            outcome.unread_count_changed_targets(),
+            HashSet::from([target]),
+            "a read named row becoming unread must repaint its route"
+        );
     }
 
     #[test]
@@ -656,10 +713,17 @@ mod tests {
         let first = record(&mut store, first);
         let mut second = request(target, "second");
         second.identity = NotificationIdentity::Unique;
-        let second = record(&mut store, second);
+        let outcome = store.record(second).unwrap();
+        let changed_targets = outcome.unread_count_changed_targets();
+        let second = outcome.notification;
 
         assert_ne!(first.id, second.id);
         assert_eq!(store.notifications().count(), 2);
+        assert_eq!(
+            changed_targets,
+            HashSet::from([target]),
+            "a second unread row must repaint an already-unread route's count"
+        );
     }
 
     #[test]
