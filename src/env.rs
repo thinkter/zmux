@@ -27,17 +27,9 @@ pub fn terminal_env_with_notification_endpoint(
         ("ZED_TERM".to_string(), "true".to_string()),
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
-        // Do not advertise outer terminal image protocols unless zmux renders them.
-        ("KITTY_WINDOW_ID".to_string(), String::new()),
-        ("KITTY_PID".to_string(), String::new()),
-        ("KITTY_PUBLIC_KEY".to_string(), String::new()),
-        ("KITTY_INSTALLATION_DIR".to_string(), String::new()),
-        ("WEZTERM_PANE".to_string(), String::new()),
-        ("GHOSTTY_RESOURCES_DIR".to_string(), String::new()),
-        // PTY children inherit process variables that are not explicitly
-        // overridden. Scrub an endpoint inherited from an outer zmux process;
-        // registered terminals replace this empty value below.
-        (NOTIFY_ENDPOINT_ENV.to_string(), String::new()),
+        // The PTY launcher removes outer-terminal identity variables before
+        // applying these overrides. Do not reinsert them with empty values:
+        // programs commonly use presence, rather than contents, for detection.
     ]);
 
     // Packaged macOS/Windows launchers are commonly outside the user's PATH.
@@ -94,7 +86,17 @@ mod tests {
         let env = terminal_env();
 
         assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("zmux"));
-        assert_eq!(env.get(NOTIFY_ENDPOINT_ENV).map(String::as_str), Some(""));
+        assert!(!env.contains_key(NOTIFY_ENDPOINT_ENV));
+        for key in [
+            "KITTY_WINDOW_ID",
+            "KITTY_PID",
+            "KITTY_PUBLIC_KEY",
+            "KITTY_INSTALLATION_DIR",
+            "WEZTERM_PANE",
+            "GHOSTTY_RESOURCES_DIR",
+        ] {
+            assert!(!env.contains_key(key), "{key} must remain unset");
+        }
     }
 
     #[test]

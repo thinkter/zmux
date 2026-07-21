@@ -81,7 +81,9 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-u", JumpToLatestNotification, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-shift-m", NotifyCurrentPane, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-shift-u", JumpToLatestNotification, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-i", ToggleNotificationCenter, None),
         KeyBinding::new("ctrl-shift-i", ToggleNotificationCenter, None),
         KeyBinding::new("ctrl-tab", tab_switcher::Toggle::default(), None),
@@ -112,9 +114,13 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-+", IncreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl--", DecreaseBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl-0", ResetBufferFontSize { persist: false }, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-=", IncreaseBufferFontSize { persist: false }, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-+", IncreaseBufferFontSize { persist: false }, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd--", DecreaseBufferFontSize { persist: false }, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-0", ResetBufferFontSize { persist: false }, None),
         KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("cmd-,", OpenSettings, None),

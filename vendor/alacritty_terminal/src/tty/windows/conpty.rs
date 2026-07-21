@@ -274,6 +274,22 @@ fn convert_custom_env(custom_env: &HashMap<String, String>) -> Option<Vec<u16>> 
         }
     }
 
+    // Do not inherit identity/capability variables from an outer terminal.
+    // Explicit custom values above remain in the block (notably a freshly
+    // minted per-terminal zmux endpoint), while absent keys are suppressed
+    // from the process-environment merge below.
+    for scrubbed_key in [
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+        "KITTY_PUBLIC_KEY",
+        "KITTY_INSTALLATION_DIR",
+        "WEZTERM_PANE",
+        "GHOSTTY_RESOURCES_DIR",
+        "ZMUX_NOTIFY_ENDPOINT",
+    ] {
+        all_env_keys.insert(OsStr::new(scrubbed_key).to_ascii_uppercase());
+    }
+
     // Pull the current process environment after, to avoid overwriting the user provided one.
     for (inherited_key, inherited_value) in std::env::vars_os() {
         if all_env_keys.insert(inherited_key.to_ascii_uppercase()) {

@@ -16,7 +16,10 @@ notification capability before the terminal is mounted.
   notification. The queue is cleared only by an exact watermark ACK written
   back through the terminal; stale ACKs replay the current envelope instead.
   Ordinary process titles remain separate state and are emitted after the
-  replay is acknowledged.
+  replay is acknowledged. Its Unix PTY launcher also removes inherited Kitty,
+  WezTerm, Ghostty, and zmux route identity variables before applying the
+  exact child environment, so presence-based terminal detection cannot see an
+  outer emulator.
 - `terminal_view/` is Zed commit
   `abbe85a3321bf6cb7f5b241e623d9c2e16c29187`. It adds one application-owned
   terminal factory hook and uses it for direct split cloning and persisted
@@ -30,7 +33,9 @@ notification capability before the terminal is mounted.
   a host repository-scope policy used by zmux's logical workspaces. The local
   manifest also reproduces Zed's Git UI lint policy explicitly so the vendored
   crate keeps correctness lints enabled without turning upstream style lints
-  into release failures.
+  into release failures. Runtime diagnostics redact lowercase and mixed-case
+  environment assignments plus credential-shaped values before producing a
+  shareable process dump.
 
 The marker prefix is `U+001F + "zmux-osc-notification-v1:"`. Keep it identical
 to `OSC_NOTIFICATION_TITLE_PREFIX` in `src/osc.rs`. The application consumes
@@ -43,5 +48,6 @@ The original VTE and Alacritty licenses and upstream README files are retained
 inside their crate directories. The terminal-view and Git UI snapshots are
 GPL-3.0-or-later and their vendored license paths resolve to the repository's
 root `LICENSE`. Local modifications are limited to the notification
-bridge/factory hook, Git UI repository scoping and feature gates, their tests,
-and standalone Cargo metadata needed for path patches.
+bridge/factory hook and PTY environment scrubbing, Git UI repository scoping,
+diagnostic redaction and feature gates, their tests, and standalone Cargo
+metadata needed for path patches.

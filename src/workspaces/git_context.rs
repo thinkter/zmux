@@ -35,6 +35,13 @@ const METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 struct GitRootCacheEntry {
     root: Option<PathBuf>,
     checked_at: Instant,
+    last_access: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalPathCacheEntry {
+    identity: Option<PathBuf>,
+    last_access: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,69 +59,146 @@ pub(super) enum GitRootRecheck {
 /// Windows verbatim paths never leak into labels or persisted sessions.
 #[derive(Debug, Default)]
 pub(super) struct PathContextCache {
-    canonical_paths: HashMap<PathBuf, Option<PathBuf>>,
+    canonical_paths: HashMap<PathBuf, CanonicalPathCacheEntry>,
     git_roots: HashMap<PathBuf, GitRootCacheEntry>,
+    access_sequence: u64,
 }
 
 impl PathContextCache {
-    fn insert_bounded<T>(map: &mut HashMap<PathBuf, T>, key: PathBuf, value: T) {
-        if !map.contains_key(&key) && map.len() >= PATH_CONTEXT_CACHE_CAPACITY {
-            map.clear();
+    fn next_access(&mut self) -> u64 {
+        self.access_sequence = self.access_sequence.saturating_add(1);
+        self.access_sequence
+    }
+
+    fn evict_canonical_lru(&mut self, incoming: &Path) {
+        if self.canonical_paths.contains_key(incoming)
+            || self.canonical_paths.len() < PATH_CONTEXT_CACHE_CAPACITY
+        {
+            return;
         }
-        map.insert(key, value);
+        if let Some(oldest) = self
+            .canonical_paths
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(path, _)| path.clone())
+        {
+            self.canonical_paths.remove(&oldest);
+        }
     }
 
-    fn canonical_identity(&mut self, path: &Path) -> Option<PathBuf> {
-        self.canonical_identity_with(path, |path| std::fs::canonicalize(path))
+    fn evict_git_root_lru(&mut self, incoming: &Path) {
+        if self.git_roots.contains_key(incoming)
+            || self.git_roots.len() < PATH_CONTEXT_CACHE_CAPACITY
+        {
+            return;
+        }
+        if let Some(oldest) = self
+            .git_roots
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(path, _)| path.clone())
+        {
+            self.git_roots.remove(&oldest);
+        }
     }
 
+    fn cached_canonical_identity(&mut self, path: &Path) -> Option<Option<PathBuf>> {
+        let access = self.next_access();
+        let entry = self.canonical_paths.get_mut(path)?;
+        entry.last_access = access;
+        Some(entry.identity.clone())
+    }
+
+    fn insert_canonical_identity(&mut self, path: PathBuf, identity: Option<PathBuf>) {
+        let access = self.next_access();
+        self.evict_canonical_lru(&path);
+        self.canonical_paths.insert(
+            path,
+            CanonicalPathCacheEntry {
+                identity,
+                last_access: access,
+            },
+        );
+    }
+
+    #[cfg(test)]
     fn canonical_identity_with(
         &mut self,
         path: &Path,
         resolve: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
     ) -> Option<PathBuf> {
-        if let Some(identity) = self.canonical_paths.get(path) {
-            return identity.clone();
+        let access = self.next_access();
+        if let Some(entry) = self.canonical_paths.get_mut(path) {
+            entry.last_access = access;
+            return entry.identity.clone();
         }
         let identity = resolve(path).ok();
-        Self::insert_bounded(
-            &mut self.canonical_paths,
+        self.evict_canonical_lru(path);
+        self.canonical_paths.insert(
             path.to_path_buf(),
-            identity.clone(),
+            CanonicalPathCacheEntry {
+                identity: identity.clone(),
+                last_access: access,
+            },
         );
         identity
     }
 
-    fn paths_match(&mut self, left: &Path, right: &Path) -> bool {
-        left == right
-            || self
-                .canonical_identity(left)
-                .zip(self.canonical_identity(right))
+    fn paths_match_cached(&mut self, left: &Path, right: &Path) -> bool {
+        if left == right {
+            return true;
+        }
+        let left_identity = self.cached_canonical_identity(left).flatten();
+        let right_identity = self.cached_canonical_identity(right).flatten();
+        left_identity.as_deref() == Some(right)
+            || right_identity.as_deref() == Some(left)
+            || left_identity
+                .zip(right_identity)
                 .is_some_and(|(left, right)| left == right)
     }
 
-    fn nearest_git_root(&mut self, directory: &Path) -> Option<PathBuf> {
-        self.nearest_git_root_with(directory, |candidate| candidate.join(".git").exists())
+    fn cached_nearest_git_root(&mut self, directory: &Path) -> Option<Option<PathBuf>> {
+        let access = self.next_access();
+        let entry = self.git_roots.get_mut(directory)?;
+        entry.last_access = access;
+        Some(entry.root.clone())
     }
 
+    fn insert_git_root(&mut self, directory: PathBuf, root: Option<PathBuf>, checked_at: Instant) {
+        let access = self.next_access();
+        self.evict_git_root_lru(&directory);
+        self.git_roots.insert(
+            directory,
+            GitRootCacheEntry {
+                root,
+                checked_at,
+                last_access: access,
+            },
+        );
+    }
+
+    #[cfg(test)]
     fn nearest_git_root_with(
         &mut self,
         directory: &Path,
         is_git_root: impl Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
-        if let Some(cached) = self.git_roots.get(directory) {
+        let access = self.next_access();
+        if let Some(cached) = self.git_roots.get_mut(directory) {
+            cached.last_access = access;
             return cached.root.clone();
         }
         let root = directory
             .ancestors()
             .find(|ancestor| is_git_root(ancestor))
             .map(Path::to_path_buf);
-        Self::insert_bounded(
-            &mut self.git_roots,
+        self.evict_git_root_lru(directory);
+        self.git_roots.insert(
             directory.to_path_buf(),
             GitRootCacheEntry {
                 root: root.clone(),
                 checked_at: Instant::now(),
+                last_access: access,
             },
         );
         root
@@ -125,9 +209,11 @@ impl PathContextCache {
         directory: &Path,
         interval: Duration,
     ) -> GitRootRecheck {
-        let Some(cached) = self.git_roots.get(directory) else {
+        let access = self.next_access();
+        let Some(cached) = self.git_roots.get_mut(directory) else {
             return GitRootRecheck::Missing;
         };
+        cached.last_access = access;
         if cached.root.is_some() {
             return GitRootRecheck::Positive;
         }
@@ -142,7 +228,8 @@ impl PathContextCache {
 
     fn invalidate_root(&mut self, root: &Path) -> Vec<PathBuf> {
         let mut identities = vec![root.to_path_buf()];
-        if let Some(Some(identity)) = self.canonical_paths.get(root)
+        if let Some(entry) = self.canonical_paths.get(root)
+            && let Some(identity) = entry.identity.as_ref()
             && identity != root
         {
             identities.push(identity.clone());
@@ -153,8 +240,8 @@ impl PathContextCache {
                 .any(|identity| path == identity || path.starts_with(identity))
         };
 
-        self.canonical_paths.retain(|logical, canonical| {
-            !belongs_to_root(logical) && !canonical.as_deref().is_some_and(&belongs_to_root)
+        self.canonical_paths.retain(|logical, entry| {
+            !belongs_to_root(logical) && !entry.identity.as_deref().is_some_and(&belongs_to_root)
         });
         let removed = self
             .git_roots
@@ -219,16 +306,43 @@ impl IndexRootBlockReason {
     }
 }
 
-fn index_root_block_reason(root: &Path) -> Option<IndexRootBlockReason> {
-    index_root_block_reason_with(
-        root,
-        paths::home_dir().as_path(),
-        paths::data_dir().as_path(),
-        |path| path.join(".git").exists(),
-        |path| std::fs::canonicalize(path),
-    )
+fn index_root_block_reason(
+    root: &Path,
+    cache: &Mutex<PathContextCache>,
+) -> Option<IndexRootBlockReason> {
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| {
+        log::error!("recovering poisoned path context cache during admission check");
+        poisoned.into_inner()
+    });
+    let Some(discovered_root) = cache.cached_nearest_git_root(root) else {
+        return Some(IndexRootBlockReason::Unverifiable);
+    };
+    let Some(discovered_root) = discovered_root else {
+        return Some(IndexRootBlockReason::NotGitRepository);
+    };
+    if !cache.paths_match_cached(root, &discovered_root) {
+        return Some(IndexRootBlockReason::NotGitRepository);
+    }
+    let Some(root) = cache.cached_canonical_identity(root).flatten() else {
+        return Some(IndexRootBlockReason::Unverifiable);
+    };
+    if root.parent().is_none() {
+        return Some(IndexRootBlockReason::ProtectedLocation);
+    }
+
+    for protected in [paths::home_dir().as_path(), paths::data_dir().as_path()] {
+        let protected = cache
+            .cached_canonical_identity(protected)
+            .flatten()
+            .unwrap_or_else(|| protected.to_path_buf());
+        if protected.starts_with(&root) {
+            return Some(IndexRootBlockReason::ProtectedLocation);
+        }
+    }
+    None
 }
 
+#[cfg(test)]
 fn index_root_block_reason_with(
     root: &Path,
     home: &Path,
@@ -427,7 +541,7 @@ fn workspace_attachment_roots(
         .iter()
         .chain(entry.promoted_git_roots.iter())
     {
-        if index_root_block_reason(root).is_none() {
+        if index_root_block_reason(root, cache).is_none() {
             push_unique_logical_path(&mut roots, root.clone(), cache);
         }
     }
@@ -445,6 +559,14 @@ fn metadata_probe_is_current(
     requested_generation: u64,
 ) -> bool {
     current_generation == requested_generation && current_root == Some(requested_root)
+}
+
+pub(super) fn accept_workspace_context_probe_result(
+    current_generation: Option<u64>,
+    requested_generation: u64,
+    observed: WorkspaceContext,
+) -> Option<WorkspaceContext> {
+    (current_generation == Some(requested_generation)).then_some(observed)
 }
 
 /// Bridges the vendored Zed Git panel to zmux's logical workspaces.
@@ -635,7 +757,7 @@ impl WorkspacesPanel {
                         })
                     })
             })
-            .filter(|root| index_root_block_reason(root).is_none())
+            .filter(|root| index_root_block_reason(root, &self.path_context_cache).is_none())
     }
 
     fn open_git_roots(&self) -> Vec<PathBuf> {
@@ -651,7 +773,7 @@ impl WorkspacesPanel {
                 .chain(&entry.worktree_paths)
                 .cloned()
             {
-                if index_root_block_reason(&root).is_none() {
+                if index_root_block_reason(&root, &self.path_context_cache).is_none() {
                     push_unique_logical_path(&mut roots, root, &self.path_context_cache);
                 }
             }
@@ -659,7 +781,7 @@ impl WorkspacesPanel {
                 .default_directory
                 .as_deref()
                 .and_then(|directory| nearest_git_root(&self.path_context_cache, directory))
-                && index_root_block_reason(&root).is_none()
+                && index_root_block_reason(&root, &self.path_context_cache).is_none()
             {
                 push_unique_logical_path(&mut roots, root, &self.path_context_cache);
             }
@@ -685,7 +807,7 @@ impl WorkspacesPanel {
             .chain(entry.promoted_git_roots.iter())
             .chain(entry.worktree_paths.iter())
         {
-            if index_root_block_reason(root).is_none() {
+            if index_root_block_reason(root, &self.path_context_cache).is_none() {
                 push_unique_logical_path(&mut roots, root.clone(), &self.path_context_cache);
             }
         }
@@ -718,7 +840,7 @@ impl WorkspacesPanel {
         root: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if index_root_block_reason(&root).is_some() {
+        if index_root_block_reason(&root, &self.path_context_cache).is_some() {
             return;
         }
         let Some(index) = self
@@ -846,7 +968,12 @@ impl WorkspacesPanel {
             // terminal has reported one. They need not match the snapshot: a
             // shell rc file may intentionally cd elsewhere, or a repository
             // may have been deleted since the previous launch.
-            if entry.context_authoritative {
+            let restored_shell_count = entry
+                .restore
+                .as_ref()
+                .map(layout_snapshot_terminal_count)
+                .unwrap_or_default();
+            if entry.context_authoritative && entry.context.shell_count >= restored_shell_count {
                 entry.restore = None;
                 entry.git_discovery = GitDiscoveryState::Authoritative;
                 changed = true;
@@ -937,7 +1064,12 @@ impl WorkspacesPanel {
                             ) =>
                         {
                             this.attached_worktrees.insert(root.clone(), worktree);
-                            this.invalidate_path_context_for_root(&root);
+                            // Attaching a Project worktree does not change the
+                            // repository on disk. Keep the background-probed
+                            // admission identities warm; clearing them here
+                            // would make the next cache-only reconciliation
+                            // classify this valid root as unverifiable and
+                            // immediately detach it again.
                             this.activate_selected_repository(cx);
                             this.request_metadata_refreshes(cx);
                         }
@@ -1002,7 +1134,7 @@ impl WorkspacesPanel {
             return;
         }
 
-        if let Some(reason) = index_root_block_reason(&root) {
+        if let Some(reason) = index_root_block_reason(&root, &self.path_context_cache) {
             log::warn!(
                 "removing inadmissible Zmux worktree {}: {}",
                 root.display(),
@@ -1052,8 +1184,8 @@ impl WorkspacesPanel {
             if self.warned_scan_roots.contains(&root) {
                 continue;
             }
-            let reason =
-                index_root_block_reason(&root).unwrap_or(IndexRootBlockReason::Unverifiable);
+            let reason = index_root_block_reason(&root, &self.path_context_cache)
+                .unwrap_or(IndexRootBlockReason::Unverifiable);
             self.show_blocked_root_notification(root, reason, cx);
         }
     }
@@ -1326,9 +1458,21 @@ impl WorkspacesPanel {
     }
 }
 
+fn layout_snapshot_terminal_count(snapshot: &crate::session::LayoutSnapshot) -> usize {
+    fn count(node: &crate::session::LayoutNodeSnapshot) -> usize {
+        match node {
+            crate::session::LayoutNodeSnapshot::Leaf { tabs, .. } => tabs.len(),
+            crate::session::LayoutNodeSnapshot::Split { first, second, .. } => {
+                count(first) + count(second)
+            }
+        }
+    }
+
+    count(&snapshot.root)
+}
+
 pub(super) fn workspace_context_for_active_workspace(
     workspace: &Workspace,
-    cache: &Mutex<PathContextCache>,
     cx: &App,
 ) -> WorkspaceContext {
     let mut context = WorkspaceContext::default();
@@ -1337,12 +1481,11 @@ pub(super) fn workspace_context_for_active_workspace(
             add_item_to_workspace_context(item.as_ref(), &mut context, cx);
         }
     }
-    finalize_workspace_context(context, cache)
+    context
 }
 
 pub(super) fn workspace_context_for_stored_layout(
     layout: &StoredLayout,
-    cache: &Mutex<PathContextCache>,
     cx: &App,
 ) -> WorkspaceContext {
     fn visit(layout: &StoredLayout, context: &mut WorkspaceContext, cx: &App) {
@@ -1361,7 +1504,7 @@ pub(super) fn workspace_context_for_stored_layout(
 
     let mut context = WorkspaceContext::default();
     visit(layout, &mut context, cx);
-    finalize_workspace_context(context, cache)
+    context
 }
 
 fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceContext, cx: &App) {
@@ -1383,12 +1526,20 @@ fn add_item_to_workspace_context(item: &dyn ItemHandle, context: &mut WorkspaceC
     }
 }
 
-fn finalize_workspace_context(
+pub(super) fn finalize_workspace_context(
     mut context: WorkspaceContext,
     cache: &Mutex<PathContextCache>,
 ) -> WorkspaceContext {
+    // Admission checks on the foreground path are cache-only. Warm protected
+    // identities here alongside cwd/root identities so symlink aliases cannot
+    // bypass the protected-root policy without reintroducing UI-thread I/O.
     context.working_directories.sort();
     context.working_directories.dedup();
+    for directory in &context.working_directories {
+        probe_canonical_identity(cache, directory);
+    }
+    probe_canonical_identity(cache, paths::home_dir().as_path());
+    probe_canonical_identity(cache, paths::data_dir().as_path());
 
     let processes = context
         .foreground_processes
@@ -1401,16 +1552,20 @@ fn finalize_workspace_context(
     for root in context
         .working_directories
         .iter()
-        .filter_map(|directory| nearest_git_root(cache, directory))
+        .filter_map(|directory| probe_nearest_git_root(cache, directory))
     {
-        let destination = if index_root_block_reason(&root).is_some() {
+        // The ancestor lookup caches `directory -> root`; admission asks the
+        // distinct question `root -> root`, so seed that exact entry too.
+        probe_nearest_git_root(cache, &root);
+        probe_canonical_identity(cache, &root);
+        let destination = if index_root_block_reason(&root, cache).is_some() {
             &mut blocked_roots
         } else {
             &mut roots
         };
         if !destination
             .iter()
-            .any(|existing| paths_match(cache, existing, &root))
+            .any(|existing| probe_paths_match(cache, existing, &root))
         {
             destination.push(root);
         }
@@ -1425,6 +1580,82 @@ fn finalize_workspace_context(
     context
 }
 
+/// Warm cache-only foreground admission for explicit workspace roots without
+/// adding those paths to the terminal-derived context.
+pub(super) fn warm_workspace_git_root_candidates(
+    candidates: &[PathBuf],
+    cache: &Mutex<PathContextCache>,
+) {
+    probe_canonical_identity(cache, paths::home_dir().as_path());
+    probe_canonical_identity(cache, paths::data_dir().as_path());
+    for candidate in candidates {
+        probe_canonical_identity(cache, candidate);
+        if let Some(root) = probe_nearest_git_root(cache, candidate) {
+            probe_nearest_git_root(cache, &root);
+            probe_canonical_identity(cache, &root);
+        }
+    }
+}
+
+/// Resolve a Git root on a background executor without retaining the shared
+/// cache lock across filesystem calls. A wedged mount can delay only the probe
+/// that touched it; foreground cache readers remain responsive.
+fn probe_nearest_git_root(cache: &Mutex<PathContextCache>, directory: &Path) -> Option<PathBuf> {
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache during Git-root lookup");
+            poisoned.into_inner()
+        })
+        .cached_nearest_git_root(directory);
+    if let Some(root) = cached {
+        return root;
+    }
+
+    let root = directory
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf);
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache after Git-root lookup");
+            poisoned.into_inner()
+        })
+        .insert_git_root(directory.to_path_buf(), root.clone(), Instant::now());
+    root
+}
+
+fn probe_canonical_identity(cache: &Mutex<PathContextCache>, path: &Path) -> Option<PathBuf> {
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache during canonical lookup");
+            poisoned.into_inner()
+        })
+        .cached_canonical_identity(path);
+    if let Some(identity) = cached {
+        return identity;
+    }
+
+    let identity = std::fs::canonicalize(path).ok();
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache after canonical lookup");
+            poisoned.into_inner()
+        })
+        .insert_canonical_identity(path.to_path_buf(), identity.clone());
+    identity
+}
+
+fn probe_paths_match(cache: &Mutex<PathContextCache>, left: &Path, right: &Path) -> bool {
+    left == right
+        || probe_canonical_identity(cache, left)
+            .zip(probe_canonical_identity(cache, right))
+            .is_some_and(|(left, right)| left == right)
+}
+
 fn nearest_git_root(cache: &Mutex<PathContextCache>, directory: &Path) -> Option<PathBuf> {
     cache
         .lock()
@@ -1432,7 +1663,8 @@ fn nearest_git_root(cache: &Mutex<PathContextCache>, directory: &Path) -> Option
             log::error!("recovering poisoned path context cache during Git-root lookup");
             poisoned.into_inner()
         })
-        .nearest_git_root(directory)
+        .cached_nearest_git_root(directory)
+        .flatten()
 }
 
 fn blocked_root_notification_id(root: &Path) -> NotificationId {
@@ -1452,11 +1684,13 @@ fn paths_match(cache: &Mutex<PathContextCache>, left: &Path, right: &Path) -> bo
             log::error!("recovering poisoned path context cache during path comparison");
             poisoned.into_inner()
         })
-        .paths_match(left, right)
+        .paths_match_cached(left, right)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::session::{LayoutNodeSnapshot, LayoutSnapshot, TerminalSnapshot};
 
@@ -1500,6 +1734,31 @@ mod tests {
 
     fn path_cache() -> Mutex<PathContextCache> {
         Mutex::new(PathContextCache::default())
+    }
+
+    async fn initialize_zmux(cx: &mut gpui::TestAppContext) {
+        let initialization = cx.update(crate::app::init_zmux);
+        initialization.await;
+    }
+
+    async fn warm_git_context_cache(
+        panel: &Entity<WorkspacesPanel>,
+        directories: Vec<PathBuf>,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cache = panel.read_with(cx, |panel, _| panel.path_context_cache.clone());
+        let probe = cx.update(|cx| {
+            cx.background_spawn(async move {
+                finalize_workspace_context(
+                    WorkspaceContext {
+                        working_directories: directories,
+                        ..WorkspaceContext::default()
+                    },
+                    cache.as_ref(),
+                )
+            })
+        });
+        let _ = probe.await;
     }
 
     #[test]
@@ -1568,7 +1827,16 @@ mod tests {
         std::fs::create_dir_all(&physical).unwrap();
         std::os::unix::fs::symlink(&physical, &logical).unwrap();
 
-        assert!(paths_match(&path_cache(), &logical, &physical));
+        let cache = path_cache();
+        assert!(
+            !paths_match(&cache, &logical, &physical),
+            "foreground comparisons must not resolve uncached filesystem aliases"
+        );
+        assert_eq!(
+            probe_canonical_identity(&cache, &logical),
+            Some(physical.clone())
+        );
+        assert!(paths_match(&cache, &logical, &physical));
         assert_ne!(logical, physical);
 
         std::fs::remove_dir_all(base).unwrap();
@@ -1579,7 +1847,9 @@ mod tests {
     fn path_identity_matches_macos_var_alias() {
         let logical = PathBuf::from("/var");
         let physical = PathBuf::from("/private/var");
-        assert!(paths_match(&path_cache(), &logical, &physical));
+        let cache = path_cache();
+        assert!(probe_paths_match(&cache, &logical, &physical));
+        assert!(paths_match(&cache, &logical, &physical));
         assert_eq!(logical, PathBuf::from("/var"));
     }
 
@@ -1588,7 +1858,9 @@ mod tests {
     fn path_identity_matches_windows_verbatim_canonical_form() {
         let logical = std::env::temp_dir();
         let canonical = logical.canonicalize().unwrap();
-        assert!(paths_match(&path_cache(), &logical, &canonical));
+        let cache = path_cache();
+        assert!(probe_paths_match(&cache, &logical, &canonical));
+        assert!(paths_match(&cache, &logical, &canonical));
         assert_eq!(logical, std::env::temp_dir());
     }
 
@@ -1633,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn path_context_cache_clears_each_map_at_capacity() {
+    fn path_context_cache_evicts_only_the_lru_entry_at_capacity() {
         let mut cache = PathContextCache::default();
         for index in 0..PATH_CONTEXT_CACHE_CAPACITY {
             cache.canonical_identity_with(Path::new(&format!("/path-{index}")), |_| {
@@ -1644,12 +1916,26 @@ mod tests {
         assert_eq!(cache.canonical_paths.len(), PATH_CONTEXT_CACHE_CAPACITY);
         assert_eq!(cache.git_roots.len(), PATH_CONTEXT_CACHE_CAPACITY);
 
+        // Refresh the oldest entries so the next-oldest entries are selected
+        // for eviction rather than dropping the still-hot cache wholesale.
+        cache.canonical_identity_with(Path::new("/path-0"), |_| {
+            panic!("a retained canonical entry must not be resolved again")
+        });
+        cache.nearest_git_root_with(Path::new("/repo-0"), |_| {
+            panic!("a retained Git-root entry must not be probed again")
+        });
         cache.canonical_identity_with(Path::new("/overflow"), |_| {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         });
         cache.nearest_git_root_with(Path::new("/repo-overflow"), |_| false);
-        assert_eq!(cache.canonical_paths.len(), 1);
-        assert_eq!(cache.git_roots.len(), 1);
+        assert_eq!(cache.canonical_paths.len(), PATH_CONTEXT_CACHE_CAPACITY);
+        assert_eq!(cache.git_roots.len(), PATH_CONTEXT_CACHE_CAPACITY);
+        assert!(cache.canonical_paths.contains_key(Path::new("/path-0")));
+        assert!(!cache.canonical_paths.contains_key(Path::new("/path-1")));
+        assert!(cache.canonical_paths.contains_key(Path::new("/overflow")));
+        assert!(cache.git_roots.contains_key(Path::new("/repo-0")));
+        assert!(!cache.git_roots.contains_key(Path::new("/repo-1")));
+        assert!(cache.git_roots.contains_key(Path::new("/repo-overflow")));
     }
 
     #[test]
@@ -1678,17 +1964,26 @@ mod tests {
         let mut cache = PathContextCache::default();
         let root_a = Path::new("/repos/a");
         let root_b = Path::new("/repos/b");
-        cache
-            .canonical_paths
-            .insert(root_a.join("src"), Some(PathBuf::from("/physical/a/src")));
-        cache
-            .canonical_paths
-            .insert(root_b.join("src"), Some(PathBuf::from("/physical/b/src")));
+        cache.canonical_paths.insert(
+            root_a.join("src"),
+            CanonicalPathCacheEntry {
+                identity: Some(PathBuf::from("/physical/a/src")),
+                last_access: 1,
+            },
+        );
+        cache.canonical_paths.insert(
+            root_b.join("src"),
+            CanonicalPathCacheEntry {
+                identity: Some(PathBuf::from("/physical/b/src")),
+                last_access: 2,
+            },
+        );
         cache.git_roots.insert(
             root_a.join("src"),
             GitRootCacheEntry {
                 root: Some(root_a.to_path_buf()),
                 checked_at: Instant::now(),
+                last_access: 3,
             },
         );
         cache.git_roots.insert(
@@ -1696,6 +1991,7 @@ mod tests {
             GitRootCacheEntry {
                 root: Some(root_b.to_path_buf()),
                 checked_at: Instant::now(),
+                last_access: 4,
             },
         );
 
@@ -1716,6 +2012,7 @@ mod tests {
             GitRootCacheEntry {
                 root: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
+                last_access: 1,
             },
         );
         cache.git_roots.insert(
@@ -1723,6 +2020,7 @@ mod tests {
             GitRootCacheEntry {
                 root: None,
                 checked_at: Instant::now() - Duration::from_millis(100),
+                last_access: 2,
             },
         );
 
@@ -1747,15 +2045,24 @@ mod tests {
         let directory = base.join("src");
         std::fs::create_dir_all(&directory).unwrap();
         let mut cache = PathContextCache::default();
-        assert_eq!(cache.nearest_git_root(&directory), None);
+        assert_eq!(
+            cache.nearest_git_root_with(&directory, |candidate| candidate.join(".git").exists()),
+            None
+        );
 
         std::fs::create_dir_all(base.join(".git")).unwrap();
-        assert_eq!(cache.nearest_git_root(&directory), None);
+        assert_eq!(
+            cache.nearest_git_root_with(&directory, |candidate| candidate.join(".git").exists()),
+            None
+        );
         assert_eq!(
             cache.git_root_recheck(&directory, Duration::ZERO),
             GitRootRecheck::Due
         );
-        assert_eq!(cache.nearest_git_root(&directory), Some(base.clone()));
+        assert_eq!(
+            cache.nearest_git_root_with(&directory, |candidate| candidate.join(".git").exists()),
+            Some(base.clone())
+        );
 
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1769,6 +2076,7 @@ mod tests {
         std::fs::create_dir_all(&physical).unwrap();
         std::os::unix::fs::symlink(&physical, &logical).unwrap();
         let cache = path_cache();
+        assert!(probe_paths_match(&cache, &logical, &physical));
 
         let counts = git_root_reference_counts([[physical.clone(), logical.clone()].as_slice()]);
         let reconciliation = plan_git_root_reconciliation(
@@ -1977,6 +2285,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_workspace_context_probe_cannot_overwrite_a_newer_result() {
+        let stale = WorkspaceContext {
+            working_directories: vec![PathBuf::from("/repos/old")],
+            git_roots: vec![PathBuf::from("/repos/old")],
+            git_root: Some(PathBuf::from("/repos/old")),
+            ..WorkspaceContext::default()
+        };
+        let newest = WorkspaceContext {
+            working_directories: vec![PathBuf::from("/repos/new")],
+            git_roots: vec![PathBuf::from("/repos/new")],
+            git_root: Some(PathBuf::from("/repos/new")),
+            ..WorkspaceContext::default()
+        };
+        let current_generation = Some(2);
+        let mut applied = WorkspaceContext::default();
+
+        // Complete generation 2 first, then deliver generation 1 late. This is
+        // the order produced when an older filesystem probe stalls.
+        for (generation, observed) in [(2, newest.clone()), (1, stale)] {
+            if let Some(observed) =
+                accept_workspace_context_probe_result(current_generation, generation, observed)
+            {
+                applied = observed;
+            }
+        }
+
+        assert_eq!(applied, newest);
+    }
+
+    #[test]
     fn pending_scan_tracking_mutates_in_release_profiles() {
         let root = PathBuf::from("/repos/pending");
         let mut pending = BTreeSet::new();
@@ -2044,10 +2382,8 @@ mod tests {
         std::fs::create_dir_all(first.join(".git")).unwrap();
         std::fs::create_dir_all(selected.join(".git")).unwrap();
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace
@@ -2112,7 +2448,6 @@ mod tests {
 
         for _ in 0..200 {
             cx.run_until_parked();
-            panel.update(cx, |panel, cx| panel.refresh_workspace_contexts(cx));
             let restored = panel.read_with(cx, |panel, _| {
                 let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
                 entry.git_discovery == GitDiscoveryState::Authoritative
@@ -2125,10 +2460,8 @@ mod tests {
                 .timer(Duration::from_millis(10))
                 .await;
         }
-        let live_context_cache = path_cache();
         let live_directories = opened.workspace.read_with(cx, |workspace, cx| {
-            workspace_context_for_active_workspace(workspace, &live_context_cache, cx)
-                .working_directories
+            workspace_context_for_active_workspace(workspace, cx).working_directories
         });
         panel.read_with(cx, |panel, _| {
             let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
@@ -2156,10 +2489,8 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let stale_selection = base.join("stale");
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
@@ -2203,6 +2534,24 @@ mod tests {
             })
             .expect("window should remain open");
 
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| {
+                panel
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == 2)
+                    .is_some_and(|entry| {
+                        entry.git_discovery == GitDiscoveryState::Authoritative
+                            && entry.selected_git_root.is_none()
+                    })
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
         panel.read_with(cx, |panel, _| {
             let entry = panel.entries.iter().find(|entry| entry.id == 2).unwrap();
             assert_eq!(entry.git_discovery, GitDiscoveryState::Authoritative);
@@ -2221,10 +2570,8 @@ mod tests {
         let selected = base.join("selected");
         std::fs::create_dir_all(selected.join(".git")).unwrap();
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
@@ -2290,7 +2637,6 @@ mod tests {
         // incomplete-context fallback becoming authoritative.
         for _ in 0..200 {
             cx.run_until_parked();
-            panel.update(cx, |panel, cx| panel.refresh_workspace_contexts(cx));
             if panel.read_with(cx, |panel, _| {
                 panel
                     .entries
@@ -2329,10 +2675,8 @@ mod tests {
         std::fs::create_dir_all(first.join(".git")).unwrap();
         std::fs::create_dir_all(second.join(".git")).unwrap();
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
@@ -2374,6 +2718,18 @@ mod tests {
             })
             .unwrap();
 
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| {
+                panel.open_git_roots() == vec![second.clone(), first.clone()]
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.entries.len(), 2, "an open worktree was duplicated");
             assert_eq!(panel.active, worktree_id);
@@ -2395,10 +2751,8 @@ mod tests {
         let directory = base.join("nested");
         std::fs::create_dir_all(&directory).unwrap();
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
@@ -2446,10 +2800,8 @@ mod tests {
             .unwrap();
         assert!(init.success());
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace.panel::<WorkspacesPanel>(cx).unwrap()
@@ -2513,10 +2865,8 @@ mod tests {
             std::env::temp_dir().join(format!("zmux-unadmitted-worktree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
         let opened = open.await.expect("workspace should open");
         cx.run_until_parked();
 
@@ -2565,16 +2915,15 @@ mod tests {
         std::fs::create_dir_all(shared.join(".git")).unwrap();
         std::fs::create_dir_all(unique.join(".git")).unwrap();
 
-        let open = cx.update(|cx| {
-            crate::app::init_zmux(cx);
-            crate::app::open_zmux_workspace_at(None, shared.clone(), cx)
-        });
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, shared.clone(), cx));
         let opened = open.await.expect("workspace should open");
         let panel = opened.workspace.read_with(cx, |workspace, cx| {
             workspace
                 .panel::<WorkspacesPanel>(cx)
                 .expect("workspaces panel should be installed")
         });
+        warm_git_context_cache(&panel, vec![shared.clone(), unique.clone()], cx).await;
         panel.update(cx, |panel, cx| {
             let active = panel
                 .entries
@@ -2674,6 +3023,101 @@ mod tests {
         });
         assert!(project_roots.contains(&shared));
         assert!(!project_roots.contains(&unique));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
+    async fn closing_workspace_purges_parked_terminal_bookkeeping(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let base = std::env::temp_dir().join(format!(
+            "zmux-close-workspace-bookkeeping-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorkspacesPanel>(cx)
+                .expect("workspaces panel should be installed")
+        });
+        let origin = panel.read_with(cx, |panel, _| panel.active_workspace_id());
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| panel.create_workspace(window, cx));
+            })
+            .expect("window should remain open");
+        let closing = panel.read_with(cx, |panel, _| panel.active_workspace_id());
+        assert_ne!(closing, origin);
+
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| {
+                panel
+                    .terminal_registry
+                    .values()
+                    .any(|terminal| terminal.workspace_id == closing)
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+
+        let closing_items = opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    let item_ids = panel
+                        .terminal_registry
+                        .iter()
+                        .filter_map(|(item_id, terminal)| {
+                            (terminal.workspace_id == closing).then_some(*item_id)
+                        })
+                        .collect::<HashSet<_>>();
+                    assert!(
+                        !item_ids.is_empty(),
+                        "closing workspace needs a live terminal"
+                    );
+                    assert_eq!(panel.active_workspace_id(), closing);
+                    for item_id in &item_ids {
+                        panel.dirty_agent_terminals.insert(*item_id);
+                        panel.agent_refresh_queue.schedule(*item_id, Instant::now());
+                    }
+                    // Closing the active workspace parks its layout while
+                    // activating the fallback, then immediately drops that
+                    // parked entry. This is the path whose ItemRemoved events
+                    // cannot clean the per-terminal registries for us.
+                    panel.close_workspace(closing, window, cx);
+                    item_ids
+                })
+            })
+            .expect("window should remain open");
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel
+                    .terminal_registry
+                    .values()
+                    .all(|terminal| { terminal.workspace_id != closing })
+            );
+            assert!(
+                closing_items
+                    .iter()
+                    .all(|item_id| !panel.dirty_agent_terminals.contains(item_id))
+            );
+            assert!(
+                closing_items
+                    .iter()
+                    .all(|item_id| { !panel.agent_refresh_queue.deadlines.contains_key(item_id) })
+            );
+        });
 
         let _ = std::fs::remove_dir_all(base);
     }

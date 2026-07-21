@@ -6,6 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context as _;
 use gpui::{App, AppContext, Context, Task, TaskExt, WeakEntity, Window};
 use project::Project;
 use terminal_view::{TerminalView, default_working_directory};
@@ -20,6 +21,73 @@ use crate::notifications::WorkspaceId;
 use crate::workspaces::{RestoredTerminal, WorkspacesPanel};
 
 const MAX_RESTORED_TERMINAL_ATTEMPTS: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshTerminalStop {
+    DestinationChanged,
+    AttemptsExhausted,
+}
+
+#[derive(Debug)]
+enum FreshTerminalAttempt<T, E> {
+    Complete(T),
+    Retry {
+        error: E,
+        attempt: u32,
+        delay: Duration,
+    },
+    Stop {
+        error: E,
+        attempt: u32,
+        reason: FreshTerminalStop,
+    },
+}
+
+#[derive(Default)]
+struct FreshTerminalRetry {
+    failed_attempts: u32,
+}
+
+impl FreshTerminalRetry {
+    fn resolve<T, E>(
+        &mut self,
+        result: Result<T, E>,
+        destination_is_current: impl FnOnce() -> bool,
+    ) -> FreshTerminalAttempt<T, E> {
+        match result {
+            Ok(value) => FreshTerminalAttempt::Complete(value),
+            Err(error) => {
+                self.failed_attempts = self.failed_attempts.saturating_add(1);
+                let attempt = self.failed_attempts;
+                if attempt >= MAX_RESTORED_TERMINAL_ATTEMPTS {
+                    FreshTerminalAttempt::Stop {
+                        error,
+                        attempt,
+                        reason: FreshTerminalStop::AttemptsExhausted,
+                    }
+                } else if !destination_is_current() {
+                    FreshTerminalAttempt::Stop {
+                        error,
+                        attempt,
+                        reason: FreshTerminalStop::DestinationChanged,
+                    }
+                } else {
+                    FreshTerminalAttempt::Retry {
+                        error,
+                        attempt,
+                        delay: restored_terminal_retry_delay(attempt),
+                    }
+                }
+            }
+        }
+    }
+
+    fn resume(&self, destination_is_current: bool) -> Result<(), FreshTerminalStop> {
+        destination_is_current
+            .then_some(())
+            .ok_or(FreshTerminalStop::DestinationChanged)
+    }
+}
 
 pub(super) fn create_center_terminal(
     workspace: &mut Workspace,
@@ -92,11 +160,64 @@ pub(crate) fn create_center_terminal_at_for_workspace(
     let project = workspace.project().downgrade();
 
     cx.spawn_in(window, async move |workspace, cx| {
-        let terminal = project
-            .update(cx, |project, cx| {
-                create_terminal_with_cli_route(project, working_directory, cx)
-            })?
-            .await?;
+        let mut retry = FreshTerminalRetry::default();
+        let terminal = loop {
+            let result = project
+                .update(cx, |project, cx| {
+                    create_terminal_with_cli_route(project, working_directory.clone(), cx)
+                })?
+                .await;
+            match retry.resolve(result, || {
+                panel
+                    .update(cx, |panel, _| {
+                        panel.active_workspace_id() == owning_workspace_id
+                            && panel.active_workspace_generation() == activation_generation
+                    })
+                    .unwrap_or(false)
+            }) {
+                FreshTerminalAttempt::Complete(terminal) => break terminal,
+                FreshTerminalAttempt::Stop {
+                    error,
+                    attempt,
+                    reason: FreshTerminalStop::AttemptsExhausted,
+                } => {
+                    return Err(error).context(format!(
+                        "failed to create a workspace terminal after {attempt} attempts"
+                    ));
+                }
+                FreshTerminalAttempt::Stop {
+                    error,
+                    reason: FreshTerminalStop::DestinationChanged,
+                    ..
+                } => {
+                    return Err(error).context(
+                        "stopped retrying a workspace terminal after its destination changed",
+                    );
+                }
+                FreshTerminalAttempt::Retry {
+                    error,
+                    attempt,
+                    delay,
+                } => {
+                    eprintln!(
+                        "workspace terminal attempt {attempt} failed; retrying in {}s: {error:#}",
+                        delay.as_secs()
+                    );
+                    cx.background_executor().timer(delay).await;
+                    let destination_is_current = panel
+                        .update(cx, |panel, _| {
+                            panel.active_workspace_id() == owning_workspace_id
+                                && panel.active_workspace_generation() == activation_generation
+                        })
+                        .unwrap_or(false);
+                    if retry.resume(destination_is_current).is_err() {
+                        return Err(error).context(
+                            "stopped retrying a workspace terminal after its destination changed",
+                        );
+                    }
+                }
+            }
+        };
         let terminal_weak = terminal.downgrade();
 
         workspace.update_in(cx, move |workspace, window, cx| {
@@ -515,7 +636,10 @@ pub(super) fn create_terminal_with_cli_route(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RESTORED_TERMINAL_ATTEMPTS, restored_terminal_retry_delay};
+    use super::{
+        FreshTerminalAttempt, FreshTerminalRetry, FreshTerminalStop,
+        MAX_RESTORED_TERMINAL_ATTEMPTS, restored_terminal_retry_delay,
+    };
     use std::time::Duration;
 
     #[test]
@@ -525,5 +649,67 @@ mod tests {
         assert_eq!(restored_terminal_retry_delay(2), Duration::from_secs(2));
         assert_eq!(restored_terminal_retry_delay(6), Duration::from_secs(32));
         assert_eq!(restored_terminal_retry_delay(100), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn fresh_terminal_retry_succeeds_and_cancels_stale_destinations() {
+        let mut retry = FreshTerminalRetry::default();
+        match retry.resolve::<(), _>(Err("first spawn failed"), || true) {
+            FreshTerminalAttempt::Retry {
+                error,
+                attempt,
+                delay,
+            } => {
+                assert_eq!(error, "first spawn failed");
+                assert_eq!(attempt, 1);
+                assert_eq!(delay, Duration::from_secs(1));
+            }
+            outcome => panic!("first failure should schedule one bounded retry: {outcome:?}"),
+        }
+        assert_eq!(retry.resume(true), Ok(()));
+        match retry.resolve(Ok::<_, &str>("terminal"), || {
+            panic!("success must not inspect destination retry state")
+        }) {
+            FreshTerminalAttempt::Complete(terminal) => assert_eq!(terminal, "terminal"),
+            outcome => panic!("the retry should complete after a successful spawn: {outcome:?}"),
+        }
+
+        let mut stale = FreshTerminalRetry::default();
+        assert!(matches!(
+            stale.resolve::<(), _>(Err("stale before wait"), || false),
+            FreshTerminalAttempt::Stop {
+                reason: FreshTerminalStop::DestinationChanged,
+                ..
+            }
+        ));
+
+        let mut canceled = FreshTerminalRetry::default();
+        assert!(matches!(
+            canceled.resolve::<(), _>(Err("destination changes during wait"), || true),
+            FreshTerminalAttempt::Retry { .. }
+        ));
+        assert_eq!(
+            canceled.resume(false),
+            Err(FreshTerminalStop::DestinationChanged),
+            "a workspace switch during backoff cancels the pending retry"
+        );
+
+        let mut exhausted = FreshTerminalRetry::default();
+        for failure in 1..MAX_RESTORED_TERMINAL_ATTEMPTS {
+            assert!(matches!(
+                exhausted.resolve::<(), _>(Err(failure), || true),
+                FreshTerminalAttempt::Retry { .. }
+            ));
+        }
+        assert!(matches!(
+            exhausted.resolve::<(), _>(Err(MAX_RESTORED_TERMINAL_ATTEMPTS), || {
+                panic!("an exhausted retry must stop without consulting stale state")
+            }),
+            FreshTerminalAttempt::Stop {
+                attempt: MAX_RESTORED_TERMINAL_ATTEMPTS,
+                reason: FreshTerminalStop::AttemptsExhausted,
+                ..
+            }
+        ));
     }
 }

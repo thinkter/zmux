@@ -42,10 +42,10 @@ pub fn run() -> anyhow::Result<()> {
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
             crate::app_icon::configure_native_app_icon();
-            let app_state = init_zmux(cx);
-            load_user_settings(app_state.fs.clone(), cx);
-
+            let initialize = init_zmux(cx);
             cx.spawn(async move |cx| {
+                let app_state = initialize.await;
+                cx.update(|cx| load_user_settings(app_state.fs.clone(), cx));
                 let open_task = cx.update(|cx| open_zmux_workspace(None, cx));
                 if let Err(error) = open_task.await {
                     cx.update(|cx| {
@@ -60,7 +60,13 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
+/// Start Zmux's one-time global initialization.
+///
+/// The returned task must complete before opening a workspace. Session state
+/// is loaded on the background executor; all registrations that depend on the
+/// completed [`AppState`] are then installed in their original order on GPUI's
+/// update path.
+pub fn init_zmux(cx: &mut App) -> Task<Arc<AppState>> {
     if !cx.has_global::<db::AppDatabase>() {
         cx.set_global(db::AppDatabase::new());
     }
@@ -77,6 +83,13 @@ pub fn init_zmux(cx: &mut App) -> Arc<AppState> {
     configure_terminal_fonts(cx);
 
     let app_state = init_app_state(cx);
+    cx.spawn(async move |cx| {
+        let app_state = app_state.await;
+        cx.update(|cx| finish_zmux_init(app_state, cx))
+    })
+}
+
+fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
     crate::syntax::register_builtin_languages(&app_state.languages);
     // Grammars alone don't produce colors: the registry needs the active theme
     // to build its highlight maps, and must rebuild them on theme changes.
@@ -235,7 +248,7 @@ fn clear_legacy_font_fallbacks(content: &mut settings::SettingsContent) {
     }
 }
 
-fn init_app_state(cx: &mut App) -> Arc<AppState> {
+fn init_app_state(cx: &mut App) -> Task<Arc<AppState>> {
     let fs: Arc<dyn Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
     <dyn Fs>::set_global(fs.clone(), cx);
 
@@ -250,26 +263,31 @@ fn init_app_state(cx: &mut App) -> Arc<AppState> {
     let client = Client::new(Arc::new(clock::RealSystemClock), http, cx);
     Client::set_global(client.clone(), cx);
 
-    let session = cx.foreground_executor().block_on(session::Session::new(
+    let session = cx.background_spawn(session::Session::new(
         format!("zmux-{}", std::process::id()),
         KeyValueStore::global(cx),
     ));
-    let session = cx.new(|cx| session::AppSession::new(session, cx));
-    let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
-    let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
 
-    let app_state = Arc::new(AppState {
-        languages,
-        client,
-        user_store,
-        workspace_store,
-        fs,
-        build_window_options,
-        node_runtime: node_runtime::NodeRuntime::unavailable(),
-        session,
-    });
-    AppState::set_global(app_state.clone(), cx);
-    app_state
+    cx.spawn(async move |cx| {
+        let session = session.await;
+        cx.update(|cx| {
+            let session = cx.new(|cx| session::AppSession::new(session, cx));
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
+            let app_state = Arc::new(AppState {
+                languages,
+                client,
+                user_store,
+                workspace_store,
+                fs,
+                build_window_options,
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                session,
+            });
+            AppState::set_global(app_state.clone(), cx);
+            app_state
+        })
+    })
 }
 
 fn build_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOptions {
@@ -285,7 +303,11 @@ fn build_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOpt
 
 #[cfg(test)]
 mod tests {
-    use super::clear_legacy_font_fallbacks;
+    use std::sync::Arc;
+
+    use workspace::AppState;
+
+    use super::{clear_legacy_font_fallbacks, init_zmux};
 
     fn fallbacks(names: &[&str]) -> Option<Vec<settings::FontFamilyName>> {
         Some(
@@ -297,6 +319,15 @@ mod tests {
     }
 
     const LEGACY: &[&str] = &["Lilex", "Noto Sans Mono", "Noto Color Emoji", "monospace"];
+
+    #[gpui::test]
+    async fn initialization_task_installs_the_completed_app_state(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let initialization = cx.update(init_zmux);
+        let app_state = initialization.await;
+
+        assert!(cx.read(|cx| Arc::ptr_eq(&app_state, &AppState::global(cx))));
+    }
 
     #[test]
     fn seeded_legacy_font_fallbacks_are_cleared() {
