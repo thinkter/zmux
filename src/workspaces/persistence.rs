@@ -407,6 +407,7 @@ impl WorkspacesPanel {
                 worktree_paths: entry.worktree_paths.clone(),
                 default_directory: entry.default_directory.clone(),
                 selected_git_root: entry.selected_git_root.clone(),
+                pinned_git_root: entry.pinned_git_root.clone(),
                 layout,
             });
         }
@@ -936,6 +937,7 @@ mod tests {
                 worktree_paths: Vec::new(),
                 default_directory: None,
                 selected_git_root: None,
+                pinned_git_root: None,
                 layout: LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: Vec::new(),

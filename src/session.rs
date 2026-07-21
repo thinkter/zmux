@@ -73,6 +73,7 @@ impl SessionSnapshot {
             for path in [
                 workspace.default_directory.as_ref(),
                 workspace.selected_git_root.as_ref(),
+                workspace.pinned_git_root.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -114,6 +115,11 @@ pub struct WorkspaceSnapshot {
     pub default_directory: Option<PathBuf>,
     #[serde(default)]
     pub selected_git_root: Option<PathBuf>,
+    /// Repository explicitly promoted to Zed's full Git integration. Older
+    /// sessions intentionally restore without a pin so startup cannot begin a
+    /// recursive scan merely because a shell once visited a repository.
+    #[serde(default)]
+    pub pinned_git_root: Option<PathBuf>,
     pub layout: LayoutSnapshot,
 }
 
@@ -604,6 +610,7 @@ mod tests {
                 worktree_paths: vec!["/tmp/api".into()],
                 default_directory: Some("/tmp/api".into()),
                 selected_git_root: Some("/tmp/api".into()),
+                pinned_git_root: Some("/tmp/api".into()),
                 layout: LayoutSnapshot {
                     root: LayoutNodeSnapshot::Split {
                         axis: LayoutAxis::Horizontal,
@@ -630,6 +637,18 @@ mod tests {
         let snapshot = snapshot();
         store.save(&snapshot).unwrap();
         assert_eq!(store.load().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn older_sessions_restore_without_enabling_git_attachment() {
+        let mut value = serde_json::to_value(snapshot()).unwrap();
+        value["workspaces"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("pinned_git_root");
+
+        let restored: SessionSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.workspaces[0].pinned_git_root, None);
     }
 
     #[test]

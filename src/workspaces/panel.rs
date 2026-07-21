@@ -9,7 +9,7 @@ use gpui::{
     Window, div, px,
 };
 use ui::prelude::*;
-use ui::{Button, ButtonSize, IconButtonShape, Indicator, PopoverMenu, Tooltip};
+use ui::{Button, ButtonSize, ContextMenu, IconButtonShape, Indicator, PopoverMenu, Tooltip};
 use workspace::dock::{DockPosition, Panel};
 
 use crate::agent_detection::AgentKind;
@@ -682,6 +682,9 @@ impl Render for WorkspacesPanel {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).active_worktree_creation().label.clone());
         let active_root = self.active_git_root();
+        let active_root_choices = self.active_git_root_choices();
+        let active_root_is_pinned = self.active_git_root_is_pinned();
+        let active_root_attachment_pending = self.active_git_root_attachment_pending();
         let active_repository = project.as_ref().and_then(|project| {
             project
                 .read(cx)
@@ -726,6 +729,56 @@ impl Render for WorkspacesPanel {
                 })
             })
             .unwrap_or_else(|| "HEAD".to_string());
+
+        let git_root_selector = active_root.clone().map(|active_root| {
+            let panel = cx.weak_entity();
+            let active_label = path_display_name(&active_root)
+                .unwrap_or_else(|| active_root.display().to_string());
+            let trigger_label = if active_root_attachment_pending {
+                format!("{active_label} · loading…")
+            } else {
+                active_label
+            };
+            PopoverMenu::new("git-root-selector")
+                .menu(move |window, cx| {
+                    let roots = active_root_choices.clone();
+                    let panel = panel.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for root in roots {
+                            let label = root.display().to_string();
+                            let panel = panel.clone();
+                            menu = menu.entry(label, None, move |_window, cx| {
+                                let _ = panel.update(cx, |panel, cx| {
+                                    panel.pin_active_git_root(root.clone(), cx);
+                                });
+                            });
+                        }
+                        if active_root_is_pinned {
+                            let panel = panel.clone();
+                            menu = menu.separator().entry(
+                                "Follow terminal directory",
+                                None,
+                                move |_window, cx| {
+                                    let _ = panel.update(cx, |panel, cx| {
+                                        panel.follow_terminal_git_root(cx);
+                                    });
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .trigger_with_tooltip(
+                    Button::new("git-root-selector-button", trigger_label)
+                        .size(ButtonSize::None)
+                        .start_icon(Icon::new(IconName::GitBranch).size(IconSize::Small))
+                        .truncate(true),
+                    |_, cx| {
+                        Tooltip::simple("Choose a repository; selection enables full Git tools", cx)
+                    },
+                )
+                .anchor(Anchor::BottomLeft)
+        });
 
         let worktree_selector = active_repository
             .as_ref()
@@ -820,7 +873,7 @@ impl Render for WorkspacesPanel {
                             ),
                     ),
             )
-            .when_some(worktree_selector, |this, worktree_selector| {
+            .when_some(git_root_selector, |this, git_root_selector| {
                 this.child(
                     h_flex()
                         .w_full()
@@ -830,7 +883,10 @@ impl Render for WorkspacesPanel {
                         .gap_1()
                         .border_b_1()
                         .border_color(cx.theme().colors().border)
-                        .child(div().flex_1().min_w_0().child(worktree_selector))
+                        .child(div().flex_1().min_w_0().child(git_root_selector))
+                        .when_some(worktree_selector, |this, worktree_selector| {
+                            this.child(div().flex_1().min_w_0().child(worktree_selector))
+                        })
                         .when_some(branch_selector, |this, branch_selector| {
                             this.child(div().flex_1().min_w_0().child(branch_selector))
                         }),

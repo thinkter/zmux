@@ -114,6 +114,7 @@ default-run = "zmux"
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
 anyhow = "1"
 async-channel = "2"
+async-process = "2"
 collections = { workspace = true }
 command_palette = { workspace = true }
 editor = { workspace = true }
@@ -139,6 +140,7 @@ client = { workspace = true }
 clock = { workspace = true }
 db = { workspace = true }
 fs = { workspace = true }
+futures = { workspace = true }
 getrandom = "0.3"
 git = { workspace = true }
 git_ui = { path = "vendor/git_ui", features = ["zmux-core"] }

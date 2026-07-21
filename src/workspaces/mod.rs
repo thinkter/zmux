@@ -24,7 +24,7 @@ pub use self::git_context::{install_git_repository_scope, register_git_repositor
 pub(crate) use self::persistence::install_session_store_for_test;
 pub(crate) use self::persistence::{RestoredTerminal, restore_startup_layout};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,7 @@ const EVENT_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
 const OUTPUT_SIDEBAR_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const SESSION_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 const MAX_INCOMPLETE_CONTEXT_REFRESHES: u8 = 3;
+const MAX_PROMOTED_GIT_ROOTS_PER_WORKSPACE: usize = 3;
 
 fn terminal_event_needs_agent_refresh(
     event: &terminal::Event,
@@ -109,9 +110,13 @@ struct WorkspaceEntry {
     incomplete_context_refreshes: u8,
     default_directory: Option<PathBuf>,
     selected_git_root: Option<PathBuf>,
+    pinned_git_root: Option<PathBuf>,
+    promoted_git_roots: VecDeque<PathBuf>,
     git_discovery: GitDiscoveryState,
     git: MetadataState<GitMetadata>,
     metadata_root: Option<PathBuf>,
+    metadata_generation: u64,
+    metadata_checked_at: Option<Instant>,
     /// The complete persisted layout, retained until every fresh terminal has
     /// materialized so an interrupted restore can retry without losing tabs.
     restore: Option<LayoutSnapshot>,
@@ -305,6 +310,7 @@ impl GitRootRecheckSchedule {
         }
     }
 
+    #[cfg(test)]
     fn clear(&mut self) -> GitRootRecheckTimerUpdate {
         let had_timer = self.deadline.take().is_some();
         self.pending.clear();
@@ -355,6 +361,7 @@ pub struct WorkspacesPanel {
     context_refresh_deadline: Option<Instant>,
     git_root_recheck_task: Option<Task<()>>,
     git_root_recheck_schedule: GitRootRecheckSchedule,
+    metadata_probe_tasks: HashMap<WorkspaceId, Task<()>>,
     agent_refresh_task: Option<Task<()>>,
     session_persist_task: Option<Task<()>>,
     session_store: SessionStore,
@@ -411,9 +418,13 @@ impl WorkspacesPanel {
                         incomplete_context_refreshes: 0,
                         default_directory: workspace.default_directory.clone(),
                         selected_git_root: workspace.selected_git_root.clone(),
+                        pinned_git_root: workspace.pinned_git_root.clone(),
+                        promoted_git_roots: workspace.pinned_git_root.iter().cloned().collect(),
                         git_discovery: GitDiscoveryState::Restoring,
                         git: MetadataState::NotRequested,
                         metadata_root: None,
+                        metadata_generation: 0,
+                        metadata_checked_at: None,
                         // Sessions saved before empty panes were pruned at
                         // capture time may still carry them; prune here so the
                         // retry snapshot and its failed-restore paths agree.
@@ -438,9 +449,13 @@ impl WorkspacesPanel {
                     incomplete_context_refreshes: 0,
                     default_directory: initial_directory,
                     selected_git_root: None,
+                    pinned_git_root: None,
+                    promoted_git_roots: VecDeque::new(),
                     git_discovery: GitDiscoveryState::Authoritative,
                     git: MetadataState::NotRequested,
                     metadata_root: None,
+                    metadata_generation: 0,
+                    metadata_checked_at: None,
                     restore: None,
                     failed_restores: Vec::new(),
                     stored: None,
@@ -509,6 +524,7 @@ impl WorkspacesPanel {
             context_refresh_deadline: None,
             git_root_recheck_task: None,
             git_root_recheck_schedule: GitRootRecheckSchedule::default(),
+            metadata_probe_tasks: HashMap::new(),
             agent_refresh_task: None,
             session_persist_task: None,
             session_store,
@@ -738,6 +754,10 @@ impl WorkspacesPanel {
             .as_deref()
             .and_then(AgentKind::from_process)
             .is_some();
+        let shell_is_idle = next
+            .foreground_process
+            .as_deref()
+            .is_none_or(is_shell_process);
         let context_changed = self
             .terminal_registry
             .get_mut(&item_id)
@@ -760,6 +780,13 @@ impl WorkspacesPanel {
         }
         if context_changed {
             self.schedule_context_refresh_for(workspace_id, event_delay, cx);
+        }
+        if matches!(event, terminal::Event::Wakeup) && shell_is_idle {
+            self.schedule_lightweight_metadata_probe(
+                workspace_id,
+                git_context::METADATA_PROBE_DEBOUNCE,
+                cx,
+            );
         }
     }
 
@@ -796,11 +823,6 @@ impl WorkspacesPanel {
             .git_root_recheck_schedule
             .observe(directory, recheck, Instant::now());
         self.apply_git_root_recheck_schedule(update, cx);
-    }
-
-    fn clear_pending_git_root_rechecks(&mut self) {
-        self.git_root_recheck_schedule.clear();
-        self.git_root_recheck_task.take();
     }
 
     fn apply_git_root_recheck_schedule(
@@ -1131,9 +1153,13 @@ impl WorkspacesPanel {
             incomplete_context_refreshes: 0,
             default_directory,
             selected_git_root: None,
+            pinned_git_root: None,
+            promoted_git_roots: VecDeque::new(),
             git_discovery: GitDiscoveryState::Authoritative,
             git: MetadataState::NotRequested,
             metadata_root: None,
+            metadata_generation: 0,
+            metadata_checked_at: None,
             restore: None,
             failed_restores: Vec::new(),
             stored: None,
@@ -1405,6 +1431,7 @@ impl WorkspacesPanel {
 
         // Dropping the entry drops its `StoredLayout`, releasing the terminals.
         self.entries.retain(|entry| entry.id != id);
+        self.metadata_probe_tasks.remove(&id);
         self.context_refresh_queue.remove(&id);
         self.context_refresh_task.take();
         self.context_refresh_deadline.take();
@@ -1981,9 +2008,13 @@ mod tests {
             incomplete_context_refreshes: 0,
             default_directory: None,
             selected_git_root: Some(retained.clone()),
+            pinned_git_root: None,
+            promoted_git_roots: VecDeque::new(),
             git_discovery: GitDiscoveryState::Authoritative,
             git: MetadataState::NotRequested,
             metadata_root: None,
+            metadata_generation: 0,
+            metadata_checked_at: None,
             restore: None,
             failed_restores: Vec::new(),
             stored: None,

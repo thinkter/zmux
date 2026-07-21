@@ -1,30 +1,35 @@
 //! Git context discovery and reconciliation for logical workspaces.
 //!
 //! Derives each workspace's Git repositories from its live terminals' working
-//! directories, keeps the project's attached worktrees in sync with the set
-//! of referenced repository roots, and bridges the vendored Zed Git panel to
-//! zmux's logical workspaces via [`ZmuxRepositoryScope`]. Incomplete
-//! directory probes must never tear down attached state: reconciliation only
-//! removes worktrees after an authoritative (fully reported) pass.
+//! directories, probes ordinary visited roots without project attachment, and
+//! attaches only roots explicitly promoted to Zed's full Git integration. It
+//! also bridges the vendored Zed Git panel to zmux's logical workspaces via
+//! [`ZmuxRepositoryScope`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, Entity, EntityId, Global, SharedString, Task, WeakEntity, Window};
+use futures::{FutureExt, future::Either};
+use gpui::{
+    App, AppContext, Context, Entity, EntityId, Global, SharedString, Task, WeakEntity, Window,
+};
 use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
 use workspace::item::ItemHandle;
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
-use crate::metadata::{MetadataState, git_metadata_from_repository};
+use crate::metadata::{MetadataState, git_metadata_from_repository, probe_git_metadata};
 use crate::notifications::WorkspaceId;
 
 use super::persistence::{FailedRestoreSlot, StoredLayout};
 use super::{WorkspaceEntry, WorkspacesPanel, is_shell_process, sanitize_process_label};
 
 const PATH_CONTEXT_CACHE_CAPACITY: usize = 1024;
+pub(super) const METADATA_PROBE_DEBOUNCE: Duration = Duration::from_millis(250);
+const METADATA_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+const METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 struct GitRootCacheEntry {
@@ -135,6 +140,37 @@ impl PathContextCache {
         }
     }
 
+    fn invalidate_root(&mut self, root: &Path) -> Vec<PathBuf> {
+        let mut identities = vec![root.to_path_buf()];
+        if let Some(Some(identity)) = self.canonical_paths.get(root)
+            && identity != root
+        {
+            identities.push(identity.clone());
+        }
+        let belongs_to_root = |path: &Path| {
+            identities
+                .iter()
+                .any(|identity| path == identity || path.starts_with(identity))
+        };
+
+        self.canonical_paths.retain(|logical, canonical| {
+            !belongs_to_root(logical) && !canonical.as_deref().is_some_and(&belongs_to_root)
+        });
+        let removed = self
+            .git_roots
+            .iter()
+            .filter_map(|(directory, entry)| {
+                (belongs_to_root(directory) || entry.root.as_deref().is_some_and(&belongs_to_root))
+                    .then_some(directory.clone())
+            })
+            .collect::<Vec<_>>();
+        for directory in &removed {
+            self.git_roots.remove(directory);
+        }
+        removed
+    }
+
+    #[cfg(test)]
     fn clear(&mut self) {
         self.canonical_paths.clear();
         self.git_roots.clear();
@@ -234,6 +270,7 @@ struct GitRootReconciliation {
     removed: BTreeSet<PathBuf>,
 }
 
+#[cfg(test)]
 fn git_root_reference_counts<'a>(
     roots_by_workspace: impl IntoIterator<Item = &'a [PathBuf]>,
 ) -> BTreeMap<PathBuf, usize> {
@@ -246,14 +283,16 @@ fn git_root_reference_counts<'a>(
     counts
 }
 
-fn git_root_is_referenced<'a>(
-    roots_by_workspace: impl IntoIterator<Item = &'a [PathBuf]>,
+fn git_root_is_desired(
+    entries: &[WorkspaceEntry],
     root: &Path,
     cache: &Mutex<PathContextCache>,
 ) -> bool {
-    roots_by_workspace.into_iter().any(|roots| {
-        roots
+    entries.iter().any(|entry| {
+        entry
+            .worktree_paths
             .iter()
+            .chain(entry.promoted_git_roots.iter())
             .any(|candidate| paths_match(cache, candidate, root))
     })
 }
@@ -323,10 +362,18 @@ fn matched_logical_git_root(
 
 fn reconcile_selected_git_root(
     selected: &mut Option<PathBuf>,
+    pinned: Option<&Path>,
     discovered_roots: &[PathBuf],
     discovery: GitDiscoveryState,
     cache: &Mutex<PathContextCache>,
 ) {
+    if let Some(pinned) = pinned {
+        *selected = Some(
+            matched_logical_git_root(discovered_roots, pinned, cache)
+                .unwrap_or_else(|| pinned.to_path_buf()),
+        );
+        return;
+    }
     if discovery != GitDiscoveryState::Authoritative {
         return;
     }
@@ -343,18 +390,61 @@ fn reconcile_selected_git_root(
     }
 }
 
-fn git_contexts_are_authoritative<'a>(
-    entries: impl IntoIterator<Item = &'a WorkspaceEntry>,
-) -> bool {
-    entries.into_iter().all(|entry| entry.context_authoritative)
+fn promote_git_root(
+    selected: &mut Option<PathBuf>,
+    pinned: &mut Option<PathBuf>,
+    promoted: &mut VecDeque<PathBuf>,
+    root: PathBuf,
+    cache: &Mutex<PathContextCache>,
+) {
+    promoted.retain(|candidate| !paths_match(cache, candidate, &root));
+    promoted.push_front(root.clone());
+    promoted.truncate(super::MAX_PROMOTED_GIT_ROOTS_PER_WORKSPACE);
+    *selected = Some(root.clone());
+    *pinned = Some(root);
 }
 
-fn retain_completed_worktree_scan(root_is_referenced: bool, contexts_authoritative: bool) -> bool {
-    root_is_referenced || !contexts_authoritative
+fn desired_git_root_reference_counts(
+    entries: &[WorkspaceEntry],
+    cache: &Mutex<PathContextCache>,
+) -> BTreeMap<PathBuf, usize> {
+    let mut counts = BTreeMap::new();
+    for entry in entries {
+        for root in workspace_attachment_roots(entry, cache) {
+            *counts.entry(root).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn workspace_attachment_roots(
+    entry: &WorkspaceEntry,
+    cache: &Mutex<PathContextCache>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root in entry
+        .worktree_paths
+        .iter()
+        .chain(entry.promoted_git_roots.iter())
+    {
+        if index_root_block_reason(root).is_none() {
+            push_unique_logical_path(&mut roots, root.clone(), cache);
+        }
+    }
+    roots
 }
 
 fn track_pending_worktree(pending: &mut BTreeSet<PathBuf>, root: PathBuf) -> bool {
     pending.insert(root)
+}
+
+fn metadata_probe_is_current(
+    current_root: Option<&Path>,
+    current_generation: u64,
+    requested_root: &Path,
+    requested_generation: u64,
+) -> bool {
+    current_generation == requested_generation && current_root == Some(requested_root)
 }
 
 /// Bridges the vendored Zed Git panel to zmux's logical workspaces.
@@ -408,7 +498,7 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
         let panel = self.panel_for(project).and_then(|panel| panel.upgrade());
         let roots = panel
             .as_ref()
-            .map(|panel| panel.read(cx).active_git_roots().to_vec())
+            .map(|panel| panel.read(cx).active_attachment_roots())
             .unwrap_or_default();
         project
             .read(cx)
@@ -495,14 +585,12 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
 }
 
 impl WorkspacesPanel {
-    /// Keep rail metadata synchronized with Zed's repository model. The Git
-    /// store already watches repository state, so this subscription replaces
-    /// zmux's independent active/inactive polling timers and subprocesses.
+    /// Keep metadata for explicitly attached roots synchronized with Zed's
+    /// repository model. Unattached roots use bounded, event-driven probes.
     pub(super) fn subscribe_to_git_metadata(workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         let git_store = workspace.read(cx).project().read(cx).git_store().clone();
         cx.subscribe(&git_store, |this, _git_store, event, cx| match event {
             GitStoreEvent::RepositoryAdded | GitStoreEvent::RepositoryRemoved(_) => {
-                this.invalidate_path_context_cache();
                 this.schedule_context_refresh(cx);
                 this.request_metadata_refreshes(cx);
             }
@@ -518,11 +606,11 @@ impl WorkspacesPanel {
         .detach();
     }
 
-    fn active_git_roots(&self) -> &[PathBuf] {
+    fn active_attachment_roots(&self) -> Vec<PathBuf> {
         self.entries
             .iter()
             .find(|entry| entry.id == self.active)
-            .map(|entry| entry.context.git_roots.as_slice())
+            .map(|entry| workspace_attachment_roots(entry, &self.path_context_cache))
             .unwrap_or_default()
     }
 
@@ -552,6 +640,8 @@ impl WorkspacesPanel {
                 .git_roots
                 .iter()
                 .chain(entry.selected_git_root.iter())
+                .chain(entry.pinned_git_root.iter())
+                .chain(entry.promoted_git_roots.iter())
                 .chain(&entry.worktree_paths)
                 .cloned()
             {
@@ -573,18 +663,113 @@ impl WorkspacesPanel {
     }
 
     fn select_git_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if let Some(entry) = self
+        self.pin_git_root_for_workspace(self.active, root, cx);
+    }
+
+    pub(super) fn active_git_root_choices(&self) -> Vec<PathBuf> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.id == self.active) else {
+            return Vec::new();
+        };
+        let mut roots = Vec::new();
+        for root in entry
+            .pinned_git_root
+            .iter()
+            .chain(entry.selected_git_root.iter())
+            .chain(entry.context.git_roots.iter())
+            .chain(entry.promoted_git_roots.iter())
+            .chain(entry.worktree_paths.iter())
+        {
+            if index_root_block_reason(root).is_none() {
+                push_unique_logical_path(&mut roots, root.clone(), &self.path_context_cache);
+            }
+        }
+        roots.sort();
+        roots
+    }
+
+    pub(super) fn active_git_root_is_pinned(&self) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == self.active)
+            .is_some_and(|entry| entry.pinned_git_root.is_some())
+    }
+
+    pub(super) fn active_git_root_attachment_pending(&self) -> bool {
+        self.active_git_root().is_some_and(|root| {
+            self.pending_worktrees
+                .iter()
+                .any(|pending| paths_match(&self.path_context_cache, pending, &root))
+        })
+    }
+
+    pub(super) fn pin_active_git_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.pin_git_root_for_workspace(self.active, root, cx);
+    }
+
+    fn pin_git_root_for_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if index_root_block_reason(&root).is_some() {
+            return;
+        }
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == workspace_id)
+        else {
+            return;
+        };
+        let logical_root = {
+            let entry = &self.entries[index];
+            entry
+                .context
+                .git_roots
+                .iter()
+                .chain(entry.worktree_paths.iter())
+                .find(|candidate| paths_match(&self.path_context_cache, candidate, &root))
+                .cloned()
+                .unwrap_or(root)
+        };
+        let entry = &mut self.entries[index];
+        promote_git_root(
+            &mut entry.selected_git_root,
+            &mut entry.pinned_git_root,
+            &mut entry.promoted_git_roots,
+            logical_root,
+            &self.path_context_cache,
+        );
+        entry.metadata_checked_at = None;
+        self.reconcile_git_context(cx);
+        self.request_metadata_refreshes(cx);
+        self.schedule_session_persistence(cx);
+        cx.notify();
+    }
+
+    pub(super) fn follow_terminal_git_root(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| entry.id == self.active)
-            && let Some(logical_root) =
-                matched_logical_git_root(&entry.context.git_roots, &root, &self.path_context_cache)
-        {
-            entry.selected_git_root = Some(logical_root);
-            self.request_metadata_refreshes(cx);
-            self.schedule_session_persistence(cx);
-            cx.notify();
-        }
+        else {
+            return;
+        };
+        entry.pinned_git_root = None;
+        entry.promoted_git_roots.clear();
+        reconcile_selected_git_root(
+            &mut entry.selected_git_root,
+            None,
+            &entry.context.git_roots,
+            entry.git_discovery,
+            &self.path_context_cache,
+        );
+        entry.metadata_checked_at = None;
+        self.reconcile_git_context(cx);
+        self.request_metadata_refreshes(cx);
+        self.schedule_session_persistence(cx);
+        cx.notify();
     }
 
     pub(super) fn workspace_id_for_git_root(&self, path: &Path) -> Option<WorkspaceId> {
@@ -675,6 +860,7 @@ impl WorkspacesPanel {
             }
             reconcile_selected_git_root(
                 &mut entry.selected_git_root,
+                entry.pinned_git_root.as_deref(),
                 &entry.context.git_roots,
                 entry.git_discovery,
                 &self.path_context_cache,
@@ -683,11 +869,8 @@ impl WorkspacesPanel {
 
         self.sync_blocked_root_notifications(cx);
 
-        let reference_counts = git_root_reference_counts(
-            self.entries
-                .iter()
-                .map(|entry| entry.context.git_roots.as_slice()),
-        );
+        let reference_counts =
+            desired_git_root_reference_counts(&self.entries, &self.path_context_cache);
         let attached = self.attached_worktrees.keys().cloned().collect();
         let reconciliation = plan_git_root_reconciliation(
             reference_counts,
@@ -700,17 +883,11 @@ impl WorkspacesPanel {
         };
         let project = workspace.read(cx).project().clone();
 
-        // A pass where any shell's directory probe failed understates the
-        // referenced roots; removing worktrees from it would detach and
-        // rescan repositories that are still in use. Wait for a stable pass.
-        let contexts_authoritative = git_contexts_are_authoritative(&self.entries);
-        if contexts_authoritative {
-            for root in reconciliation.removed {
-                if let Some(worktree) = self.attached_worktrees.remove(&root) {
-                    let id = worktree.read(cx).id();
-                    project.update(cx, |project, cx| project.remove_worktree(id, cx));
-                    self.invalidate_path_context_cache();
-                }
+        for root in reconciliation.removed {
+            if let Some(worktree) = self.attached_worktrees.remove(&root) {
+                let id = worktree.read(cx).id();
+                project.update(cx, |project, cx| project.remove_worktree(id, cx));
+                self.invalidate_path_context_for_root(&root);
             }
         }
 
@@ -747,20 +924,16 @@ impl WorkspacesPanel {
                     this.pending_worktrees.remove(&root);
                     match result {
                         Ok(worktree)
-                            if retain_completed_worktree_scan(
-                                git_root_is_referenced(
-                                    this.entries
-                                        .iter()
-                                        .map(|entry| entry.context.git_roots.as_slice()),
-                                    &root,
-                                    &this.path_context_cache,
-                                ),
-                                git_contexts_are_authoritative(&this.entries),
+                            if git_root_is_desired(
+                                &this.entries,
+                                &root,
+                                &this.path_context_cache,
                             ) =>
                         {
                             this.attached_worktrees.insert(root.clone(), worktree);
-                            this.invalidate_path_context_cache();
+                            this.invalidate_path_context_for_root(&root);
                             this.activate_selected_repository(cx);
+                            this.request_metadata_refreshes(cx);
                         }
                         Ok(worktree) => {
                             // Repository discovery moved on while this worktree
@@ -768,7 +941,7 @@ impl WorkspacesPanel {
                             // well as dropping this late result.
                             let id = worktree.read(cx).id();
                             project.update(cx, |project, cx| project.remove_worktree(id, cx));
-                            this.invalidate_path_context_cache();
+                            this.invalidate_path_context_for_root(&root);
                         }
                         Err(error) => {
                             eprintln!(
@@ -998,22 +1171,44 @@ impl WorkspacesPanel {
             .unwrap_or_default();
 
         let mut changed = false;
+        let mut probes = Vec::new();
+        let mut cancelled_probes = Vec::new();
         for entry in &mut self.entries {
             let root = entry.selected_git_root.clone();
-            if entry.metadata_root != root {
+            let root_changed = entry.metadata_root != root;
+            if root_changed {
+                entry.metadata_generation = entry.metadata_generation.wrapping_add(1);
                 entry.metadata_root = root.clone();
+                entry.metadata_checked_at = None;
+                cancelled_probes.push(entry.id);
             }
-            let git = if let Some(root) = root {
-                let repository = repositories.iter().find(|repository| {
+            let repository = root.as_ref().and_then(|root| {
+                repositories.iter().find(|repository| {
                     paths_match(
                         &self.path_context_cache,
                         repository.work_directory_abs_path.as_ref(),
-                        &root,
+                        root,
                     )
-                });
-                git_metadata_from_repository(repository)
-            } else {
-                MetadataState::NotRequested
+                })
+            });
+            let git = match (root.as_ref(), repository) {
+                (_, Some(repository)) => {
+                    entry.metadata_generation = entry.metadata_generation.wrapping_add(1);
+                    entry.metadata_checked_at = Some(Instant::now());
+                    cancelled_probes.push(entry.id);
+                    git_metadata_from_repository(Some(repository))
+                }
+                (Some(_), None) if root_changed => {
+                    probes.push(entry.id);
+                    MetadataState::NotRequested
+                }
+                (Some(_), None) => {
+                    if matches!(entry.git, MetadataState::NotRequested) {
+                        probes.push(entry.id);
+                    }
+                    entry.git.clone()
+                }
+                (None, None) => MetadataState::NotRequested,
             };
             if entry.git != git {
                 entry.git = git;
@@ -1023,14 +1218,105 @@ impl WorkspacesPanel {
         if changed {
             cx.notify();
         }
+        for workspace_id in cancelled_probes {
+            self.metadata_probe_tasks.remove(&workspace_id);
+        }
+        for workspace_id in probes {
+            self.schedule_lightweight_metadata_probe(workspace_id, Duration::ZERO, cx);
+        }
     }
 
-    pub(super) fn invalidate_path_context_cache(&mut self) {
-        self.clear_pending_git_root_rechecks();
-        self.path_context_cache
+    pub(super) fn schedule_lightweight_metadata_probe(
+        &mut self,
+        workspace_id: WorkspaceId,
+        requested_delay: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        if self.metadata_probe_tasks.contains_key(&workspace_id) {
+            return;
+        }
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == workspace_id)
+        else {
+            return;
+        };
+        let Some(root) = entry.selected_git_root.clone() else {
+            return;
+        };
+        if self
+            .attached_worktrees
+            .keys()
+            .any(|attached| paths_match(&self.path_context_cache, attached, &root))
+        {
+            return;
+        }
+
+        let cooldown = entry
+            .metadata_checked_at
+            .and_then(|checked_at| METADATA_PROBE_MIN_INTERVAL.checked_sub(checked_at.elapsed()))
+            .unwrap_or_default();
+        let delay = requested_delay.max(cooldown);
+        entry.metadata_generation = entry.metadata_generation.wrapping_add(1);
+        let generation = entry.metadata_generation;
+        let executor = cx.background_executor().clone();
+        let probe_root = root.clone();
+        let background = cx.background_spawn(async move {
+            executor.timer(delay).await;
+            let probe = probe_git_metadata(&probe_root).boxed();
+            let timeout = executor.timer(METADATA_PROBE_TIMEOUT).boxed();
+            match futures::future::select(probe, timeout).await {
+                Either::Left((result, _)) => result,
+                Either::Right(((), _)) => Err("git status probe timed out".to_string()),
+            }
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = background.await;
+            this.update(cx, |this, cx| {
+                this.metadata_probe_tasks.remove(&workspace_id);
+                let Some(entry) = this
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.id == workspace_id)
+                else {
+                    return;
+                };
+                if !metadata_probe_is_current(
+                    entry.metadata_root.as_deref(),
+                    entry.metadata_generation,
+                    &root,
+                    generation,
+                ) {
+                    return;
+                }
+                entry.metadata_checked_at = Some(Instant::now());
+                let next = match result {
+                    Ok(metadata) => MetadataState::Ready(metadata),
+                    Err(error) => MetadataState::Unavailable(error),
+                };
+                if entry.git != next {
+                    entry.git = next;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.metadata_probe_tasks.insert(workspace_id, task);
+    }
+
+    fn invalidate_path_context_for_root(&mut self, root: &Path) {
+        let removed = self
+            .path_context_cache
             .lock()
-            .expect("path context cache poisoned")
-            .clear();
+            .unwrap_or_else(|poisoned| {
+                log::error!("recovering poisoned path context cache during invalidation");
+                poisoned.into_inner()
+            })
+            .invalidate_root(root);
+        for directory in removed {
+            self.git_root_recheck_schedule.remove(&directory);
+        }
     }
 }
 
@@ -1352,6 +1638,39 @@ mod tests {
     }
 
     #[test]
+    fn root_scoped_invalidation_preserves_unrelated_cache_entries() {
+        let mut cache = PathContextCache::default();
+        let root_a = Path::new("/repos/a");
+        let root_b = Path::new("/repos/b");
+        cache
+            .canonical_paths
+            .insert(root_a.join("src"), Some(PathBuf::from("/physical/a/src")));
+        cache
+            .canonical_paths
+            .insert(root_b.join("src"), Some(PathBuf::from("/physical/b/src")));
+        cache.git_roots.insert(
+            root_a.join("src"),
+            GitRootCacheEntry {
+                root: Some(root_a.to_path_buf()),
+                checked_at: Instant::now(),
+            },
+        );
+        cache.git_roots.insert(
+            root_b.join("src"),
+            GitRootCacheEntry {
+                root: Some(root_b.to_path_buf()),
+                checked_at: Instant::now(),
+            },
+        );
+
+        assert_eq!(cache.invalidate_root(root_a), vec![root_a.join("src")]);
+        assert!(!cache.canonical_paths.contains_key(&root_a.join("src")));
+        assert!(!cache.git_roots.contains_key(&root_a.join("src")));
+        assert!(cache.canonical_paths.contains_key(&root_b.join("src")));
+        assert!(cache.git_roots.contains_key(&root_b.join("src")));
+    }
+
+    #[test]
     fn negative_git_root_rechecks_retain_per_cwd_deadlines() {
         let mut cache = PathContextCache::default();
         let due = PathBuf::from("/outside/due");
@@ -1437,6 +1756,7 @@ mod tests {
         let mut selected = Some(physical.clone());
         reconcile_selected_git_root(
             &mut selected,
+            None,
             std::slice::from_ref(&logical),
             GitDiscoveryState::Authoritative,
             &cache,
@@ -1500,6 +1820,7 @@ mod tests {
 
         reconcile_selected_git_root(
             &mut selected,
+            None,
             &[],
             GitDiscoveryState::Restoring,
             &path_cache(),
@@ -1518,6 +1839,7 @@ mod tests {
         // was created before the selected repository's terminal.
         reconcile_selected_git_root(
             &mut selected,
+            None,
             std::slice::from_ref(&first_root),
             GitDiscoveryState::Restoring,
             &path_cache(),
@@ -1525,6 +1847,7 @@ mod tests {
         assert_eq!(selected, Some(selected_root.clone()));
         reconcile_selected_git_root(
             &mut selected,
+            None,
             std::slice::from_ref(&first_root),
             GitDiscoveryState::Discovering,
             &path_cache(),
@@ -1533,6 +1856,7 @@ mod tests {
 
         reconcile_selected_git_root(
             &mut selected,
+            None,
             &[first_root, selected_root.clone()],
             GitDiscoveryState::Authoritative,
             &path_cache(),
@@ -1547,6 +1871,7 @@ mod tests {
 
         reconcile_selected_git_root(
             &mut selected,
+            None,
             std::slice::from_ref(&discovered_root),
             GitDiscoveryState::Authoritative,
             &path_cache(),
@@ -1575,10 +1900,44 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_context_retains_a_completed_worktree_scan_until_a_stable_pass() {
-        assert!(retain_completed_worktree_scan(false, false));
-        assert!(!retain_completed_worktree_scan(false, true));
-        assert!(retain_completed_worktree_scan(true, true));
+    fn explicit_promotions_are_bounded_and_update_the_pin() {
+        let cache = path_cache();
+        let mut selected = None;
+        let mut pinned = None;
+        let mut promoted = VecDeque::new();
+        for index in 0..8 {
+            promote_git_root(
+                &mut selected,
+                &mut pinned,
+                &mut promoted,
+                PathBuf::from(format!("/repos/{index}")),
+                &cache,
+            );
+        }
+        assert_eq!(selected, Some(PathBuf::from("/repos/7")));
+        assert_eq!(pinned, selected);
+        assert_eq!(promoted.len(), 3);
+        assert_eq!(
+            promoted,
+            VecDeque::from([
+                PathBuf::from("/repos/7"),
+                PathBuf::from("/repos/6"),
+                PathBuf::from("/repos/5"),
+            ])
+        );
+    }
+
+    #[test]
+    fn metadata_probe_results_require_matching_root_and_generation() {
+        let root = Path::new("/repos/current");
+        assert!(metadata_probe_is_current(Some(root), 7, root, 7));
+        assert!(!metadata_probe_is_current(
+            Some(Path::new("/repos/new")),
+            7,
+            root,
+            7
+        ));
+        assert!(!metadata_probe_is_current(Some(root), 8, root, 7));
     }
 
     #[test]
@@ -1611,19 +1970,6 @@ mod tests {
 
         assert_eq!(reconciliation.added, BTreeSet::from([first]));
         assert_eq!(reconciliation.removed, BTreeSet::from([stale]));
-    }
-
-    #[test]
-    fn late_attachment_is_unreferenced_after_its_workspace_moves_on() {
-        let late = PathBuf::from("/repos/late");
-        let current = PathBuf::from("/repos/current");
-        let roots = [current];
-
-        assert!(!git_root_is_referenced(
-            [roots.as_slice()],
-            &late,
-            &path_cache()
-        ));
     }
 
     #[test]
@@ -1684,9 +2030,13 @@ mod tests {
                 incomplete_context_refreshes: 0,
                 default_directory: None,
                 selected_git_root: Some(selected.clone()),
+                pinned_git_root: None,
+                promoted_git_roots: VecDeque::new(),
                 git_discovery: GitDiscoveryState::Restoring,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
+                metadata_generation: 0,
+                metadata_checked_at: None,
                 restore: Some(LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: vec![
@@ -1790,9 +2140,13 @@ mod tests {
                 incomplete_context_refreshes: 0,
                 default_directory: None,
                 selected_git_root: Some(stale_selection),
+                pinned_git_root: None,
+                promoted_git_roots: VecDeque::new(),
                 git_discovery: GitDiscoveryState::Restoring,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
+                metadata_generation: 0,
+                metadata_checked_at: None,
                 restore: Some(LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: Vec::new(),
@@ -1851,9 +2205,13 @@ mod tests {
                 incomplete_context_refreshes: 0,
                 default_directory: Some(selected.clone()),
                 selected_git_root: Some(selected.clone()),
+                pinned_git_root: None,
+                promoted_git_roots: VecDeque::new(),
                 git_discovery: GitDiscoveryState::Restoring,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
+                metadata_generation: 0,
+                metadata_checked_at: None,
                 restore: Some(LayoutSnapshot {
                     root: LayoutNodeSnapshot::Leaf {
                         tabs: vec![TerminalSnapshot::fresh_shell(Some(selected.clone()))],
@@ -2039,6 +2397,78 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn visited_repository_uses_probe_until_explicitly_pinned(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let base =
+            std::env::temp_dir().join(format!("zmux-probed-repository-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        let open = cx.update(|cx| {
+            crate::app::init_zmux(cx);
+            crate::app::open_zmux_workspace_at(None, base.clone(), cx)
+        });
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panel::<WorkspacesPanel>(cx).unwrap()
+        });
+
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| {
+                panel.entries.iter().any(|entry| {
+                    entry.selected_git_root.as_deref() == Some(base.as_path())
+                        && matches!(entry.git, MetadataState::Ready(_))
+                })
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(panel.read_with(cx, |panel, _| {
+            panel.entries.iter().any(|entry| {
+                entry.selected_git_root.as_deref() == Some(base.as_path())
+                    && matches!(entry.git, MetadataState::Ready(_))
+            })
+        }));
+        assert_eq!(
+            opened.workspace.read_with(cx, |workspace, cx| {
+                workspace.project().read(cx).worktrees(cx).count()
+            }),
+            0,
+            "visiting a repository must not attach a recursively watched worktree"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.pin_active_git_root(base.clone(), cx);
+        });
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| panel.attached_worktrees.len()) == 1 {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.attached_worktrees.len()),
+            1,
+            "an explicit pin should enable Zed's full Git integration"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[gpui::test]
     async fn project_event_audit_removes_an_unadmitted_directory_worktree(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2117,6 +2547,8 @@ mod tests {
                 .unwrap();
             active.context.git_roots = vec![shared.clone()];
             active.selected_git_root = Some(shared.clone());
+            active.pinned_git_root = Some(shared.clone());
+            active.promoted_git_roots = VecDeque::from([shared.clone()]);
             panel.entries.push(WorkspaceEntry {
                 id: 2,
                 manual_name: None,
@@ -2131,9 +2563,13 @@ mod tests {
                 incomplete_context_refreshes: 0,
                 default_directory: None,
                 selected_git_root: Some(unique.clone()),
+                pinned_git_root: Some(unique.clone()),
+                promoted_git_roots: VecDeque::from([unique.clone()]),
                 git_discovery: GitDiscoveryState::Authoritative,
                 git: MetadataState::NotRequested,
                 metadata_root: None,
+                metadata_generation: 0,
+                metadata_checked_at: None,
                 restore: None,
                 failed_restores: Vec::new(),
                 stored: Some(StoredLayout::Leaf {
