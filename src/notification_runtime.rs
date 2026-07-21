@@ -46,15 +46,34 @@ struct TerminalRoute {
     cli_registration: Option<Arc<CliRouteRegistration>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FocusedRouteState {
+    key: (EntityId, EntityId),
+    has_unread: bool,
+}
+
+fn take_cached_unread_route(
+    focused_route: Option<&mut FocusedRouteState>,
+) -> Option<(EntityId, EntityId)> {
+    let focused_route = focused_route?;
+    if !focused_route.has_unread {
+        return None;
+    }
+    focused_route.has_unread = false;
+    Some(focused_route.key)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use gpui::{EntityId, TestAppContext};
 
     use super::{
-        KittyRegistry, KittyRuntimeState, MAX_KITTY_PLAIN_CHUNK_BYTES, NotificationRuntime,
-        NotificationSequence, NotificationTarget, joined_identifier_bytes,
+        FocusedRouteState, KittyRegistry, KittyRuntimeState, MAX_KITTY_PLAIN_CHUNK_BYTES,
+        NotificationRuntime, NotificationSequence, NotificationTarget, joined_identifier_bytes,
         native_delivery_absorbs_removed_retraction, sequence_is_after, should_deliver_native,
-        unread_notification_ids_for_scope,
+        take_cached_unread_route, unread_notification_ids_for_scope,
     };
     use crate::{
         notifications::{
@@ -69,6 +88,41 @@ mod tests {
             workspace_id: workspace,
             item_id: EntityId::from(item),
         }
+    }
+
+    #[test]
+    fn keystroke_without_cached_unread_skips_store_callback() {
+        let store_accesses = Cell::new(0);
+        let mut focused_route = FocusedRouteState {
+            key: (EntityId::from(1), EntityId::from(2)),
+            has_unread: false,
+        };
+        if take_cached_unread_route(Some(&mut focused_route)).is_some() {
+            store_accesses.set(store_accesses.get() + 1);
+        }
+
+        assert_eq!(store_accesses.get(), 0);
+    }
+
+    #[test]
+    fn keystroke_with_cached_unread_dispatches_exact_route() {
+        let expected = (EntityId::from(1), EntityId::from(2));
+        let mut focused_route = FocusedRouteState {
+            key: expected,
+            has_unread: true,
+        };
+        let dispatched = Cell::new(take_cached_unread_route(Some(&mut focused_route)));
+
+        assert_eq!(dispatched.get(), Some(expected));
+        assert!(
+            !focused_route.has_unread,
+            "dispatch consumes the cached bit"
+        );
+        assert_eq!(
+            take_cached_unread_route(Some(&mut focused_route)),
+            None,
+            "a second key before observer refresh cannot rescan the store",
+        );
     }
 
     fn state(
@@ -403,6 +457,7 @@ mod tests {
 #[derive(Default)]
 pub struct NotificationRuntime {
     routes: HashMap<(EntityId, EntityId), TerminalRoute>,
+    focused_routes: HashMap<AnyWindowHandle, FocusedRouteState>,
     cli_routes: HashMap<CliRouteId, (EntityId, EntityId)>,
     pending_cli_routes: HashMap<EntityId, Arc<CliRouteRegistration>>,
     listeners_installed: HashSet<(EntityId, EntityId)>,
@@ -658,22 +713,18 @@ impl NotificationRuntime {
         if !cx.has_global::<Self>() {
             cx.set_global(Self::default());
             let subscription = cx.observe(&notification_store, |_store, cx| {
+                Self::refresh_focused_route_unread(cx);
                 Self::notify_terminal_tabs(cx);
             });
             cx.global_mut::<Self>()._notification_subscription = Some(subscription);
             cx.observe_keystrokes(|_, window, cx| {
-                let routes = cx
-                    .global::<Self>()
-                    .routes
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(target) = routes
-                    .iter()
-                    .find(|route| Self::route_is_focused_in_window(route, window, cx))
-                    .map(|route| route.target)
-                {
-                    Self::mark_item_read_state(target.scope_id, target.item_id, cx);
+                let target = take_cached_unread_route(
+                    cx.global_mut::<Self>()
+                        .focused_routes
+                        .get_mut(&window.window_handle()),
+                );
+                if let Some((scope_id, item_id)) = target {
+                    Self::mark_item_read_state(scope_id, item_id, cx);
                 }
             })
             .detach();
@@ -716,6 +767,55 @@ impl NotificationRuntime {
             .collect::<Vec<_>>();
         for view in views {
             let _ = view.update(cx, |_view, view_cx| view_cx.notify());
+        }
+    }
+
+    fn refresh_focused_route_unread(cx: &mut App) {
+        let focused_routes = cx
+            .global::<Self>()
+            .focused_routes
+            .iter()
+            .map(|(window, state)| (*window, state.key))
+            .collect::<Vec<_>>();
+        let unread = {
+            let store = crate::notifications::NotificationStore::global(cx);
+            let store = store.read(cx);
+            focused_routes
+                .into_iter()
+                .map(|(window, key)| (window, key, store.pane_has_unread(key.0, key.1)))
+                .collect::<Vec<_>>()
+        };
+        let runtime = cx.global_mut::<Self>();
+        for (window, key, has_unread) in unread {
+            if let Some(state) = runtime.focused_routes.get_mut(&window)
+                && state.key == key
+            {
+                state.has_unread = has_unread;
+            }
+        }
+    }
+
+    fn set_focused_route(window: AnyWindowHandle, key: (EntityId, EntityId), cx: &mut App) {
+        let has_unread = crate::notifications::NotificationStore::global(cx)
+            .read(cx)
+            .pane_has_unread(key.0, key.1);
+        cx.global_mut::<Self>()
+            .focused_routes
+            .insert(window, FocusedRouteState { key, has_unread });
+    }
+
+    fn clear_focused_route_if_matches(
+        window: AnyWindowHandle,
+        key: (EntityId, EntityId),
+        cx: &mut App,
+    ) {
+        let runtime = cx.global_mut::<Self>();
+        if runtime
+            .focused_routes
+            .get(&window)
+            .is_some_and(|state| state.key == key)
+        {
+            runtime.focused_routes.remove(&window);
         }
     }
 
@@ -919,10 +1019,17 @@ impl NotificationRuntime {
 
     fn remove_route_state(key: (EntityId, EntityId), cx: &mut App) {
         let runtime = cx.global_mut::<Self>();
-        if let Some(route) = runtime.routes.remove(&key)
-            && let Some(registration) = route.cli_registration
-        {
-            runtime.cli_routes.remove(&registration.route_id());
+        if let Some(route) = runtime.routes.remove(&key) {
+            if runtime
+                .focused_routes
+                .get(&route.window)
+                .is_some_and(|state| state.key == key)
+            {
+                runtime.focused_routes.remove(&route.window);
+            }
+            if let Some(registration) = route.cli_registration {
+                runtime.cli_routes.remove(&registration.route_id());
+            }
         }
         runtime.listeners_installed.remove(&key);
         runtime.osc_parsers.remove(&key);
@@ -960,21 +1067,35 @@ impl NotificationRuntime {
                     .and_then(|route| route.cli_registration.clone())
             })
         };
-        cx.global_mut::<Self>().routes.insert(
-            key,
-            TerminalRoute {
-                target,
-                window: window.window_handle(),
-                workspace,
-                panel,
-                view: view.downgrade(),
-                terminal: terminal.downgrade(),
-                terminal_id,
-                cli_registration: None,
-            },
-        );
+        let current_window = window.window_handle();
+        let previous_window = cx
+            .global_mut::<Self>()
+            .routes
+            .insert(
+                key,
+                TerminalRoute {
+                    target,
+                    window: current_window,
+                    workspace,
+                    panel,
+                    view: view.downgrade(),
+                    terminal: terminal.downgrade(),
+                    terminal_id,
+                    cli_registration: None,
+                },
+            )
+            .map(|route| route.window);
+        if let Some(previous_window) = previous_window
+            && previous_window != current_window
+        {
+            Self::clear_focused_route_if_matches(previous_window, key, cx);
+        }
         if let Some(registration) = cli_registration {
             Self::bind_cli_registration(key, registration, cx);
+        }
+
+        if Self::target_is_focused_in_window(target, window, cx) {
+            Self::set_focused_route(window.window_handle(), key, cx);
         }
 
         if !cx.global_mut::<Self>().listeners_installed.insert(key) {
@@ -984,7 +1105,8 @@ impl NotificationRuntime {
         view.update(cx, |view, view_cx| {
             let focus_handle = view.focus_handle(view_cx);
             view_cx
-                .on_focus_in(&focus_handle, window, move |_view, _window, cx| {
+                .on_focus_in(&focus_handle, window, move |_view, window, cx| {
+                    Self::set_focused_route(window.window_handle(), key, cx);
                     let store = crate::notifications::NotificationStore::global(cx);
                     let watermark = store.read(cx).newest_recorded_sequence();
                     cx.defer(move |cx| {

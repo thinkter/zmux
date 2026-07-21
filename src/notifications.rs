@@ -5,7 +5,10 @@
 //! and the runtime decides which side effects to perform. Keeping the history
 //! as a GPUI entity gives every window a single observable source of truth.
 
-use std::{collections::VecDeque, time::SystemTime};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::SystemTime,
+};
 
 use gpui::{App, AppContext, Entity, EntityId, Global};
 use serde::{Deserialize, Serialize};
@@ -142,6 +145,7 @@ pub struct RecordOutcome {
 /// Observable app-global notification history.
 pub struct NotificationStore {
     notifications: VecDeque<Notification>,
+    unread_panes: HashSet<(EntityId, EntityId)>,
     next_id: NotificationId,
     next_sequence: NotificationSequence,
     capacity: usize,
@@ -162,6 +166,7 @@ impl NotificationStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             notifications: VecDeque::new(),
+            unread_panes: HashSet::new(),
             next_id: 1,
             next_sequence: 1,
             capacity: capacity.max(1),
@@ -264,6 +269,7 @@ impl NotificationStore {
         };
         self.notifications.push_front(notification.clone());
         removed.extend(self.trim_to_capacity());
+        self.rebuild_unread_panes();
         Some(RecordOutcome {
             notification,
             removed,
@@ -276,7 +282,9 @@ impl NotificationStore {
 
     pub fn set_capacity(&mut self, capacity: usize) -> Vec<Notification> {
         self.capacity = capacity.max(1);
-        self.trim_to_capacity()
+        let removed = self.trim_to_capacity();
+        self.rebuild_unread_panes();
+        removed
     }
 
     pub fn notifications(&self) -> impl DoubleEndedIterator<Item = &Notification> {
@@ -316,11 +324,7 @@ impl NotificationStore {
     }
 
     pub fn pane_has_unread(&self, scope_id: EntityId, item_id: EntityId) -> bool {
-        self.notifications.iter().any(|notification| {
-            notification.target.scope_id == scope_id
-                && notification.target.item_id == item_id
-                && !notification.read
-        })
+        self.unread_panes.contains(&(scope_id, item_id))
     }
 
     /// Item entity IDs are process-global, so terminal tab lookups do not need
@@ -360,6 +364,9 @@ impl NotificationStore {
         };
         let changed = !notification.read;
         notification.read = true;
+        if changed {
+            self.rebuild_unread_panes();
+        }
         changed
     }
 
@@ -373,6 +380,9 @@ impl NotificationStore {
         };
         let changed = notification.read;
         notification.read = false;
+        if changed {
+            self.rebuild_unread_panes();
+        }
         changed
     }
 
@@ -396,6 +406,9 @@ impl NotificationStore {
             notification.read = true;
             changed += 1;
         }
+        if changed > 0 {
+            self.rebuild_unread_panes();
+        }
         changed
     }
 
@@ -408,6 +421,9 @@ impl NotificationStore {
         }) {
             notification.read = true;
             changed += 1;
+        }
+        if changed > 0 {
+            self.rebuild_unread_panes();
         }
         changed
     }
@@ -422,6 +438,9 @@ impl NotificationStore {
             notification.read = true;
             changed += 1;
         }
+        if changed > 0 {
+            self.unread_panes.clear();
+        }
         changed
     }
 
@@ -429,7 +448,11 @@ impl NotificationStore {
         let before = self.notifications.len();
         self.notifications
             .retain(|notification| notification.id != id);
-        self.notifications.len() != before
+        let changed = self.notifications.len() != before;
+        if changed {
+            self.rebuild_unread_panes();
+        }
+        changed
     }
 
     pub fn dismiss_all_read(&mut self) -> usize {
@@ -443,7 +466,11 @@ impl NotificationStore {
         self.notifications.retain(|notification| {
             notification.target.scope_id != scope_id || notification.target.item_id != item_id
         });
-        before - self.notifications.len()
+        let changed = before - self.notifications.len();
+        if changed > 0 {
+            self.unread_panes.remove(&(scope_id, item_id));
+        }
+        changed
     }
 
     pub fn clear_workspace(&mut self, scope_id: EntityId, workspace_id: WorkspaceId) -> usize {
@@ -452,20 +479,39 @@ impl NotificationStore {
             notification.target.scope_id != scope_id
                 || notification.target.workspace_id != workspace_id
         });
-        before - self.notifications.len()
+        let changed = before - self.notifications.len();
+        if changed > 0 {
+            self.rebuild_unread_panes();
+        }
+        changed
     }
 
     pub fn clear_scope(&mut self, scope_id: EntityId) -> usize {
         let before = self.notifications.len();
         self.notifications
             .retain(|notification| notification.target.scope_id != scope_id);
-        before - self.notifications.len()
+        let changed = before - self.notifications.len();
+        if changed > 0 {
+            self.rebuild_unread_panes();
+        }
+        changed
     }
 
     pub fn clear_all(&mut self) -> usize {
         let count = self.notifications.len();
         self.notifications.clear();
+        self.unread_panes.clear();
         count
+    }
+
+    fn rebuild_unread_panes(&mut self) {
+        self.unread_panes.clear();
+        self.unread_panes.extend(
+            self.notifications
+                .iter()
+                .filter(|notification| !notification.read)
+                .map(|notification| (notification.target.scope_id, notification.target.item_id)),
+        );
     }
 
     fn trim_to_capacity(&mut self) -> Vec<Notification> {
@@ -631,6 +677,37 @@ mod tests {
         assert!(store.item_has_unread(entity_id(2)));
         assert!(!store.workspace_has_unread(entity_id(10), 1));
         assert!(store.workspace_has_unread(entity_id(20), 1));
+    }
+
+    #[test]
+    fn pane_unread_index_tracks_state_changes_and_removals() {
+        let mut store = NotificationStore::with_capacity(2);
+        let first_target = target(1, 1, 1);
+        let second_target = target(1, 1, 2);
+        let third_target = target(1, 2, 3);
+        let first = record(&mut store, request(first_target, "first"));
+
+        assert!(store.pane_has_unread(first_target.scope_id, first_target.item_id));
+        assert!(store.mark_read(first.id));
+        assert!(!store.pane_has_unread(first_target.scope_id, first_target.item_id));
+        assert!(store.mark_unread(first.id));
+        assert!(store.pane_has_unread(first_target.scope_id, first_target.item_id));
+
+        record(&mut store, request(second_target, "second"));
+        record(&mut store, request(third_target, "third"));
+        assert!(
+            store.get(first.id).is_none(),
+            "capacity evicted the first row"
+        );
+        assert!(!store.pane_has_unread(first_target.scope_id, first_target.item_id));
+
+        assert_eq!(
+            store.mark_pane_read(second_target.scope_id, second_target.item_id),
+            1
+        );
+        assert!(!store.pane_has_unread(second_target.scope_id, second_target.item_id));
+        assert_eq!(store.clear_scope(third_target.scope_id), 2);
+        assert!(!store.pane_has_unread(third_target.scope_id, third_target.item_id));
     }
 
     #[test]
