@@ -137,7 +137,7 @@ Build notes:
 
 - `zmux` wraps Zed's GPUI terminal view, which pulls in substantial editor/workspace/UI code. The required Zed crates are fetched from `https://github.com/zed-industries/zed` at the pinned revision recorded in `Cargo.toml` and `Cargo.lock`
 - On the first run after moving away from Zed's data directory, legacy databases are copied into a private staging directory and atomically installed without changing the Zed copy. Each live WAL-mode `db.sqlite` is captured with SQLite's online backup API; raw WAL, shared-memory, and rollback-journal sidecars are not copied.
-- Release builds strip symbols and use `panic = "abort"` to reduce artifact size without enabling slower size optimizations such as LTO by default.
+- Release builds strip symbols, use thin LTO, and retain `panic = "abort"` for artifact size. Before an abort, a bounded panic hook attempts one atomic, fsync-backed commit of the latest captured session layout.
 - Linux and FreeBSD builds enable `gpui_platform`'s `font-kit`, `wayland`, and `x11` backends. macOS and Windows avoid those Linux display features in this crate's target-specific dependency configuration.
 - Cross-platform builds still require the appropriate platform toolchain and native QA for GUI, PTY, clipboard, and font behavior.
 - Release CI pins Ubuntu 24.04, macOS 15 (with a macOS 12 deployment target), and Windows 2025; the Linux `.deb` therefore targets the Ubuntu 24.04/glibc compatibility baseline.

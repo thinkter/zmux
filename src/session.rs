@@ -11,9 +11,9 @@ use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+use std::sync::{Arc, Mutex, Once, OnceLock, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
@@ -29,6 +29,11 @@ pub const MAX_TERMINALS_PER_WORKSPACE: usize = 256;
 pub const MAX_NAME_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 4_096;
 const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(60 * 60);
+const PANIC_SESSION_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+static PROCESS_SESSION_STORE: OnceLock<SessionStore> = OnceLock::new();
+static INSTALL_PANIC_HOOK: Once = Once::new();
+static PANIC_FLUSH_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,11 +310,18 @@ pub enum ResumePolicy {
     Disabled,
 }
 
+#[derive(Clone, Debug)]
+struct CachedSessionSnapshot {
+    owner_generation: SessionOwnerGeneration,
+    snapshot: Arc<SessionSnapshot>,
+}
+
 #[derive(Debug, Default)]
 struct SessionWriter {
     next_sequence: AtomicU64,
     newest_sequence: AtomicU64,
     owner_generation: AtomicU64,
+    crash_snapshot: Mutex<Option<CachedSessionSnapshot>>,
     write_lock: Mutex<()>,
 }
 
@@ -339,6 +351,105 @@ pub struct SessionOwnerGeneration(u64);
 pub enum SessionWriteOutcome {
     Installed,
     Superseded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CrashFlushOutcome {
+    Installed,
+    Superseded,
+    NoSnapshot,
+    SnapshotBusy,
+    TimedOut,
+    Failed(String),
+}
+
+pub(crate) struct CrashSessionFlusher {
+    request_sender: mpsc::SyncSender<mpsc::SyncSender<CrashFlushOutcome>>,
+}
+
+impl CrashSessionFlusher {
+    pub(crate) fn start(store: SessionStore) -> std::io::Result<Self> {
+        let (request_sender, request_receiver) =
+            mpsc::sync_channel::<mpsc::SyncSender<CrashFlushOutcome>>(1);
+        std::thread::Builder::new()
+            .name("zmux-panic-session-flush".to_owned())
+            .spawn(move || {
+                while let Ok(result_sender) = request_receiver.recv() {
+                    let _ = result_sender.send(store.commit_cached_for_crash());
+                }
+            })?;
+        Ok(Self { request_sender })
+    }
+
+    pub(crate) fn flush(&self, timeout: Duration) -> CrashFlushOutcome {
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        match self.request_sender.try_send(result_sender) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return CrashFlushOutcome::SnapshotBusy,
+            Err(TrySendError::Disconnected(_)) => {
+                return CrashFlushOutcome::Failed(
+                    "panic session writer is no longer running".to_owned(),
+                );
+            }
+        }
+        match result_receiver.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => CrashFlushOutcome::TimedOut,
+            Err(RecvTimeoutError::Disconnected) => CrashFlushOutcome::Failed(
+                "panic session writer stopped without reporting a result".to_owned(),
+            ),
+        }
+    }
+}
+
+/// Return the one session store shared by normal persistence and the panic
+/// hook. `configure_zmux_paths` must run before the first call so the path is
+/// rooted in zmux's private data directory.
+pub(crate) fn process_session_store() -> SessionStore {
+    PROCESS_SESSION_STORE
+        .get_or_init(SessionStore::from_environment)
+        .clone()
+}
+
+/// Keep `panic = "abort"` from discarding the newest in-memory layout without
+/// first attempting one bounded, durable session commit.
+pub(crate) fn install_panic_session_flush() -> Result<()> {
+    install_panic_session_flush_with(process_session_store())
+}
+
+fn install_panic_session_flush_with(store: SessionStore) -> Result<()> {
+    if INSTALL_PANIC_HOOK.is_completed() {
+        return Ok(());
+    }
+    let flusher =
+        CrashSessionFlusher::start(store).context("starting the bounded panic session writer")?;
+    INSTALL_PANIC_HOOK.call_once(move || {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            if !PANIC_FLUSH_STARTED.swap(true, Ordering::AcqRel) {
+                match flusher.flush(PANIC_SESSION_FLUSH_TIMEOUT) {
+                    CrashFlushOutcome::Installed => {
+                        eprintln!("persisted the latest zmux session before aborting");
+                    }
+                    CrashFlushOutcome::Superseded | CrashFlushOutcome::NoSnapshot => {}
+                    CrashFlushOutcome::SnapshotBusy => {
+                        eprintln!("could not read the latest zmux session during panic handling");
+                    }
+                    CrashFlushOutcome::TimedOut => {
+                        eprintln!(
+                            "timed out after {} ms while persisting the zmux session during panic handling",
+                            PANIC_SESSION_FLUSH_TIMEOUT.as_millis()
+                        );
+                    }
+                    CrashFlushOutcome::Failed(error) => {
+                        eprintln!("failed to persist the zmux session during panic handling: {error}");
+                    }
+                }
+            }
+            previous_hook(panic_info);
+        }));
+    });
+    Ok(())
 }
 
 impl SessionStore {
@@ -387,7 +498,60 @@ impl SessionStore {
             .ok()
             .and_then(|previous| previous.checked_add(1))
             .context("zmux session owner generation overflowed")?;
-        Ok(SessionOwnerGeneration(generation))
+        let generation = SessionOwnerGeneration(generation);
+        *self
+            .writer
+            .crash_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        Ok(generation)
+    }
+
+    /// Publish the newest fully captured layout for the panic hook without
+    /// doing filesystem I/O on the UI thread. A stale owner cannot replace the
+    /// current owner's recovery snapshot.
+    pub(crate) fn cache_for_crash(
+        &self,
+        snapshot: SessionSnapshot,
+        owner_generation: SessionOwnerGeneration,
+    ) {
+        if owner_generation
+            != SessionOwnerGeneration(self.writer.owner_generation.load(Ordering::Acquire))
+        {
+            return;
+        }
+        let mut cached = self
+            .writer
+            .crash_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if owner_generation
+            == SessionOwnerGeneration(self.writer.owner_generation.load(Ordering::Acquire))
+        {
+            *cached = Some(CachedSessionSnapshot {
+                owner_generation,
+                snapshot: Arc::new(snapshot),
+            });
+        }
+    }
+
+    fn commit_cached_for_crash(&self) -> CrashFlushOutcome {
+        let cached = match self.writer.crash_snapshot.try_lock() {
+            Ok(cached) => cached.clone(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+            Err(TryLockError::WouldBlock) => return CrashFlushOutcome::SnapshotBusy,
+        };
+        let Some(cached) = cached else {
+            return CrashFlushOutcome::NoSnapshot;
+        };
+        match self
+            .prepare_save(&cached.snapshot, cached.owner_generation)
+            .and_then(|write| self.commit(&write))
+        {
+            Ok(SessionWriteOutcome::Installed) => CrashFlushOutcome::Installed,
+            Ok(SessionWriteOutcome::Superseded) => CrashFlushOutcome::Superseded,
+            Err(error) => CrashFlushOutcome::Failed(format!("{error:#}")),
+        }
     }
 
     /// Reserve this write's place in the newest-wins order. Validation and
@@ -583,12 +747,16 @@ fn install_session_file(temporary: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+    use std::time::Instant;
 
     use super::*;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    const PANIC_HOOK_CHILD: &str = "ZMUX_PANIC_HOOK_TEST_CHILD";
+    const PANIC_HOOK_SESSION_PATH: &str = "ZMUX_PANIC_HOOK_TEST_SESSION_PATH";
 
     fn test_store(name: &str) -> SessionStore {
         let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -872,6 +1040,159 @@ mod tests {
             SessionWriteOutcome::Installed
         );
         assert_eq!(store.load().unwrap(), Some(current_snapshot));
+    }
+
+    #[test]
+    fn crash_flush_durably_commits_the_latest_cached_snapshot() {
+        let store = test_store("crash-flush");
+        let flusher = CrashSessionFlusher::start(store.clone()).unwrap();
+        let generation = store.begin_owner_generation().unwrap();
+        let mut expected = snapshot();
+        expected.workspaces[0].manual_name = Some("captured before debounce".into());
+        store.cache_for_crash(expected.clone(), generation);
+
+        assert_eq!(
+            flusher.flush(Duration::from_secs(1)),
+            CrashFlushOutcome::Installed
+        );
+        assert_eq!(store.load().unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn ownership_transfer_clears_a_stale_crash_snapshot() {
+        let store = test_store("stale-crash-owner");
+        let flusher = CrashSessionFlusher::start(store.clone()).unwrap();
+        let first_generation = store.begin_owner_generation().unwrap();
+        store.cache_for_crash(snapshot(), first_generation);
+
+        store.begin_owner_generation().unwrap();
+
+        assert_eq!(
+            flusher.flush(Duration::from_secs(1)),
+            CrashFlushOutcome::NoSnapshot
+        );
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[test]
+    fn crash_flush_never_waits_past_its_deadline_for_the_writer_lock() {
+        let store = test_store("crash-flush-timeout");
+        let flusher = CrashSessionFlusher::start(store.clone()).unwrap();
+        let generation = store.begin_owner_generation().unwrap();
+        store.cache_for_crash(snapshot(), generation);
+        let guard = store.writer.write_lock.lock().unwrap();
+        let started = Instant::now();
+
+        assert_eq!(
+            flusher.flush(Duration::from_millis(25)),
+            CrashFlushOutcome::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        drop(guard);
+    }
+
+    #[test]
+    fn crash_flush_does_not_block_on_a_busy_snapshot_cache() {
+        let store = test_store("crash-cache-busy");
+        let flusher = CrashSessionFlusher::start(store.clone()).unwrap();
+        let generation = store.begin_owner_generation().unwrap();
+        store.cache_for_crash(snapshot(), generation);
+        let _guard = store.writer.crash_snapshot.lock().unwrap();
+
+        assert_eq!(
+            flusher.flush(Duration::from_secs(1)),
+            CrashFlushOutcome::SnapshotBusy
+        );
+    }
+
+    #[test]
+    fn panic_hook_subprocess_child() {
+        let Ok(mode) = std::env::var(PANIC_HOOK_CHILD) else {
+            return;
+        };
+        let path = PathBuf::from(
+            std::env::var_os(PANIC_HOOK_SESSION_PATH)
+                .expect("panic-hook child requires a session path"),
+        );
+        let store = SessionStore::at(path);
+        let generation = store.begin_owner_generation().unwrap();
+        let mut expected = snapshot();
+        expected.workspaces[0].manual_name = Some("captured by the panic hook".into());
+        store.cache_for_crash(expected, generation);
+        install_panic_session_flush_with(store.clone()).unwrap();
+
+        let writer = store.writer.clone();
+        let _blocked_writer = (mode == "blocked").then(|| writer.write_lock.lock().unwrap());
+        let _ = std::panic::catch_unwind(|| {
+            panic!("deliberately injected non-critical subsystem panic");
+        });
+
+        // Test binaries unwind regardless of the package's release panic
+        // strategy. Terminate explicitly so the parent verifies recovery
+        // without Rust destructors or ordinary shutdown persistence, matching
+        // production without making the test wait for OS core-dump handling.
+        std::process::exit(86);
+    }
+
+    #[test]
+    fn installed_panic_hook_durably_commits_and_obeys_its_deadline() {
+        let executable = std::env::current_exe().expect("locate the test executable");
+        let directory = std::env::temp_dir().join(format!(
+            "zmux-panic-hook-test-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        let recovered_path = directory.join("recovered-session.json");
+        let recovered = Command::new(&executable)
+            .args([
+                "--exact",
+                "session::tests::panic_hook_subprocess_child",
+                "--nocapture",
+            ])
+            .env(PANIC_HOOK_CHILD, "commit")
+            .env(PANIC_HOOK_SESSION_PATH, &recovered_path)
+            .output()
+            .expect("run panic-hook recovery subprocess");
+        assert!(!recovered.status.success());
+        assert!(
+            String::from_utf8_lossy(&recovered.stderr)
+                .contains("persisted the latest zmux session before aborting")
+        );
+        let mut expected = snapshot();
+        expected.workspaces[0].manual_name = Some("captured by the panic hook".into());
+        assert_eq!(
+            SessionStore::at(recovered_path).load().unwrap(),
+            Some(expected),
+            "a fresh store must recover exactly the crash-time snapshot"
+        );
+
+        let blocked_path = directory.join("blocked-session.json");
+        let started = Instant::now();
+        let blocked = Command::new(&executable)
+            .args([
+                "--exact",
+                "session::tests::panic_hook_subprocess_child",
+                "--nocapture",
+            ])
+            .env(PANIC_HOOK_CHILD, "blocked")
+            .env(PANIC_HOOK_SESSION_PATH, &blocked_path)
+            .output()
+            .expect("run blocked panic-hook subprocess");
+        let elapsed = started.elapsed();
+        assert!(!blocked.status.success());
+        assert!(
+            String::from_utf8_lossy(&blocked.stderr)
+                .contains("timed out after 1000 ms while persisting the zmux session")
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "panic hook exceeded its hard deadline: {elapsed:?}"
+        );
+
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

@@ -493,9 +493,11 @@ fn publish_chat_state(
 }
 
 fn next_agent_activity_sequence(sequence: &mut u64) -> u64 {
-    *sequence = sequence
-        .checked_add(1)
-        .expect("agent activity sequence exhausted");
+    let Some(next) = sequence.checked_add(1) else {
+        log::error!("agent activity sequence exhausted; retaining the last stable order");
+        return *sequence;
+    };
+    *sequence = next;
     *sequence
 }
 
@@ -573,6 +575,14 @@ pub(super) fn agent_chats_for_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_activity_sequence_retains_the_last_stable_order() {
+        let mut sequence = u64::MAX;
+
+        assert_eq!(next_agent_activity_sequence(&mut sequence), u64::MAX);
+        assert_eq!(sequence, u64::MAX);
+    }
 
     #[test]
     fn agent_kinds_are_recognized_from_process_paths() {

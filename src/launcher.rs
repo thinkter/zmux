@@ -5,5 +5,6 @@
 /// state identically.
 pub fn run_gui() -> anyhow::Result<()> {
     crate::bootstrap::configure_zmux_paths()?;
+    crate::session::install_panic_session_flush()?;
     crate::run()
 }

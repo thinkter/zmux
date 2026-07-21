@@ -130,6 +130,7 @@ mod tests {
                 "A",
                 "older in this window",
             ))
+            .unwrap()
             .notification;
         let in_b = store
             .record(NotificationRequest::new(
@@ -138,6 +139,7 @@ mod tests {
                 "B",
                 "newer globally",
             ))
+            .unwrap()
             .notification;
 
         assert_eq!(store.latest_unread().unwrap().id, in_b.id);
@@ -159,6 +161,7 @@ mod tests {
                 "old",
                 "old",
             ))
+            .unwrap()
             .notification;
         let replacement = store
             .record(NotificationRequest::new(
@@ -167,6 +170,7 @@ mod tests {
                 "new",
                 "new",
             ))
+            .unwrap()
             .notification;
         let unrelated = store
             .record(NotificationRequest::new(
@@ -175,6 +179,7 @@ mod tests {
                 "other",
                 "other",
             ))
+            .unwrap()
             .notification;
 
         assert!(native_delivery_absorbs_removed_retraction(
@@ -194,9 +199,9 @@ mod tests {
         let mut request =
             NotificationRequest::new(owner, NotificationSource::Osc99, "build", "first");
         request.identity = NotificationIdentity::KittyNamed("build".to_owned());
-        let first = store.record(request.clone()).notification;
+        let first = store.record(request.clone()).unwrap().notification;
         request.body = "updated canonical body".to_owned();
-        let update = store.record(request);
+        let update = store.record(request).unwrap();
 
         assert_eq!(update.notification.id, first.id);
         assert!(update.removed.is_empty());
@@ -346,6 +351,7 @@ mod tests {
                         "Background build",
                         "Still needs attention",
                     ))
+                    .unwrap()
                     .notification
             });
             let mut tracked = state(owner, Some("build"), notification.sequence);
@@ -986,6 +992,11 @@ impl NotificationRuntime {
                     });
                 })
                 .detach();
+            view_cx
+                .on_focus_out(&focus_handle, window, move |_view, _event, window, cx| {
+                    Self::clear_focused_route_if_matches(window.window_handle(), key, cx);
+                })
+                .detach();
         });
 
         // TerminalView intentionally forwards only a subset of terminal
@@ -1012,9 +1023,10 @@ impl NotificationRuntime {
     }
 
     /// Submit a notification from any ingress path.
-    pub fn publish(request: NotificationRequest, cx: &mut App) -> Notification {
+    pub fn publish(request: NotificationRequest, cx: &mut App) -> Option<Notification> {
         let exact_target_is_focused = Self::target_is_focused(request.target, cx);
-        Self::publish_with_focus(request, exact_target_is_focused, cx).notification
+        Self::publish_with_focus(request, exact_target_is_focused, cx)
+            .map(|published| published.notification)
     }
 
     /// Submit while already updating the notification's owning window.
@@ -1026,16 +1038,17 @@ impl NotificationRuntime {
         request: NotificationRequest,
         window: &Window,
         cx: &mut App,
-    ) -> Notification {
+    ) -> Option<Notification> {
         let exact_target_is_focused = Self::target_is_focused_in_window(request.target, window, cx);
-        Self::publish_with_focus(request, exact_target_is_focused, cx).notification
+        Self::publish_with_focus(request, exact_target_is_focused, cx)
+            .map(|published| published.notification)
     }
 
     fn publish_with_focus(
         request: NotificationRequest,
         exact_target_is_focused: bool,
         cx: &mut App,
-    ) -> PublishedNotification {
+    ) -> Option<PublishedNotification> {
         Self::publish_with_native_override(request, exact_target_is_focused, false, cx)
     }
 
@@ -1044,7 +1057,7 @@ impl NotificationRuntime {
         exact_target_is_focused: bool,
         force_native_delivery: bool,
         cx: &mut App,
-    ) -> PublishedNotification {
+    ) -> Option<PublishedNotification> {
         let target = request.target;
         if request.source != NotificationSource::Osc99 {
             Self::report_target_closed(target.scope_id, target.item_id, cx);
@@ -1052,9 +1065,12 @@ impl NotificationRuntime {
         let outcome =
             crate::notifications::NotificationStore::global(cx).update(cx, |store, store_cx| {
                 let outcome = store.record(request);
-                store_cx.notify();
+                if outcome.is_some() {
+                    store_cx.notify();
+                }
                 outcome
             });
+        let outcome = outcome?;
         let notification = outcome.notification;
         let should_deliver = should_deliver_native(exact_target_is_focused, force_native_delivery);
 
@@ -1084,10 +1100,10 @@ impl NotificationRuntime {
             DesktopNotificationService::retract(notification.id, cx);
         }
 
-        PublishedNotification {
+        Some(PublishedNotification {
             notification,
             native_alive,
-        }
+        })
     }
 
     pub fn publish_manual_for_target(
@@ -1096,7 +1112,7 @@ impl NotificationRuntime {
         body: impl Into<String>,
         window: &Window,
         cx: &mut App,
-    ) -> Notification {
+    ) -> Option<Notification> {
         Self::publish_from_window(
             NotificationRequest::new(target, NotificationSource::Manual, title, body),
             window,
@@ -1146,7 +1162,7 @@ impl NotificationRuntime {
             notification.body,
         );
         request.subtitle = notification.subtitle.unwrap_or_default();
-        Some(Self::publish(request, cx))
+        Self::publish(request, cx)
     }
 
     pub fn target_is_focused(target: NotificationTarget, cx: &mut App) -> bool {
@@ -1748,12 +1764,14 @@ impl NotificationRuntime {
                             KittyDeliveryCondition::Always | KittyDeliveryCondition::Invisible
                         )
                     });
-                    let published = Self::publish_with_native_override(
+                    let Some(published) = Self::publish_with_native_override(
                         request,
                         exact_target_is_focused,
                         force_native_delivery,
                         cx,
-                    );
+                    ) else {
+                        continue;
+                    };
 
                     if let Some(kitty) = notification.kitty {
                         let client_id = kitty.identifier;

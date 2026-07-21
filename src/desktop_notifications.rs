@@ -548,9 +548,10 @@ impl DesktopNotificationService {
             eprintln!("native notification delivery queue is full; row remains canonical-only");
             return false;
         };
-        let order = submission_order
-            .checked_add(1)
-            .expect("native notification submission order exhausted");
+        let Some(order) = submission_order.checked_add(1) else {
+            eprintln!("native notification submission order exhausted; dropping delivery");
+            return false;
+        };
         match self
             .delivery_sender
             .try_send(QueuedDelivery { order, job, permit })
@@ -577,9 +578,10 @@ impl DesktopNotificationService {
             .submission_order
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let order = submission_order
-            .checked_add(1)
-            .expect("native notification submission order exhausted");
+        let Some(order) = submission_order.checked_add(1) else {
+            eprintln!("native notification submission order exhausted; dropping retraction");
+            return false;
+        };
         if !enqueue_retraction_control(
             &self.control_sender,
             &self.coalesced_retract_all_order,
@@ -711,10 +713,15 @@ impl<B: NativeBackend> NotificationDispatcher<B> {
         }
 
         let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("native notification generation space exhausted");
+        let Some(next_generation) = self.next_generation.checked_add(1) else {
+            eprintln!("native notification generation space exhausted; dropping delivery");
+            self.emit_action(DesktopNotificationAction::Unavailable {
+                id: job.id,
+                sequence: job.sequence,
+            });
+            return;
+        };
+        self.next_generation = next_generation;
         let supersedes_different_canonical_record = self
             .active
             .get(&job.key)
@@ -1189,12 +1196,11 @@ impl NotifyRustBackend {
             generation,
             kind: NativeCallbackKind::Closed,
         };
-        if let Err(error) = self
+        let observer = self
             .mac_observer
             .as_ref()
-            .expect("macOS response observer was initialized")
-            .observe(handle, callback)
-        {
+            .ok_or_else(|| "macOS response observer is unavailable".to_owned())?;
+        if let Err(error) = observer.observe(handle, callback) {
             mac_usernotifications::blocking::close_delivered(&native_id);
             mac_usernotifications::blocking::cancel_pending(&native_id);
             return Err(error);
@@ -1252,19 +1258,16 @@ impl NotifyRustBackend {
     {
         let listener_ready = listener_status.is_ok() && self.xdg_listener.is_some();
         if listener_ready {
-            self.xdg_listener
-                .as_ref()
-                .expect("XDG listener readiness was checked")
-                .begin_show(replacement.map(|NotifyRustToken::Xdg(id)| *id));
+            let Some(listener) = self.xdg_listener.as_ref() else {
+                return Err("XDG signal listener disappeared before notification delivery".into());
+            };
+            listener.begin_show(replacement.map(|NotifyRustToken::Xdg(id)| *id));
         }
         let handle = match show() {
             Ok(handle) => handle,
             Err(error) => {
-                if listener_ready {
-                    self.xdg_listener
-                        .as_ref()
-                        .expect("XDG listener readiness was checked")
-                        .cancel_show();
+                if listener_ready && let Some(listener) = self.xdg_listener.as_ref() {
+                    listener.cancel_show();
                 }
                 return Err(error);
             }
@@ -1288,20 +1291,21 @@ impl NotifyRustBackend {
         }
 
         let previous_id = replacement.map(|NotifyRustToken::Xdg(id)| *id);
-        self.xdg_listener
+        let listener = self
+            .xdg_listener
             .as_mut()
-            .expect("XDG listener status was checked")
-            .register(
-                native_id,
-                previous_id,
-                NativeCallback {
-                    key: job.key.clone(),
-                    id: job.id,
-                    sequence: job.sequence,
-                    generation,
-                    kind: NativeCallbackKind::Closed,
-                },
-            );
+            .ok_or_else(|| "XDG signal listener disappeared before registration".to_owned())?;
+        listener.register(
+            native_id,
+            previous_id,
+            NativeCallback {
+                key: job.key.clone(),
+                id: job.id,
+                sequence: job.sequence,
+                generation,
+                kind: NativeCallbackKind::Closed,
+            },
+        );
         drop(handle);
         Ok(NotifyRustToken::Xdg(native_id))
     }
@@ -1320,7 +1324,7 @@ impl NotifyRustBackend {
         }
         self.xdg_connection
             .as_ref()
-            .expect("XDG connection was initialized")
+            .ok_or_else(|| "XDG notification connection is unavailable".to_owned())?
             .call_method(
                 Some("org.freedesktop.Notifications"),
                 "/org/freedesktop/Notifications",
@@ -1850,7 +1854,7 @@ impl XdgSignalListener {
     fn close_notification(&self, native_id: u32) -> Result<(), String> {
         self.connection
             .as_ref()
-            .expect("XDG signal listener connection is available")
+            .ok_or_else(|| "XDG signal listener connection is unavailable".to_owned())?
             .call_method(
                 Some("org.freedesktop.Notifications"),
                 "/org/freedesktop/Notifications",

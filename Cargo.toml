@@ -195,6 +195,8 @@ terminal = { workspace = true, features = ["test-support"] }
 
 [profile.release]
 strip = "symbols"
+# A bounded panic hook commits the latest captured session through SessionStore
+# before this process-wide abort, preserving layouts without paying unwind cost.
 panic = "abort"
 # Thin LTO + a single codegen unit shrink the statically-linked Zed dependency
 # graph substantially and improve runtime code quality; fat LTO was rejected

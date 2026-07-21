@@ -817,7 +817,10 @@ impl WorkspacesPanel {
         let recheck = self
             .path_context_cache
             .lock()
-            .expect("path context cache poisoned")
+            .unwrap_or_else(|poisoned| {
+                log::error!("recovering poisoned path context cache during Git-root recheck");
+                poisoned.into_inner()
+            })
             .git_root_recheck(&directory, interval);
         let update = self
             .git_root_recheck_schedule
@@ -847,10 +850,12 @@ impl WorkspacesPanel {
                 let pending = this.git_root_recheck_schedule.take_firing_paths();
                 let interval = this.negative_git_root_recheck_interval(cx);
                 let states = {
-                    let mut cache = this
-                        .path_context_cache
-                        .lock()
-                        .expect("path context cache poisoned");
+                    let mut cache = this.path_context_cache.lock().unwrap_or_else(|poisoned| {
+                        log::error!(
+                            "recovering poisoned path context cache during scheduled recheck"
+                        );
+                        poisoned.into_inner()
+                    });
                     pending
                         .into_iter()
                         .map(|directory| {
@@ -1134,10 +1139,11 @@ impl WorkspacesPanel {
         cx: &mut Context<Self>,
     ) {
         let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("workspace ID space exhausted");
+        let Some(next_id) = self.next_id.checked_add(1) else {
+            log::error!("cannot create another workspace: workspace ID space is exhausted");
+            return;
+        };
+        self.next_id = next_id;
         self.entries.push(WorkspaceEntry {
             id,
             manual_name: None,
@@ -1254,10 +1260,13 @@ impl WorkspacesPanel {
 
         self.cancel_rename(cx);
         let previous = self.active;
-        self.activation_generation = self
-            .activation_generation
-            .checked_add(1)
-            .expect("workspace activation generation exhausted");
+        let Some(activation_generation) = self.activation_generation.checked_add(1) else {
+            log::error!(
+                "cannot activate workspace {id}: workspace activation generation is exhausted"
+            );
+            return;
+        };
+        self.activation_generation = activation_generation;
         let target_generation = self.activation_generation;
         // Take the target's parked layout out before we borrow the workspace so we
         // don't have to touch `self` inside the update closure.

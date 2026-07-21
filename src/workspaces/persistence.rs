@@ -83,7 +83,9 @@ pub(super) fn register_session_panel(
     cx: &mut Context<WorkspacesPanel>,
 ) -> SessionOwnershipClaim {
     if !cx.has_global::<SessionOwnership>() {
-        cx.set_global(SessionOwnership::new(SessionStore::from_environment()));
+        cx.set_global(SessionOwnership::new(
+            crate::session::process_session_store(),
+        ));
     }
 
     let id = panel.entity_id();
@@ -347,26 +349,33 @@ impl SessionPersistence {
 }
 
 impl WorkspacesPanel {
-    /// Persist the newest layout after mutations have been quiet for 500 ms.
-    /// Replacing the task resets the debounce window, so a burst of split,
-    /// resize, tab, and workspace changes produces one detached snapshot.
+    /// Capture the newest layout immediately, then persist it after mutations
+    /// have been quiet for 500 ms. Replacing the task resets only the disk-I/O
+    /// debounce window: the panic hook must never wait for this task to be
+    /// polled before it can see the state that triggered the request.
     pub(super) fn schedule_session_persistence(&mut self, cx: &mut Context<Self>) {
         if self.session_owner_generation.is_none() {
             return;
         }
+        self.request_session_snapshot(cx);
         self.session_persist_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(super::SESSION_PERSIST_DEBOUNCE)
                 .await;
             this.update(cx, |this, cx| {
                 this.session_persist_task.take();
-                this.persist_session(cx);
+                this.start_session_write(cx);
             })
             .ok();
         }));
     }
 
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
+        self.request_session_snapshot(cx);
+        self.start_session_write(cx);
+    }
+
+    fn request_session_snapshot(&mut self, cx: &mut Context<Self>) {
         if self.session_owner_generation.is_none() {
             return;
         }
@@ -418,8 +427,11 @@ impl WorkspacesPanel {
             active_workspace_id: self.active,
             workspaces,
         };
-        self.session_persistence.request(snapshot);
-        self.start_session_write(cx);
+        if let Some(owner_generation) = self.session_owner_generation {
+            self.session_store
+                .cache_for_crash(snapshot.clone(), owner_generation);
+            self.session_persistence.request(snapshot);
+        }
     }
 
     fn start_session_write(&mut self, cx: &mut Context<Self>) {

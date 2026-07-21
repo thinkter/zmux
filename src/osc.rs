@@ -289,10 +289,10 @@ impl OscNotificationParser {
         }
 
         if !frame.done {
-            self.store_pending(
-                identifier.expect("incomplete frame must have an identifier"),
-                pending,
-            );
+            let Some(identifier) = identifier else {
+                return Err(OscParseError::InvalidIdentifier);
+            };
+            self.store_pending(identifier, pending);
             return Ok(None);
         }
 

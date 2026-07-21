@@ -476,14 +476,20 @@ impl ZmuxRepositoryScope {
     pub fn register(&self, project: &Entity<project::Project>, panel: &Entity<WorkspacesPanel>) {
         self.panels
             .lock()
-            .expect("repository scope registry poisoned")
+            .unwrap_or_else(|poisoned| {
+                log::error!("recovering poisoned repository scope registry");
+                poisoned.into_inner()
+            })
             .insert(project.entity_id(), panel.downgrade());
     }
 
     fn panel_for(&self, project: &Entity<project::Project>) -> Option<WeakEntity<WorkspacesPanel>> {
         self.panels
             .lock()
-            .expect("repository scope registry poisoned")
+            .unwrap_or_else(|poisoned| {
+                log::error!("recovering poisoned repository scope registry");
+                poisoned.into_inner()
+            })
             .get(&project.entity_id())
             .cloned()
     }
@@ -1422,7 +1428,10 @@ fn finalize_workspace_context(
 fn nearest_git_root(cache: &Mutex<PathContextCache>, directory: &Path) -> Option<PathBuf> {
     cache
         .lock()
-        .expect("path context cache poisoned")
+        .unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache during Git-root lookup");
+            poisoned.into_inner()
+        })
         .nearest_git_root(directory)
 }
 
@@ -1439,7 +1448,10 @@ fn blocked_root_notification_id(root: &Path) -> NotificationId {
 fn paths_match(cache: &Mutex<PathContextCache>, left: &Path, right: &Path) -> bool {
     cache
         .lock()
-        .expect("path context cache poisoned")
+        .unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache during path comparison");
+            poisoned.into_inner()
+        })
         .paths_match(left, right)
 }
 
@@ -1447,6 +1459,30 @@ fn paths_match(cache: &Mutex<PathContextCache>, left: &Path, right: &Path) -> bo
 mod tests {
     use super::*;
     use crate::session::{LayoutNodeSnapshot, LayoutSnapshot, TerminalSnapshot};
+
+    #[test]
+    fn poisoned_path_context_cache_degrades_without_panicking() {
+        let cache = Arc::new(Mutex::new(PathContextCache::default()));
+        let poisoned = cache.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("poison path context cache");
+            })
+            .join()
+            .is_err()
+        );
+
+        assert_eq!(
+            nearest_git_root(&cache, Path::new("/path/that/does/not/exist")),
+            None
+        );
+        assert!(!paths_match(
+            &cache,
+            Path::new("/path/that/does/not/exist"),
+            Path::new("/another/missing/path")
+        ));
+    }
 
     /// `temp_dir()` sits behind the `/var -> /private/var` symlink on macOS,
     /// while live shells report physical cwds. Tests that assert exact paths

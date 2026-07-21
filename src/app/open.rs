@@ -147,7 +147,7 @@ mod tests {
     use terminal_view::TerminalView;
     use workspace::{OpenResult, Workspace};
 
-    use crate::session::{LayoutNodeSnapshot, SessionSnapshot, SessionStore};
+    use crate::session::{CrashFlushOutcome, LayoutNodeSnapshot, SessionSnapshot, SessionStore};
     use crate::workspaces::install_session_store_for_test;
     use crate::{SplitTerminalRight, init_zmux};
 
@@ -350,6 +350,49 @@ mod tests {
         let restarted = restarted_task.await.expect("reopen persisted session");
         wait_for_terminal_count(&restarted, 2, cx).await;
         close_window(restarted, cx);
+    }
+
+    #[gpui::test]
+    async fn crash_flush_uses_the_layout_captured_before_debounced_io(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let state = TestDirectory::new("panic-session-state");
+        let workspace_directory = TestDirectory::new("panic-session-workspace");
+        let store = SessionStore::at(state.path().join("session.json"));
+        let flusher = crate::session::CrashSessionFlusher::start(store.clone()).unwrap();
+
+        let open_task = cx.update(|cx| {
+            init_zmux(cx);
+            install_session_store_for_test(store.clone(), cx);
+            open_zmux_workspace_for_directory(
+                None,
+                Some(workspace_directory.path().to_path_buf()),
+                true,
+                cx,
+            )
+        });
+        let opened = open_task.await.expect("open persistence owner");
+        wait_for_terminal_count(&opened, 1, cx).await;
+        wait_for_persisted_terminal_count(&store, 1, cx).await;
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(SplitTerminalRight.boxed_clone(), cx);
+            })
+            .expect("window should remain open");
+        wait_for_terminal_count(&opened, 2, cx).await;
+
+        assert_eq!(
+            flusher.flush(Duration::from_secs(1)),
+            CrashFlushOutcome::Installed
+        );
+        let recovered = store
+            .load()
+            .expect("load crash-flushed session")
+            .expect("crash flush should install a session");
+        assert_eq!(snapshot_terminal_count(&recovered), 2);
+
+        close_window(opened, cx);
     }
 
     #[gpui::test]

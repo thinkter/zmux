@@ -264,18 +264,24 @@ pub(crate) fn create_restored_terminals_for_workspace(
                     })
                     .ok();
                 eprintln!(
-                    "failed to restore {} terminal(s) after {attempt} attempts; preserving them for the next session: {:#}",
+                    "failed to restore {} terminal(s) after {attempt} attempts; preserving them for the next session: {}",
                     failed.len(),
-                    last_error.expect("a failed terminal has an error")
+                    last_error
+                        .as_ref()
+                        .map(|error| format!("{error:#}"))
+                        .unwrap_or_else(|| "terminal creation failed without an error".to_owned())
                 );
                 return Ok(());
             }
             let delay = restored_terminal_retry_delay(attempt);
             eprintln!(
-                "failed to restore {} terminal(s); retrying in {}s: {:#}",
+                "failed to restore {} terminal(s); retrying in {}s: {}",
                 failed.len(),
                 delay.as_secs(),
-                last_error.expect("a failed terminal has an error")
+                last_error
+                    .as_ref()
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "terminal creation failed without an error".to_owned())
             );
             pending = failed;
             cx.background_executor().timer(delay).await;

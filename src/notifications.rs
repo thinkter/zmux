@@ -186,8 +186,32 @@ impl NotificationStore {
     ///
     /// cmux treats the history as one current row per surface. Replacing the
     /// older row prevents agent notification storms from growing unread counts
-    /// while preserving explicit read rows for every other pane.
-    pub fn record(&mut self, request: NotificationRequest) -> RecordOutcome {
+    /// while preserving explicit read rows for every other pane. Returns
+    /// `None` without mutating history if either monotonic counter is exhausted.
+    pub fn record(&mut self, request: NotificationRequest) -> Option<RecordOutcome> {
+        let reusable_named_id = match &request.identity {
+            NotificationIdentity::KittyNamed(identifier) => self
+                .notifications
+                .iter()
+                .find(|notification| {
+                    notification.target == request.target
+                        && matches!(
+                            &notification.identity,
+                            NotificationIdentity::KittyNamed(candidate) if candidate == identifier
+                        )
+                })
+                .map(|notification| notification.id),
+            NotificationIdentity::Target | NotificationIdentity::Unique => None,
+        };
+        if reusable_named_id.is_none() && self.next_id.checked_add(1).is_none() {
+            log::error!("notification ID space exhausted; dropping notification");
+            return None;
+        }
+        let Some(next_sequence) = self.next_sequence.checked_add(1) else {
+            log::error!("notification sequence space exhausted; dropping notification");
+            return None;
+        };
+
         let mut removed = Vec::new();
         let reused_id = match &request.identity {
             NotificationIdentity::Target => {
@@ -219,17 +243,11 @@ impl NotificationStore {
 
         let id = reused_id.unwrap_or_else(|| {
             let id = self.next_id;
-            self.next_id = self
-                .next_id
-                .checked_add(1)
-                .expect("notification ID space exhausted");
+            self.next_id += 1;
             id
         });
         let sequence = self.next_sequence;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .expect("notification sequence space exhausted");
+        self.next_sequence = next_sequence;
 
         let notification = Notification {
             id,
@@ -246,10 +264,10 @@ impl NotificationStore {
         };
         self.notifications.push_front(notification.clone());
         removed.extend(self.trim_to_capacity());
-        RecordOutcome {
+        Some(RecordOutcome {
             notification,
             removed,
-        }
+        })
     }
 
     pub fn capacity(&self) -> usize {
@@ -500,7 +518,7 @@ mod tests {
     }
 
     fn record(store: &mut NotificationStore, request: NotificationRequest) -> Notification {
-        store.record(request).notification
+        store.record(request).unwrap().notification
     }
 
     #[test]
@@ -508,7 +526,7 @@ mod tests {
         let mut store = NotificationStore::new();
         let target = target(1, 1, 1);
         let first = record(&mut store, request(target, "first"));
-        let outcome = store.record(request(target, "second"));
+        let outcome = store.record(request(target, "second")).unwrap();
         let second = outcome.notification;
 
         assert_ne!(first.id, second.id);
@@ -526,7 +544,7 @@ mod tests {
         let mut store = NotificationStore::with_capacity(2);
         let first = record(&mut store, request(target(1, 1, 1), "one"));
         record(&mut store, request(target(1, 1, 2), "two"));
-        let outcome = store.record(request(target(1, 2, 3), "three"));
+        let outcome = store.record(request(target(1, 2, 3), "three")).unwrap();
         let third = outcome.notification;
 
         assert_eq!(store.notifications().count(), 2);
@@ -536,6 +554,28 @@ mod tests {
             outcome.removed.iter().map(|row| row.id).collect::<Vec<_>>(),
             [first.id]
         );
+    }
+
+    #[test]
+    fn exhausted_counters_reject_without_mutating_existing_history() {
+        let mut store = NotificationStore::new();
+        let owner = target(1, 1, 1);
+        let existing = record(&mut store, request(owner, "existing"));
+
+        store.next_sequence = u64::MAX;
+        assert!(store.record(request(owner, "replacement")).is_none());
+        assert_eq!(store.notifications().count(), 1);
+        assert_eq!(store.get(existing.id).unwrap().title, "existing");
+
+        store.next_sequence = existing.sequence + 1;
+        store.next_id = u64::MAX;
+        assert!(
+            store
+                .record(request(target(1, 1, 2), "new target"))
+                .is_none()
+        );
+        assert_eq!(store.notifications().count(), 1);
+        assert_eq!(store.get(existing.id).unwrap().title, "existing");
     }
 
     #[test]
@@ -552,7 +592,7 @@ mod tests {
 
         let mut update_a = request(target, "a2");
         update_a.identity = NotificationIdentity::KittyNamed("a".to_owned());
-        let outcome = store.record(update_a);
+        let outcome = store.record(update_a).unwrap();
 
         assert_eq!(outcome.notification.id, a.id);
         assert!(outcome.removed.is_empty());
