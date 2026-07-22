@@ -15,6 +15,7 @@ mod notifications;
 mod osc;
 mod session;
 mod settings_page;
+mod shell_settings;
 mod syntax;
 mod theme;
 mod visual_power;

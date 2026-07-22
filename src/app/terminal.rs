@@ -18,6 +18,7 @@ use crate::cli_server::CliServer;
 use crate::env::terminal_env_with_notification_endpoint;
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::WorkspaceId;
+use crate::shell_settings::shell_spawn_command;
 use crate::workspaces::{RestoredTerminal, WorkspacesPanel};
 
 const MAX_RESTORED_TERMINAL_ATTEMPTS: u32 = 3;
@@ -611,16 +612,24 @@ pub(super) fn create_terminal_with_cli_route(
     };
     let endpoint = registration.endpoint_env();
     let route_id = registration.route_id();
+    let configured_shell = project
+        .terminal_settings(&working_directory, cx)
+        .shell
+        .clone();
+    let (command, args, shell) =
+        shell_spawn_command(&configured_shell, project.is_via_remote_server());
     let spawn = task::SpawnInTerminal {
         id: task::TaskId(format!("zmux-shell-{route_id}")),
         full_label: "Terminal".to_owned(),
         label: "Terminal".to_owned(),
+        command,
+        args,
         command_label: "Terminal".to_owned(),
         cwd: working_directory,
         env: terminal_env_with_notification_endpoint(Some(&endpoint)),
         use_new_terminal: true,
         allow_concurrent_runs: true,
-        shell: task::Shell::System,
+        shell,
         ..Default::default()
     };
     let terminal_task = project.create_terminal_task(spawn, cx);

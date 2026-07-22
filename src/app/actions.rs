@@ -45,7 +45,7 @@ pub(super) fn register_zmux_actions(workspace: &mut Workspace) {
                 pane.activate_item(index, true, true, window, cx);
                 return;
             }
-            let page = cx.new(SettingsPage::new);
+            let page = cx.new(|cx| SettingsPage::new(window, cx));
             pane.add_item(Box::new(page), true, true, None, window, cx);
         });
     });

@@ -58,6 +58,7 @@ ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5
 ui_input = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 uuid = "1"
 watch = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+which = "6.0.0"
 windows = "0.61"
 ztracing = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 
@@ -151,7 +152,9 @@ node_runtime = { workspace = true }
 paths = { workspace = true }
 session = { workspace = true }
 ui = { workspace = true }
+ui_input = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+which = { workspace = true }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

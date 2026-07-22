@@ -7,13 +7,14 @@
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, App, Context, FontWeight, IntoElement, KeyDownEvent, Pixels, Render, SharedString,
-    Window, div, px,
+    Action, Anchor, App, Context, FontWeight, IntoElement, KeyDownEvent, Pixels, Render,
+    SharedString, Window, div, px,
 };
 use ui::prelude::*;
 use ui::{Button, ButtonSize, ContextMenu, IconButtonShape, Indicator, PopoverMenu, Tooltip};
 use workspace::dock::{DockPosition, Panel};
 
+use crate::OpenSettings;
 use crate::agent_detection::AgentKind;
 use crate::metadata::{GitMetadata, MetadataState};
 use crate::notification_runtime::NotificationRuntime;
@@ -895,6 +896,22 @@ impl Render for WorkspacesPanel {
                     .child(
                         h_flex()
                             .gap_1()
+                            .child(
+                                div()
+                                    .debug_selector(|| "OPEN_SETTINGS_BUTTON".to_string())
+                                    .child(
+                                        IconButton::new("settings", IconName::Settings)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Settings"))
+                                            .on_click(|_, window, cx| {
+                                                window.dispatch_action(
+                                                    OpenSettings.boxed_clone(),
+                                                    cx,
+                                                );
+                                            }),
+                                    ),
+                            )
                             .child(
                                 IconButton::new("notifications", IconName::Info)
                                     .shape(IconButtonShape::Square)

@@ -3,21 +3,27 @@
 //! so changes land in the user's `settings.json` and apply live via the
 //! settings-file watcher installed by `crate::app::load_user_settings`.
 
+use std::path::Path;
+
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement, Render,
-    SharedString, Styled, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
+    Render, SharedString, Styled, Window,
 };
-use settings::{Settings, SettingsContent, SettingsStore};
+use settings::{Settings, SettingsContent, SettingsStore, Shell as SettingsShell};
+use task::Shell as TaskShell;
 use terminal::terminal_settings::TerminalSettings;
 use theme_settings::ThemeSettings;
 use ui::{
-    Color, ContextMenu, Divider, DividerColor, DropdownMenu, Headline, IconButton, IconName,
-    IntoElement, Label, LabelSize, Switch, ToggleState, h_flex, prelude::*, v_flex,
+    Button, ButtonStyle, Color, ContextMenu, Divider, DividerColor, DropdownMenu, Headline,
+    IconButton, IconName, IntoElement, Label, LabelSize, Switch, ToggleState, h_flex, prelude::*,
+    v_flex,
 };
+use ui_input::InputField;
 use vim_mode_setting::VimModeSetting;
 use workspace::AppState;
 use workspace::item::{Item, ItemEvent};
 
+use crate::shell_settings::{ShellCandidate, detect_shell_candidates, resolve_custom_shell};
 use crate::theme::{DEFAULT_MONO_FONT, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_UI_FONT_SIZE};
 
 /// The whole UI is laid out in rems derived from `ui_font_size`, so the
@@ -31,13 +37,205 @@ const MAX_TERMINAL_FONT_SIZE: f32 = 32.0;
 
 pub struct SettingsPage {
     focus_handle: FocusHandle,
+    shell_candidates: Vec<ShellCandidate>,
+    custom_program: Entity<InputField>,
+    custom_arguments: Vec<Entity<InputField>>,
+    next_argument_id: usize,
+    show_custom_shell: bool,
 }
 
 impl SettingsPage {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let shell_candidates = detect_shell_candidates();
+        let configured_shell = TerminalSettings::get_global(cx).shell.clone();
+        let (program, arguments) = custom_shell_parts(&configured_shell, &shell_candidates);
+        let show_custom_shell = shell_is_custom(&configured_shell, &shell_candidates);
+        let custom_program = new_input("Shell executable or command", program, window, cx);
+        let custom_arguments = arguments
+            .into_iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                new_input(
+                    &format!("Shell argument {}", index + 1),
+                    argument,
+                    window,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        let next_argument_id = custom_arguments.len() + 1;
+
         Self {
             focus_handle: cx.focus_handle(),
+            shell_candidates,
+            custom_program,
+            custom_arguments,
+            next_argument_id,
+            show_custom_shell,
         }
+    }
+
+    fn begin_custom_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let configured_shell = TerminalSettings::get_global(cx).shell.clone();
+        let (program, arguments) = custom_shell_parts(&configured_shell, &self.shell_candidates);
+        self.custom_program.update(cx, |input, cx| {
+            input.set_text(&program, window, cx);
+            input.set_error(None::<SharedString>, cx);
+        });
+        self.custom_arguments = arguments
+            .into_iter()
+            .map(|argument| {
+                let id = self.next_argument_id;
+                self.next_argument_id += 1;
+                new_input(&format!("Shell argument {id}"), argument, window, cx)
+            })
+            .collect();
+        self.show_custom_shell = true;
+        cx.notify();
+    }
+
+    fn add_custom_argument(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.next_argument_id;
+        self.next_argument_id += 1;
+        self.custom_arguments.push(new_input(
+            &format!("Shell argument {id}"),
+            String::new(),
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    fn save_custom_shell(&mut self, cx: &mut Context<Self>) {
+        let program = self.custom_program.read(cx).text(cx);
+        let resolved_program = match resolve_custom_shell(&program) {
+            Ok(program) => program.to_string_lossy().into_owned(),
+            Err(error) => {
+                self.custom_program.update(cx, |input, cx| {
+                    input.set_error(Some(error), cx);
+                });
+                return;
+            }
+        };
+        self.custom_program.update(cx, |input, cx| {
+            input.set_error(None::<SharedString>, cx);
+        });
+
+        let arguments = self
+            .custom_arguments
+            .iter()
+            .map(|argument| argument.read(cx).text(cx))
+            .filter(|argument| !argument.is_empty())
+            .collect::<Vec<_>>();
+        let title_override = preserved_title_override(&program, &resolved_program, cx);
+        let shell = if arguments.is_empty() && title_override.is_none() {
+            SettingsShell::Program(resolved_program)
+        } else {
+            SettingsShell::WithArguments {
+                program: resolved_program,
+                args: arguments,
+                title_override,
+            }
+        };
+        set_default_shell(shell, cx);
+        cx.notify();
+    }
+}
+
+fn new_input(
+    placeholder: &str,
+    text: String,
+    window: &mut Window,
+    cx: &mut Context<SettingsPage>,
+) -> Entity<InputField> {
+    cx.new(|cx| {
+        let input = InputField::new(window, cx, placeholder);
+        input.set_text(&text, window, cx);
+        input
+    })
+}
+
+fn same_program(left: &str, right: &Path) -> bool {
+    let left = Path::new(left);
+    if cfg!(target_os = "windows") {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn shell_is_custom(shell: &TaskShell, candidates: &[ShellCandidate]) -> bool {
+    match shell {
+        TaskShell::System => false,
+        TaskShell::Program(program) => !candidates
+            .iter()
+            .any(|candidate| same_program(program, &candidate.program)),
+        TaskShell::WithArguments { .. } => true,
+    }
+}
+
+fn custom_shell_parts(shell: &TaskShell, candidates: &[ShellCandidate]) -> (String, Vec<String>) {
+    match shell {
+        TaskShell::System => (String::new(), Vec::new()),
+        TaskShell::Program(program) => {
+            let program = candidates
+                .iter()
+                .find(|candidate| same_program(program, &candidate.program))
+                .map(|candidate| candidate.program.to_string_lossy().into_owned())
+                .unwrap_or_else(|| program.clone());
+            (program, Vec::new())
+        }
+        TaskShell::WithArguments { program, args, .. } => (program.clone(), args.clone()),
+    }
+}
+
+fn shell_label(shell: &TaskShell, candidates: &[ShellCandidate]) -> SharedString {
+    match shell {
+        TaskShell::System => {
+            let system_shell = util::get_system_shell();
+            let name = Path::new(&system_shell)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&system_shell);
+            format!("System Default ({name})").into()
+        }
+        TaskShell::Program(program) => candidates
+            .iter()
+            .find(|candidate| same_program(program, &candidate.program))
+            .map(|candidate| candidate.label.into())
+            .unwrap_or_else(|| format!("Custom ({program})").into()),
+        TaskShell::WithArguments { program, .. } => format!("Custom ({program})").into(),
+    }
+}
+
+fn set_default_shell(shell: SettingsShell, cx: &mut App) {
+    update_settings_file(cx, move |content, _| {
+        apply_default_shell(content, shell);
+    });
+}
+
+fn apply_default_shell(content: &mut SettingsContent, shell: SettingsShell) {
+    content.terminal.get_or_insert_default().project.shell = Some(shell);
+}
+
+fn preserved_title_override(
+    entered_program: &str,
+    resolved_program: &str,
+    cx: &App,
+) -> Option<String> {
+    let TaskShell::WithArguments {
+        program,
+        title_override,
+        ..
+    } = &TerminalSettings::get_global(cx).shell
+    else {
+        return None;
+    };
+    if program == entered_program || same_program(program, Path::new(resolved_program)) {
+        title_override.clone()
+    } else {
+        None
     }
 }
 
@@ -206,6 +404,7 @@ impl Render for SettingsPage {
         let ui_scale = current_ui_scale(cx);
         let terminal_font_size = current_terminal_font_size(cx);
         let vim_mode = current_vim_mode(cx);
+        let configured_shell = TerminalSettings::get_global(cx).shell.clone();
 
         let font_menu = ContextMenu::build(window, cx, |mut menu, _window, cx| {
             menu = menu.entry("Default (Lilex)", None, |_window, cx| {
@@ -224,6 +423,62 @@ impl Render for SettingsPage {
             }
             menu
         });
+
+        let settings_page = cx.weak_entity();
+        let shell_candidates = self.shell_candidates.clone();
+        let shell_menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            let settings_page_for_system = settings_page.clone();
+            menu = menu.entry("System Default", None, move |_window, cx| {
+                let _ = settings_page_for_system.update(cx, |this, cx| {
+                    this.show_custom_shell = false;
+                    set_default_shell(SettingsShell::System, cx);
+                    cx.notify();
+                });
+            });
+            for candidate in &shell_candidates {
+                let label = candidate.label;
+                let program = candidate.program.to_string_lossy().into_owned();
+                let settings_page = settings_page.clone();
+                menu = menu.entry(label, None, move |_window, cx| {
+                    let program = program.clone();
+                    let _ = settings_page.update(cx, |this, cx| {
+                        this.show_custom_shell = false;
+                        set_default_shell(SettingsShell::Program(program), cx);
+                        cx.notify();
+                    });
+                });
+            }
+            let settings_page_for_custom = settings_page.clone();
+            menu.separator()
+                .entry("Custom Shell…", None, move |window, cx| {
+                    let _ = settings_page_for_custom.update(cx, |this, cx| {
+                        this.begin_custom_shell(window, cx);
+                    });
+                })
+        });
+
+        let custom_argument_rows = self
+            .custom_arguments
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, argument)| {
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(div().flex_1().child(argument))
+                    .child(
+                        IconButton::new(("remove-shell-argument", index), IconName::Close)
+                            .tooltip(ui::Tooltip::text("Remove argument"))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                if index < this.custom_arguments.len() {
+                                    this.custom_arguments.remove(index);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+            })
+            .collect::<Vec<_>>();
 
         v_flex()
             .key_context("SettingsPage")
@@ -294,6 +549,76 @@ impl Render for SettingsPage {
                                     font_menu,
                                 ),
                             )),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_full()
+                            .child(SectionHeader::new("Terminal"))
+                            .child(setting_row(
+                                "Default shell",
+                                "Used by new local terminals; running terminals are unchanged",
+                                DropdownMenu::new(
+                                    "default-shell",
+                                    shell_label(&configured_shell, &self.shell_candidates),
+                                    shell_menu,
+                                ),
+                            ))
+                            .when(self.show_custom_shell, |this| {
+                                this.child(
+                                    v_flex()
+                                        .mt_2()
+                                        .p_3()
+                                        .gap_3()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border_variant)
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(Label::new("Executable"))
+                                                .child(self.custom_program.clone()),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(Label::new("Arguments"))
+                                                .child(
+                                                    Label::new(
+                                                        "Each field is passed as one exact argument",
+                                                    )
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                                )
+                                                .children(custom_argument_rows)
+                                                .child(
+                                                    Button::new(
+                                                        "add-shell-argument",
+                                                        "Add argument",
+                                                    )
+                                                    .start_icon(ui::Icon::new(IconName::Plus))
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.add_custom_argument(window, cx);
+                                                        },
+                                                    )),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex().justify_end().child(
+                                                Button::new(
+                                                    "save-custom-shell",
+                                                    "Use Custom Shell",
+                                                )
+                                                .style(ButtonStyle::Filled)
+                                                .on_click(cx.listener(
+                                                    |this, _, _window, cx| {
+                                                        this.save_custom_shell(cx);
+                                                    },
+                                                )),
+                                            ),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         v_flex()
@@ -379,5 +704,26 @@ mod tests {
 
         assert_eq!(content.vim_mode, Some(true));
         assert_eq!(content.helix_mode, Some(false));
+    }
+
+    #[test]
+    fn default_shell_is_written_to_the_terminal_project_settings() {
+        let shell = SettingsShell::WithArguments {
+            program: "/bin/zsh".to_string(),
+            args: vec!["-l".to_string()],
+            title_override: None,
+        };
+        let mut content = SettingsContent::default();
+
+        apply_default_shell(&mut content, shell.clone());
+
+        assert_eq!(
+            content
+                .terminal
+                .expect("terminal settings should be created")
+                .project
+                .shell,
+            Some(shell)
+        );
     }
 }

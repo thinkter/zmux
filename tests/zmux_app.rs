@@ -384,6 +384,60 @@ async fn notification_shell_tab_title_tracks_foreground_process(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn configured_default_shell_is_used_by_the_notification_terminal_bridge(
+    cx: &mut TestAppContext,
+) {
+    use gpui::UpdateGlobal as _;
+
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    initialize_zmux(cx).await;
+    let configured_program = util::get_system_shell();
+    cx.update(|cx| {
+        let mut settings_json: serde_json::Value =
+            serde_json::from_str(&zmux::default_settings_json()).unwrap();
+        settings_json["terminal"]["shell"] =
+            serde_json::to_value(settings::Shell::Program(configured_program.clone())).unwrap();
+        let result = settings::SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(&settings_json.to_string(), cx)
+        });
+        assert!(
+            !matches!(result.parse_status, settings::ParseStatus::Failed { .. }),
+            "configured shell settings should parse"
+        );
+    });
+
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
+    let opened = open_task.await.expect("workspace should open");
+    let spawned_task = loop {
+        cx.run_until_parked();
+        let spawned_task = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace.panes().iter().find_map(|pane| {
+                pane.read(cx).items().find_map(|item| {
+                    let view = item.act_as::<TerminalView>(cx)?;
+                    view.read(cx)
+                        .terminal()
+                        .read(cx)
+                        .task()
+                        .map(|task| task.spawned_task.clone())
+                })
+            })
+        });
+        if let Some(spawned_task) = spawned_task {
+            break spawned_task;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    };
+
+    assert_eq!(spawned_task.command, Some(configured_program.clone()));
+    assert_eq!(spawned_task.args, Vec::<String>::new());
+    assert_eq!(spawned_task.shell, task::Shell::Program(configured_program));
+    assert!(spawned_task.env.contains_key(NOTIFY_ENDPOINT_ENV));
+}
+
+#[gpui::test]
 async fn workspace_metadata_click_activates_the_workspace(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
@@ -2491,4 +2545,44 @@ async fn open_settings_opens_a_single_reused_settings_tab(cx: &mut TestAppContex
         });
     assert_eq!(settings_tab_count, 1);
     assert!(active_is_settings, "settings tab should be the active item");
+}
+
+#[gpui::test]
+async fn top_left_settings_button_opens_the_settings_tab(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
+    let opened = open_task.await.expect("workspace should open");
+
+    let workspace = opened.workspace.clone();
+    let mut cx = VisualTestContext::from_window(opened.window.into(), cx);
+    let mut settings_bounds = None;
+    for _ in 0..50 {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        settings_bounds = cx.debug_bounds("OPEN_SETTINGS_BUTTON");
+        if settings_bounds.is_some() {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+
+    let settings_bounds = settings_bounds.expect("top-left settings button should be rendered");
+    cx.simulate_click(settings_bounds.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let (settings_tab_count, active_is_settings) = workspace.read_with(&cx, |workspace, cx| {
+        let pane = workspace.active_pane().read(cx);
+        (
+            pane.items_of_type::<zmux::SettingsPage>().count(),
+            pane.active_item()
+                .and_then(|item| item.downcast::<zmux::SettingsPage>())
+                .is_some(),
+        )
+    });
+    assert_eq!(settings_tab_count, 1);
+    assert!(active_is_settings, "settings tab should be active");
 }
