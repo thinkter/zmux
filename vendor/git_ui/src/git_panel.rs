@@ -236,9 +236,17 @@ const TREE_INDENT: f32 = 16.0;
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+        let project = workspace.project().clone();
+        cx.defer(move |cx| {
+            crate::repository_scope(cx).activate_current_repository(&project, cx);
+        });
         workspace.toggle_panel_focus::<GitPanel>(window, cx);
     });
     workspace.register_action(|workspace, _: &Toggle, window, cx| {
+        let project = workspace.project().clone();
+        cx.defer(move |cx| {
+            crate::repository_scope(cx).activate_current_repository(&project, cx);
+        });
         if !workspace.toggle_panel_focus::<GitPanel>(window, cx) {
             workspace.close_panel::<GitPanel>(window, cx);
         }
@@ -5243,7 +5251,13 @@ impl GitPanel {
     }
 
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
+        if tab == GitPanelTab::History && self.active_repository.is_none() {
+            crate::repository_scope(cx).activate_current_repository(&self.project, cx);
+        }
         if self.active_tab == tab {
+            if tab == GitPanelTab::History {
+                self.load_commit_history(cx);
+            }
             return;
         }
         self.active_tab = tab;
@@ -5292,10 +5306,15 @@ impl GitPanel {
             self._repo_subscriptions.push(cx.subscribe(
                 active_repository,
                 |this, _repo, event, cx| {
-                    if let RepositoryEvent::GraphEvent(_, _) = event {
-                        if this.active_tab == GitPanelTab::History {
-                            this.fetch_commit_history_shas(cx);
-                        }
+                    if this.active_tab == GitPanelTab::History
+                        && matches!(
+                            event,
+                            RepositoryEvent::GraphEvent(_, _)
+                                | RepositoryEvent::HeadChanged
+                                | RepositoryEvent::BranchListChanged
+                        )
+                    {
+                        this.fetch_commit_history_shas(cx);
                     }
                 },
             ));
@@ -6729,6 +6748,11 @@ impl Render for GitPanel {
         if self.active_repository != scoped_active {
             self.active_repository = scoped_active;
             self.entries.clear();
+            self.commit_history_shas.take();
+            self._repo_subscriptions.clear();
+            if self.active_tab == GitPanelTab::History {
+                self.load_commit_history(cx);
+            }
             self.schedule_update(window, cx);
         }
         let project = self.project.read(cx);

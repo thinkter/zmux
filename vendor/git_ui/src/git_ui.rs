@@ -69,6 +69,14 @@ pub trait RepositoryScope: Send + Sync + 'static {
     fn repositories(&self, project: &Entity<project::Project>, cx: &App)
     -> Vec<Entity<Repository>>;
 
+    /// Prepare the host's current repository for Git tools that require a
+    /// fully attached [`Repository`].
+    ///
+    /// Zed projects already attach their visible worktrees, so the default is
+    /// a no-op. Embedders with lightweight repository discovery can promote
+    /// the current root here when the user explicitly opens a Git surface.
+    fn activate_current_repository(&self, _project: &Entity<project::Project>, _cx: &mut App) {}
+
     fn display_name(&self, repository: &Entity<Repository>, cx: &App) -> SharedString {
         repository.read(cx).display_name()
     }

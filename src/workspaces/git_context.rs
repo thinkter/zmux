@@ -649,6 +649,18 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
             .collect()
     }
 
+    fn activate_current_repository(&self, project: &Entity<project::Project>, cx: &mut App) {
+        let Some(panel) = self.panel_for(project).and_then(|panel| panel.upgrade()) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            let Some(root) = panel.active_git_root() else {
+                return;
+            };
+            panel.pin_active_git_root(root, cx);
+        });
+    }
+
     fn display_name(
         &self,
         repository: &Entity<project::git_store::Repository>,
@@ -2787,7 +2799,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn visited_repository_uses_probe_until_explicitly_pinned(cx: &mut gpui::TestAppContext) {
+    async fn visited_repository_uses_probe_until_deferred_git_tools_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.executor().allow_parking();
         let base =
             std::env::temp_dir().join(format!("zmux-probed-repository-{}", uuid::Uuid::new_v4()));
@@ -2835,9 +2849,14 @@ mod tests {
             "visiting a repository must not attach a recursively watched worktree"
         );
 
-        panel.update(cx, |panel, cx| {
-            panel.pin_active_git_root(base.clone(), cx);
+        opened.workspace.update(cx, |workspace, cx| {
+            let project = workspace.project().clone();
+            cx.defer(move |cx| {
+                let scope = cx.global::<ZmuxRepositoryScopeGlobal>().0.clone();
+                git_ui::RepositoryScope::activate_current_repository(scope.as_ref(), &project, cx);
+            });
         });
+        cx.run_until_parked();
         for _ in 0..200 {
             cx.run_until_parked();
             if panel.read_with(cx, |panel, _| panel.attached_worktrees.len()) == 1 {
@@ -2850,7 +2869,7 @@ mod tests {
         assert_eq!(
             panel.read_with(cx, |panel, _| panel.attached_worktrees.len()),
             1,
-            "an explicit pin should enable Zed's full Git integration"
+            "requesting Git tools should explicitly enable full Git integration"
         );
 
         let _ = std::fs::remove_dir_all(base);
