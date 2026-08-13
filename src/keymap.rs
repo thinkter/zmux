@@ -67,6 +67,7 @@ pub fn configure_keybindings(cx: &mut App) {
         #[cfg(target_os = "windows")]
         KeyBinding::new("shift-alt-w", zed_actions::git::Worktree, None),
         KeyBinding::new("ctrl-shift-b", ToggleWorkspacesPanel, None),
+        KeyBinding::new("ctrl-alt-e", zed_actions::project_panel::ToggleFocus, None),
         KeyBinding::new("ctrl-}", ActivateNextWorkspace, None),
         KeyBinding::new("ctrl-{", ActivatePreviousWorkspace, None),
         KeyBinding::new("ctrl-shift-right", ActivateNextWorkspace, None),

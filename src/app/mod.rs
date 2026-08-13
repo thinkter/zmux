@@ -105,6 +105,7 @@ fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
     command_palette::init(cx);
     vim::init(cx);
     git_ui::init(cx);
+    project_panel::init(cx);
     install_git_repository_scope(cx);
     tab_switcher::init(cx);
     terminal_view::init(cx);

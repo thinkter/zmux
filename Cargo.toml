@@ -4,6 +4,7 @@ exclude = ["vendor/alacritty_terminal", "vendor/terminal", "vendor/terminal_view
 
 [workspace.dependencies]
 agent_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+zed_assets = { package = "assets", git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 askpass = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 buffer_diff = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 call = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -31,6 +32,7 @@ vim_mode_setting = { git = "https://github.com/zed-industries/zed", rev = "abbe8
 zed_actions = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 workspace = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 project = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+project_panel = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 client = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 clock = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 db = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -101,6 +103,7 @@ alacritty_terminal = { path = "vendor/alacritty_terminal" }
 [patch."https://github.com/zed-industries/zed"]
 terminal = { path = "vendor/terminal" }
 terminal_view = { path = "vendor/terminal_view" }
+git_ui = { path = "vendor/git_ui" }
 workspace = { path = "vendor/workspace" }
 
 [package]
@@ -135,6 +138,7 @@ util = { workspace = true }
 vim = { workspace = true }
 vim_mode_setting = { workspace = true }
 zed_actions = { workspace = true }
+zed_assets = { workspace = true }
 workspace = { workspace = true }
 project = { workspace = true }
 client = { workspace = true }
@@ -148,6 +152,7 @@ git_ui = { path = "vendor/git_ui", features = ["zmux-core"] }
 http_client = { workspace = true }
 language = { workspace = true }
 log = { workspace = true }
+project_panel = { workspace = true }
 node_runtime = { workspace = true }
 paths = { workspace = true }
 session = { workspace = true }
