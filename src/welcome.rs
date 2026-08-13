@@ -1,12 +1,12 @@
-use crate::NewTerminal;
 use crate::keymap::OpenSettings;
+use crate::NewTerminal;
 use gpui::{
     Action, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
     Render, SharedString, Styled, Window,
 };
 use ui::{
-    ButtonLike, Color, Divider, DividerColor, Headline, Icon, IconName, IconSize, IntoElement,
-    Label, LabelSize, RenderOnce, h_flex, prelude::*, v_flex,
+    h_flex, prelude::*, v_flex, ButtonLike, Color, Divider, DividerColor, Headline, Icon, IconName,
+    IconSize, IntoElement, Label, LabelSize, RenderOnce,
 };
 use workspace::item::{Item, ItemEvent};
 use zed_actions::command_palette;
@@ -216,13 +216,13 @@ impl Render for ZmuxWelcome {
                                 "Customize Keymaps",
                                 IconName::Keyboard,
                                 3,
-                            ))
-                            .child(InertButton::new(
-                                "explore-extensions",
-                                "Explore Extensions",
-                                IconName::Blocks,
-                                4,
                             )),
+                        // .child(InertButton::new(
+                        //     "explore-extensions",
+                        //     "Explore Extensions",
+                        //     IconName::Blocks,
+                        //     4,
+                        // )),
                     ),
             )
     }
