@@ -1,10 +1,9 @@
-//! Git context discovery and reconciliation for logical workspaces.
+//! Git context discovery and Project-root reconciliation for logical workspaces.
 //!
 //! Derives each workspace's Git repositories from its live terminals' working
-//! directories, probes ordinary visited roots without project attachment, and
-//! attaches only roots explicitly promoted to Zed's full Git integration. It
-//! also bridges the vendored Zed Git panel to zmux's logical workspaces via
-//! [`ZmuxRepositoryScope`].
+//! directories and attaches the active workspace directory for the embedded
+//! Project Panel, whether or not it contains a repository. Git-derived roots
+//! remain available for the vendored Zed Git panel via [`ZmuxRepositoryScope`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -379,7 +378,7 @@ impl WorkspaceContext {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct GitRootReconciliation {
+struct ProjectRootReconciliation {
     added: BTreeSet<PathBuf>,
     removed: BTreeSet<PathBuf>,
 }
@@ -397,26 +396,28 @@ fn git_root_reference_counts<'a>(
     counts
 }
 
-fn git_root_is_desired(
+fn project_root_is_desired(
     entries: &[WorkspaceEntry],
+    active: WorkspaceId,
     root: &Path,
     cache: &Mutex<PathContextCache>,
 ) -> bool {
-    entries.iter().any(|entry| {
-        entry
-            .worktree_paths
-            .iter()
-            .chain(entry.promoted_git_roots.iter())
-            .any(|candidate| paths_match(cache, candidate, root))
-    })
+    entries
+        .iter()
+        .find(|entry| entry.id == active)
+        .is_some_and(|entry| {
+            workspace_project_roots(entry, cache)
+                .iter()
+                .any(|candidate| paths_match(cache, candidate, root))
+        })
 }
 
-fn plan_git_root_reconciliation(
+fn plan_project_root_reconciliation(
     reference_counts: BTreeMap<PathBuf, usize>,
     attached: &BTreeSet<PathBuf>,
     pending: &BTreeSet<PathBuf>,
     cache: &Mutex<PathContextCache>,
-) -> GitRootReconciliation {
+) -> ProjectRootReconciliation {
     let mut desired: Vec<PathBuf> = Vec::new();
     for root in reference_counts.keys() {
         push_unique_logical_path(&mut desired, root.clone(), cache);
@@ -447,7 +448,7 @@ fn plan_git_root_reconciliation(
                 .any(|existing| paths_match(cache, existing, root))
         })
         .collect();
-    GitRootReconciliation { added, removed }
+    ProjectRootReconciliation { added, removed }
 }
 
 fn push_unique_logical_path(
@@ -518,24 +519,33 @@ fn promote_git_root(
     *pinned = Some(root);
 }
 
-fn desired_git_root_reference_counts(
+fn desired_project_root_reference_counts(
     entries: &[WorkspaceEntry],
+    active: WorkspaceId,
     cache: &Mutex<PathContextCache>,
 ) -> BTreeMap<PathBuf, usize> {
     let mut counts = BTreeMap::new();
-    for entry in entries {
-        for root in workspace_attachment_roots(entry, cache) {
+    if let Some(entry) = entries.iter().find(|entry| entry.id == active) {
+        for root in workspace_project_roots(entry, cache) {
             *counts.entry(root).or_insert(0) += 1;
         }
     }
     counts
 }
 
-fn workspace_attachment_roots(
+fn workspace_project_roots(
     entry: &WorkspaceEntry,
     cache: &Mutex<PathContextCache>,
 ) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    // The stable workspace directory is the explorer root and is valid without
+    // Git metadata. Git-derived roots remain attached for Git Panel support.
+    if let Some(root) = entry.default_directory.as_ref() {
+        push_unique_logical_path(&mut roots, root.clone(), cache);
+    }
+    // Roots in `WorkspaceContext` come from the bounded Git-root probe, so
+    // they are safe to attach directly. Persisted/promoted paths retain the
+    // cache guard because they may predate current terminal discovery.
     for root in entry
         .worktree_paths
         .iter()
@@ -544,6 +554,9 @@ fn workspace_attachment_roots(
         if index_root_block_reason(root, cache).is_none() {
             push_unique_logical_path(&mut roots, root.clone(), cache);
         }
+    }
+    for root in &entry.context.git_roots {
+        push_unique_logical_path(&mut roots, root.clone(), cache);
     }
     roots
 }
@@ -626,7 +639,7 @@ impl git_ui::RepositoryScope for ZmuxRepositoryScope {
         let panel = self.panel_for(project).and_then(|panel| panel.upgrade());
         let roots = panel
             .as_ref()
-            .map(|panel| panel.read(cx).active_attachment_roots())
+            .map(|panel| panel.read(cx).active_project_roots())
             .unwrap_or_default();
         project
             .read(cx)
@@ -746,11 +759,11 @@ impl WorkspacesPanel {
         .detach();
     }
 
-    fn active_attachment_roots(&self) -> Vec<PathBuf> {
+    fn active_project_roots(&self) -> Vec<PathBuf> {
         self.entries
             .iter()
             .find(|entry| entry.id == self.active)
-            .map(|entry| workspace_attachment_roots(entry, &self.path_context_cache))
+            .map(|entry| workspace_project_roots(entry, &self.path_context_cache))
             .unwrap_or_default()
     }
 
@@ -1014,10 +1027,13 @@ impl WorkspacesPanel {
 
         self.sync_blocked_root_notifications(cx);
 
-        let reference_counts =
-            desired_git_root_reference_counts(&self.entries, &self.path_context_cache);
+        let reference_counts = desired_project_root_reference_counts(
+            &self.entries,
+            self.active,
+            &self.path_context_cache,
+        );
         let attached = self.attached_worktrees.keys().cloned().collect();
-        let reconciliation = plan_git_root_reconciliation(
+        let reconciliation = plan_project_root_reconciliation(
             reference_counts,
             &attached,
             &self.pending_worktrees,
@@ -1045,11 +1061,9 @@ impl WorkspacesPanel {
                 inserted,
                 "planned additions are disjoint from pending scans"
             );
-            // `find_or_create_worktree` accepts any existing ancestor worktree,
-            // and Zed deliberately disables Git discovery for invisible
-            // worktrees. Both behaviors are wrong for terminal-driven discovery:
-            // attach an exact, Git-tracked worktree root. zmux has no project
-            // panel, so making it visible affects only Zed's internal scanning.
+            // Attach an exact, Git-tracked worktree root. A visible worktree
+            // keeps the embedded Project Panel synchronized with terminal cwd
+            // discovery without admitting broad, non-repository directories.
             let existing = project.read(cx).worktrees(cx).find(|worktree| {
                 paths_match(
                     &self.path_context_cache,
@@ -1069,8 +1083,9 @@ impl WorkspacesPanel {
                     this.pending_worktrees.remove(&root);
                     match result {
                         Ok(worktree)
-                            if git_root_is_desired(
+                            if project_root_is_desired(
                                 &this.entries,
+                                this.active,
                                 &root,
                                 &this.path_context_cache,
                             ) =>
@@ -1146,16 +1161,7 @@ impl WorkspacesPanel {
             return;
         }
 
-        if let Some(reason) = index_root_block_reason(&root, &self.path_context_cache) {
-            log::warn!(
-                "removing inadmissible Zmux worktree {}: {}",
-                root.display(),
-                reason.message()
-            );
-            self.audited_blocked_roots.insert(root.clone());
-            self.show_blocked_root_notification(root, reason, cx);
-            project.update(cx, |project, cx| project.remove_worktree(id, cx));
-        } else {
+        if project_root_is_desired(&self.entries, self.active, &root, &self.path_context_cache) {
             if self.audited_blocked_roots.remove(&root) {
                 let notification_id = blocked_root_notification_id(&root);
                 if let Some(workspace) = self.workspace.upgrade() {
@@ -1165,7 +1171,16 @@ impl WorkspacesPanel {
                 }
                 self.warned_scan_roots.remove(&root);
             }
-            log::info!("admitted Zmux Git worktree {}", root.display());
+            log::info!("admitted Zmux project worktree {}", root.display());
+        } else if let Some(reason) = index_root_block_reason(&root, &self.path_context_cache) {
+            log::warn!(
+                "removing inadmissible Zmux worktree {}: {}",
+                root.display(),
+                reason.message()
+            );
+            self.audited_blocked_roots.insert(root.clone());
+            self.show_blocked_root_notification(root, reason, cx);
+            project.update(cx, |project, cx| project.remove_worktree(id, cx));
         }
     }
 
@@ -2091,7 +2106,7 @@ mod tests {
         assert!(probe_paths_match(&cache, &logical, &physical));
 
         let counts = git_root_reference_counts([[physical.clone(), logical.clone()].as_slice()]);
-        let reconciliation = plan_git_root_reconciliation(
+        let reconciliation = plan_project_root_reconciliation(
             counts,
             &BTreeSet::from([physical.clone(), logical.clone()]),
             &BTreeSet::new(),
@@ -2352,7 +2367,7 @@ mod tests {
         let pending = BTreeSet::from([second.clone()]);
 
         let reconciliation =
-            plan_git_root_reconciliation(counts, &attached, &pending, &path_cache());
+            plan_project_root_reconciliation(counts, &attached, &pending, &path_cache());
 
         assert_eq!(reconciliation.added, BTreeSet::from([first]));
         assert_eq!(reconciliation.removed, BTreeSet::from([stale]));
@@ -2366,7 +2381,7 @@ mod tests {
         let active = visited.iter().rev().take(3).cloned().collect::<Vec<_>>();
         let reference_counts = git_root_reference_counts([active.as_slice()]);
 
-        let reconciliation = plan_git_root_reconciliation(
+        let reconciliation = plan_project_root_reconciliation(
             reference_counts,
             &visited,
             &BTreeSet::new(),
@@ -2752,7 +2767,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn directory_navigation_creates_a_logical_workspace_without_a_worktree(
+    async fn directory_navigation_attaches_the_active_workspace_project_root(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -2791,10 +2806,29 @@ mod tests {
                 Some(directory.as_path())
             );
         });
-        let worktree_count = opened.workspace.read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).worktrees(cx).count()
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| {
+                panel.attached_worktrees.contains_key(&directory)
+            }) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(panel.read_with(cx, |panel, _| {
+            panel.attached_worktrees.contains_key(&directory)
+        }));
+        let project_roots = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<BTreeSet<_>>()
         });
-        assert_eq!(worktree_count, 0);
+        assert_eq!(project_roots, BTreeSet::from([directory.clone()]));
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -2845,8 +2879,8 @@ mod tests {
             opened.workspace.read_with(cx, |workspace, cx| {
                 workspace.project().read(cx).worktrees(cx).count()
             }),
-            0,
-            "visiting a repository must not attach a recursively watched worktree"
+            1,
+            "the active workspace must attach its explorer root"
         );
 
         opened.workspace.update(cx, |workspace, cx| {
@@ -2882,17 +2916,22 @@ mod tests {
         cx.executor().allow_parking();
         let base =
             std::env::temp_dir().join(format!("zmux-unadmitted-worktree-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&base).unwrap();
+        let workspace_root = base.join("workspace");
+        let unadmitted_root = base.join("unadmitted");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&unadmitted_root).unwrap();
 
         initialize_zmux(cx).await;
-        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, base.clone(), cx));
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, workspace_root, cx));
         let opened = open.await.expect("workspace should open");
         cx.run_until_parked();
 
         let project = opened
             .workspace
             .read_with(cx, |workspace, _| workspace.project().clone());
-        let create = project.update(cx, |project, cx| project.create_worktree(&base, true, cx));
+        let create = project.update(cx, |project, cx| {
+            project.create_worktree(&unadmitted_root, true, cx)
+        });
         let inadmissible = create.await.expect("test worktree should be created");
         let inadmissible_id = inadmissible.read_with(cx, |worktree, _| worktree.id());
 
@@ -2919,16 +2958,57 @@ mod tests {
         });
         panel.update(cx, |panel, cx| panel.reconcile_git_context(cx));
         assert!(panel.read_with(cx, |panel, _| {
-            panel.audited_blocked_roots.contains(&base) && panel.warned_scan_roots.contains(&base)
+            panel.audited_blocked_roots.contains(&unadmitted_root)
+                && panel.warned_scan_roots.contains(&unadmitted_root)
         }));
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[gpui::test]
-    async fn closing_workspace_removes_only_its_project_worktree(cx: &mut gpui::TestAppContext) {
+    async fn project_panel_attaches_active_non_git_workspace_root(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let root = std::env::temp_dir().join(format!("zmux-project-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        initialize_zmux(cx).await;
+        let open = cx.update(|cx| crate::app::open_zmux_workspace_at(None, root.clone(), cx));
+        let opened = open.await.expect("workspace should open");
+        let panel = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<WorkspacesPanel>(cx)
+                .expect("workspaces panel should be installed")
+        });
+
+        panel.update(cx, |panel, cx| panel.reconcile_git_context(cx));
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if panel.read_with(cx, |panel, _| panel.attached_worktrees.contains_key(&root)) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+
+        assert!(panel.read_with(cx, |panel, _| panel.attached_worktrees.contains_key(&root)));
+        let project_roots = opened.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<BTreeSet<_>>()
+        });
+        assert_eq!(project_roots, BTreeSet::from([root.clone()]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    async fn project_panel_attaches_only_active_workspace_roots(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
         let base =
-            std::env::temp_dir().join(format!("zmux-worktree-ownership-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("zmux-worktree-scope-{}", uuid::Uuid::new_v4()));
         let shared = base.join("shared");
         let unique = base.join("unique");
         std::fs::create_dir_all(shared.join(".git")).unwrap();
@@ -2960,7 +3040,7 @@ mod tests {
                 worktree_paths: Vec::new(),
                 automatic_name: "Second".into(),
                 context: WorkspaceContext {
-                    git_roots: vec![shared.clone(), unique.clone()],
+                    git_roots: vec![unique.clone()],
                     ..WorkspaceContext::default()
                 },
                 context_authoritative: true,
@@ -2988,40 +3068,13 @@ mod tests {
 
         for _ in 0..100 {
             cx.run_until_parked();
-            if panel.read_with(cx, |panel, _| panel.attached_worktrees.len()) == 2 {
+            if panel.read_with(cx, |panel, _| panel.attached_worktrees.len()) == 1 {
                 break;
             }
             cx.background_executor
                 .timer(Duration::from_millis(10))
                 .await;
         }
-        assert_eq!(
-            panel.read_with(cx, |panel, _| panel.attached_worktrees.len()),
-            2
-        );
-
-        opened
-            .window
-            .update(cx, |_, window, cx| {
-                panel.update(cx, |panel, cx| {
-                    // Terminal context refreshes run asynchronously and may
-                    // have marked the active entry incomplete while the two
-                    // worktrees were attaching. Establish this test's
-                    // authoritative-root precondition in the same update as
-                    // the close so cleanup is not timing-dependent.
-                    let active = panel
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.id == panel.active)
-                        .unwrap();
-                    active.context.git_roots = vec![shared.clone()];
-                    active.context_authoritative = true;
-                    active.git_discovery = GitDiscoveryState::Authoritative;
-                    panel.close_workspace(2, window, cx);
-                });
-            })
-            .expect("window should remain open");
-
         assert_eq!(
             panel.read_with(cx, |panel, _| {
                 panel
@@ -3032,6 +3085,40 @@ mod tests {
             }),
             BTreeSet::from([shared.clone()])
         );
+
+        opened
+            .window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| panel.activate_workspace(2, window, cx));
+            })
+            .expect("window should remain open");
+
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let attached = panel.read_with(cx, |panel, _| {
+                panel
+                    .attached_worktrees
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            });
+            if attached == BTreeSet::from([unique.clone()]) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert_eq!(
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .attached_worktrees
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            }),
+            BTreeSet::from([unique.clone()])
+        );
         let project_roots = opened.workspace.read_with(cx, |workspace, cx| {
             workspace
                 .project()
@@ -3040,8 +3127,7 @@ mod tests {
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
                 .collect::<BTreeSet<_>>()
         });
-        assert!(project_roots.contains(&shared));
-        assert!(!project_roots.contains(&unique));
+        assert_eq!(project_roots, BTreeSet::from([unique]));
 
         let _ = std::fs::remove_dir_all(base);
     }

@@ -1409,6 +1409,7 @@ impl WorkspacesPanel {
             entry.stored = Some(captured);
         }
         self.active = id;
+        self.reconcile_git_context(cx);
         if restored_snapshot && restored_terminals.is_empty() {
             // Empty snapshots have no asynchronous terminal task that could
             // otherwise announce completion.
