@@ -9,7 +9,9 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
     Render, SharedString, Styled, Window,
 };
-use settings::{Settings, SettingsContent, SettingsStore, Shell as SettingsShell};
+use settings::{
+    Settings, SettingsContent, SettingsStore, Shell as SettingsShell, ThemeName, ThemeSelection,
+};
 use task::Shell as TaskShell;
 use terminal::terminal_settings::TerminalSettings;
 use theme_settings::ThemeSettings;
@@ -249,6 +251,26 @@ fn update_settings_file(
         .update_settings_file(fs, update);
 }
 
+fn current_theme_name(cx: &App) -> SharedString {
+    cx.theme().name.clone()
+}
+
+fn set_theme(name: SharedString, cx: &mut App) {
+    update_settings_file(cx, move |content, _| apply_theme(content, &name));
+}
+
+fn apply_theme(content: &mut SettingsContent, name: &str) {
+    content.theme.theme = Some(ThemeSelection::Static(ThemeName(name.into())));
+}
+
+/// orders dark themes ahead of light ones so the menu doesn't interleave appearances as theme names change.
+fn appearance_rank(appearance: ::theme::Appearance) -> u8 {
+    match appearance {
+        ::theme::Appearance::Dark => 0,
+        ::theme::Appearance::Light => 1,
+    }
+}
+
 fn current_ui_scale(cx: &App) -> f32 {
     f32::from(ThemeSettings::get_global(cx).ui_font_size_settings()) / DEFAULT_UI_FONT_SIZE
 }
@@ -407,6 +429,29 @@ impl Render for SettingsPage {
         let vim_mode = current_vim_mode(cx);
         let configured_shell = TerminalSettings::get_global(cx).shell.clone();
 
+        let theme_menu = ContextMenu::build(window, cx, |mut menu, _window, cx| {
+            let mut themes = ::theme::ThemeRegistry::global(cx).list();
+            themes.sort_by(|left, right| {
+                appearance_rank(left.appearance)
+                    .cmp(&appearance_rank(right.appearance))
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+
+            let mut previous_appearance = None;
+            for theme in themes {
+                if previous_appearance.is_some_and(|previous| previous != theme.appearance) {
+                    menu = menu.separator();
+                }
+                previous_appearance = Some(theme.appearance);
+
+                let name = theme.name.clone();
+                menu = menu.entry(theme.name, None, move |_window, cx| {
+                    set_theme(name.clone(), cx);
+                });
+            }
+            menu
+        });
+
         let font_menu = ContextMenu::build(window, cx, |mut menu, _window, cx| {
             menu = menu.entry("Default (Lilex)", None, |_window, cx| {
                 set_font_family(DEFAULT_MONO_FONT.to_string(), cx);
@@ -509,6 +554,11 @@ impl Render for SettingsPage {
                         v_flex()
                             .min_w_full()
                             .child(SectionHeader::new("Appearance"))
+                            .child(setting_row(
+                                "Theme",
+                                "Colors for the interface and terminal",
+                                DropdownMenu::new("theme", current_theme_name(cx), theme_menu),
+                            ))
                             .child(setting_row(
                                 "UI scale",
                                 "Scales the whole interface, including terminal text",
@@ -684,6 +734,36 @@ mod tests {
 
         assert_eq!(content.vim_mode, Some(true));
         assert_eq!(content.helix_mode, Some(false));
+    }
+
+    #[test]
+    fn selecting_a_theme_writes_a_static_selection() {
+        let mut content = SettingsContent::default();
+
+        apply_theme(&mut content, "Vercel Light");
+
+        assert_eq!(
+            content.theme.theme,
+            Some(ThemeSelection::Static(ThemeName("Vercel Light".into())))
+        );
+    }
+
+    #[gpui::test]
+    async fn every_bundled_theme_is_offered(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(
+                ::theme::LoadThemes::All(Box::new(crate::assets::Assets)),
+                cx,
+            );
+            let names = ::theme::ThemeRegistry::global(cx).list_names();
+
+            assert!(names.iter().any(|name| name == crate::theme::DEFAULT_THEME));
+            assert!(names.iter().any(|name| name == "Vercel Light"));
+
+            crate::theme::configure_terminal_fonts(cx);
+            assert_eq!(current_theme_name(cx), crate::theme::DEFAULT_THEME);
+        });
     }
 
     #[test]

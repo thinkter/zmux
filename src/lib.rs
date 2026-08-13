@@ -19,6 +19,7 @@ mod settings_page;
 mod shell_settings;
 mod syntax;
 mod theme;
+mod theme_selector;
 mod visual_power;
 mod welcome;
 mod workspace_switcher;
