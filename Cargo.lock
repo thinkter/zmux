@@ -8719,6 +8719,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "project_panel"
+version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
+dependencies = [
+ "anyhow",
+ "client",
+ "collections",
+ "command_palette_hooks",
+ "editor",
+ "feature_flags",
+ "file_icons",
+ "fs",
+ "futures",
+ "git",
+ "git_ui",
+ "gpui",
+ "itertools 0.14.0",
+ "language",
+ "menu",
+ "notifications",
+ "pretty_assertions",
+ "project",
+ "rayon",
+ "schemars",
+ "search",
+ "serde",
+ "serde_json",
+ "settings",
+ "smallvec",
+ "telemetry",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+ "worktree",
+ "zed_actions",
+]
+
+[[package]]
 name = "prompt_store"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
@@ -15034,6 +15074,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "assets",
  "async-channel 2.5.0",
  "async-process",
  "block2 0.6.2",
@@ -15066,6 +15107,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "paths",
  "project",
+ "project_panel",
  "raw-window-handle",
  "rust-embed",
  "serde",
