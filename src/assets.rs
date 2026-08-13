@@ -1,9 +1,6 @@
-//! Embedded assets (icons, images, fonts, and themes) bundled into the binary so GPUI
-//! can resolve the `icons/*.svg` paths referenced by the `ui` crate and the
-//! `fonts/**` families registered at startup. Without an [`AssetSource`],
-//! every icon renders as nothing.
+//! Resolves embedded Zmux assets first, then falls back to Zed's embedded
+//! assets for Project Panel and file-icon paths.
 
-use anyhow::Context as _;
 use gpui::{AssetSource, Result, SharedString};
 use rust_embed::RustEmbed;
 
@@ -18,15 +15,20 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Self::get(path)
-            .map(|file| Some(file.data))
-            .with_context(|| format!("loading asset at path {path:?}"))
+        if let Some(file) = Self::get(path) {
+            return Ok(Some(file.data));
+        }
+        zed_assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        Ok(Self::iter()
+        let mut assets: Vec<_> = Self::iter()
             .filter(|candidate| candidate.starts_with(path))
             .map(SharedString::from)
-            .collect())
+            .collect();
+        assets.extend(zed_assets::Assets.list(path)?);
+        assets.sort();
+        assets.dedup();
+        Ok(assets)
     }
 }
