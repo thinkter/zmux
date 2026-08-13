@@ -1,12 +1,12 @@
-use crate::keymap::OpenSettings;
 use crate::NewTerminal;
+use crate::keymap::OpenSettings;
 use gpui::{
     Action, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
     Render, SharedString, Styled, Window,
 };
 use ui::{
-    h_flex, prelude::*, v_flex, ButtonLike, Color, Divider, DividerColor, Headline, Icon, IconName,
-    IconSize, IntoElement, Label, LabelSize, RenderOnce,
+    ButtonLike, Color, Divider, DividerColor, Headline, Icon, IconName, IconSize, IntoElement,
+    Label, LabelSize, RenderOnce, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent};
 use zed_actions::command_palette;

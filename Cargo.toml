@@ -119,11 +119,13 @@ async-process = "2"
 collections = { workspace = true }
 command_palette = { workspace = true }
 editor = { workspace = true }
+fuzzy = { workspace = true }
 gpui = { workspace = true }
 grammars = { workspace = true, features = ["load-grammars"] }
 hmac = "0.12"
 mio = { version = "1", features = ["net", "os-poll"] }
 settings = { workspace = true }
+picker = { workspace = true }
 sha2 = "0.10"
 task = { workspace = true }
 terminal = { workspace = true }

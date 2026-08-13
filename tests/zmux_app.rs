@@ -2548,6 +2548,81 @@ async fn open_settings_opens_a_single_reused_settings_tab(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn theme_selector_is_available_only_through_the_command_palette(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let root = fresh_workspace_root();
+    initialize_zmux(cx).await;
+    let open_task = cx.update(|cx| open_zmux_workspace_at(None, root.path().to_path_buf(), cx));
+    let opened = open_task.await.expect("workspace should open");
+    cx.run_until_parked();
+
+    let theme_action = zed_actions::theme_selector::Toggle::default();
+    let icon_theme_action = zed_actions::icon_theme_selector::Toggle::default();
+    let (theme_available, icon_theme_available, bindings) = opened
+        .window
+        .update(cx, |_, window, cx| {
+            window.refresh();
+            let actions = window.available_actions(cx);
+            (
+                actions
+                    .iter()
+                    .any(|action| action.partial_eq(&theme_action)),
+                actions
+                    .iter()
+                    .any(|action| action.partial_eq(&icon_theme_action)),
+                window.bindings_for_action(&theme_action),
+            )
+        })
+        .expect("window should remain open");
+
+    assert!(theme_available, "theme selector action should be available");
+    assert!(
+        !icon_theme_available,
+        "Zmux should not register its unsupported icon-theme action"
+    );
+    assert!(
+        bindings.is_empty(),
+        "theme selector should have no shortcut: {bindings:?}"
+    );
+
+    let modal_was_open = opened
+        .window
+        .update(cx, |_, window, cx| {
+            opened
+                .workspace
+                .update(cx, |workspace, cx| workspace.has_active_modal(window, cx))
+        })
+        .expect("window should remain open");
+    assert!(!modal_was_open, "workspace should start without a modal");
+
+    opened
+        .window
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(theme_action.boxed_clone(), cx);
+        })
+        .expect("window should remain open");
+    cx.run_until_parked();
+
+    let modal_is_open = opened
+        .window
+        .update(cx, |_, window, cx| {
+            opened
+                .workspace
+                .update(cx, |workspace, cx| workspace.has_active_modal(window, cx))
+        })
+        .expect("window should remain open");
+    assert!(modal_is_open, "theme selector action should open a modal");
+
+    let mut cx = VisualTestContext::from_window(opened.window.into(), cx);
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("more-themes").is_none(),
+        "theme selector should not offer unsupported extension installation"
+    );
+}
+
+#[gpui::test]
 async fn top_left_settings_button_opens_the_settings_tab(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let root = fresh_workspace_root();
