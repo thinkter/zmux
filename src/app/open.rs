@@ -85,13 +85,17 @@ fn open_zmux_workspace_for_directory(
             register_git_repository_scope(workspace.project(), &panel, cx);
             workspace.open_panel::<WorkspacesPanel>(window, cx);
             cx.spawn_in(window, async move |workspace_handle, cx| {
+                let project_panel =
+                    project_panel::ProjectPanel::load(workspace_handle.clone(), cx.clone()).await?;
                 let git_panel =
                     git_ui::git_panel::GitPanel::load(workspace_handle.clone(), cx.clone()).await?;
                 workspace_handle.update_in(cx, |workspace, window, cx| {
+                    workspace.add_panel(project_panel, window, cx);
                     workspace.add_panel(git_panel, window, cx);
-                    // Adding a panel to an already-open dock can make the new
-                    // panel active. Keep Zmux's workspace switcher visible;
-                    // the Git panel remains available through its action.
+                    // The explorer owns the right dock initially. Git remains
+                    // its adjacent dock tab; the workspace switcher stays open
+                    // in the independent left dock.
+                    workspace.open_panel::<project_panel::ProjectPanel>(window, cx);
                     workspace.open_panel::<WorkspacesPanel>(window, cx);
                 })?;
                 anyhow::Ok(())
