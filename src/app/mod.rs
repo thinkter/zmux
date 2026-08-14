@@ -22,7 +22,7 @@ use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{App, AppContext, Bounds, Task, UpdateGlobal, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
-use http_client::{BlockedHttpClient, HttpClientWithUrl};
+use http_client::HttpClientWithUrl;
 use project::Project;
 use settings::Settings;
 use theme::ActiveTheme as _;
@@ -75,6 +75,17 @@ pub fn init_zmux(cx: &mut App) -> Task<Arc<AppState>> {
         eprintln!("failed to load embedded fonts: {error:#}");
     }
     crate::visual_power::VisualPowerMonitor::init(cx);
+    // zmux tracks Zed's extension API without shipping a Zed release channel.
+    // Use the development API range so current gallery packages (including HTML's
+    // WASM API v0.7) are admitted by the pinned host.
+    release_channel::init_test(
+        env!("CARGO_PKG_VERSION")
+            .parse()
+            .expect("Cargo package versions are valid semver"),
+        release_channel::ReleaseChannel::Dev,
+        cx,
+    );
+    gpui_tokio::init(cx);
 
     settings::init(cx);
     theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -90,6 +101,7 @@ pub fn init_zmux(cx: &mut App) -> Task<Arc<AppState>> {
 }
 
 fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
+    crate::extensions::init(&app_state, cx);
     crate::syntax::register_builtin_languages(&app_state.languages);
     // Grammars alone don't produce colors: the registry needs the active theme
     // to build its highlight maps, and must rebuild them on theme changes.
@@ -99,9 +111,11 @@ fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
         move |cx| languages.set_theme(cx.theme().clone())
     })
     .detach();
+    extensions_ui::init(cx);
     Project::init(&app_state.client, cx);
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
+    extensions_ui::init(cx);
     command_palette::init(cx);
     vim::init(cx);
     git_ui::init(cx);
@@ -257,8 +271,8 @@ fn init_app_state(cx: &mut App) -> Task<Arc<AppState>> {
         cx.background_executor().clone(),
     ));
     let http = Arc::new(HttpClientWithUrl::new(
-        Arc::new(BlockedHttpClient::new()),
-        "http://localhost",
+        Arc::new(reqwest_client::ReqwestClient::new()),
+        "https://zed.dev",
         None,
     ));
     let client = Client::new(Arc::new(clock::RealSystemClock), http, cx);
