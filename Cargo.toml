@@ -18,11 +18,19 @@ fuzzy_nucleo = { git = "https://github.com/zed-industries/zed", rev = "abbe85a33
 git = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+<<<<<<< Updated upstream
 gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extension_host = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 language_extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extensions_ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+=======
+extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+extension_host = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+extensions_ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+language_extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+>>>>>>> Stashed changes
 grammars = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 task = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -131,8 +139,13 @@ editor = { workspace = true }
 gpui = { workspace = true }
 extension = { workspace = true }
 extension_host = { workspace = true }
+<<<<<<< Updated upstream
 gpui_tokio = { workspace = true }
 extensions_ui = { workspace = true }
+=======
+extensions_ui = { workspace = true }
+gpui_tokio = { workspace = true }
+>>>>>>> Stashed changes
 language_extension = { workspace = true }
 grammars = { workspace = true, features = ["load-grammars"] }
 hmac = "0.12"
@@ -161,6 +174,8 @@ getrandom = "0.3"
 git = { workspace = true }
 git_ui = { path = "vendor/git_ui", features = ["zmux-core"] }
 http_client = { workspace = true }
+reqwest_client = { workspace = true }
+release_channel = { workspace = true }
 language = { workspace = true }
 log = { workspace = true }
 release_channel = { workspace = true }

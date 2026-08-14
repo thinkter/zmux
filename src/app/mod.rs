@@ -111,6 +111,7 @@ fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
     Project::init(&app_state.client, cx);
     client::init(&app_state.client, cx);
     workspace::init(app_state.clone(), cx);
+    extensions_ui::init(cx);
     command_palette::init(cx);
     vim::init(cx);
     git_ui::init(cx);
