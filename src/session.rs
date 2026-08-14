@@ -283,6 +283,8 @@ impl LayoutNodeSnapshot {
 pub struct TerminalSnapshot {
     pub working_directory: Option<PathBuf>,
     pub resume: ResumePolicy,
+    #[serde(default)]
+    pub font_size_offset: i8,
 }
 
 impl TerminalSnapshot {
@@ -290,6 +292,7 @@ impl TerminalSnapshot {
         Self {
             working_directory,
             resume: ResumePolicy::Disabled,
+            font_size_offset: 0,
         }
     }
 

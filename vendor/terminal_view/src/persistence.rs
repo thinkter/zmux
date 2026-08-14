@@ -413,6 +413,9 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN custom_title TEXT;
         ),
+        sql! (
+            ALTER TABLE terminals ADD COLUMN font_size_offset INTEGER NOT NULL DEFAULT 0;
+        ),
     ];
 }
 
@@ -495,6 +498,34 @@ impl TerminalDb {
             statement.exec()
         })
         .await
+    }
+
+    pub async fn save_font_size_offset(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        font_size_offset: i8,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let query = "INSERT INTO terminals (item_id, workspace_id, font_size_offset)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                    font_size_offset = excluded.font_size_offset";
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&item_id, 1)?;
+            next_index = statement.bind(&workspace_id, next_index)?;
+            statement.bind(&i64::from(font_size_offset), next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        pub fn get_font_size_offset(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<i64>> {
+            SELECT font_size_offset
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
     }
 
     query! {

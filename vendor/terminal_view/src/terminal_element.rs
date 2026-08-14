@@ -29,6 +29,16 @@ use std::{fmt::Debug, rc::Rc, sync::Arc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
 
+const MIN_TERMINAL_FONT_SIZE: f32 = 6.0;
+const MAX_TERMINAL_FONT_SIZE: f32 = 32.0;
+
+fn font_size_with_offset(configured_font_size: Pixels, font_size_offset: i8) -> Pixels {
+    px(
+        (f32::from(configured_font_size) + f32::from(font_size_offset))
+            .clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE),
+    )
+}
+
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
     hitbox: Hitbox,
@@ -1087,13 +1097,17 @@ impl Element for TerminalElement {
                     TerminalMode::Embedded { .. } => {
                         window.text_style().font_size.to_pixels(window.rem_size())
                     }
-                    TerminalMode::Standalone => terminal_settings
-                        .font_size
-                        .map_or(buffer_font_size, |size| {
-                            theme_settings::adjusted_font_size(size, cx)
-                        }),
+                    TerminalMode::Standalone => {
+                        let configured_font_size = terminal_settings.font_size.map_or(
+                            buffer_font_size,
+                            |size| theme_settings::adjusted_font_size(size, cx),
+                        );
+                        font_size_with_offset(
+                            configured_font_size,
+                            self.terminal_view.read(cx).font_size_offset(),
+                        )
+                    },
                 };
-
                 let theme = cx.theme().clone();
 
                 let link_style = HighlightStyle {
@@ -2011,6 +2025,14 @@ mod tests {
         let mut changed = test_grid_cache_key(&theme);
         changed.hovered_range = Some(Range::new(Point::new(0, 0), Point::new(0, 1)));
         assert!(cache.grid(&changed).is_none());
+    }
+
+    #[test]
+    fn terminal_font_size_offset_is_relative_and_clamped() {
+        assert_eq!(font_size_with_offset(px(14.0), 0), px(14.0));
+        assert_eq!(font_size_with_offset(px(14.0), 2), px(16.0));
+        assert_eq!(font_size_with_offset(px(6.0), -1), px(6.0));
+        assert_eq!(font_size_with_offset(px(32.0), 1), px(32.0));
     }
 
     #[test]

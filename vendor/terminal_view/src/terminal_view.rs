@@ -383,6 +383,12 @@ actions!(
     [
         /// Reruns the last executed task in the terminal.
         RerunTask,
+        /// Increases the focused terminal's font size.
+        IncreaseFontSize,
+        /// Decreases the focused terminal's font size.
+        DecreaseFontSize,
+        /// Restores the focused terminal's font size to the configured default.
+        ResetFontSize,
     ]
 );
 
@@ -426,6 +432,7 @@ pub struct TerminalView {
     cursor_shape: CursorShape,
     blink_manager: Entity<BlinkManager>,
     mode: TerminalMode,
+    font_size_offset: i8,
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
@@ -731,6 +738,7 @@ impl TerminalView {
 
         Self {
             terminal,
+            font_size_offset: 0,
             workspace: workspace_handle,
             project,
             has_bell: false,
@@ -777,6 +785,47 @@ impl TerminalView {
             max_lines_when_unfocused,
         };
         cx.notify();
+    }
+
+    pub fn font_size_offset(&self) -> i8 {
+        self.font_size_offset
+    }
+
+    pub fn set_font_size_offset(&mut self, font_size_offset: i8, cx: &mut Context<Self>) {
+        if self.font_size_offset == font_size_offset {
+            return;
+        }
+        self.font_size_offset = font_size_offset;
+        self.needs_serialize = true;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn increase_font_size(
+        &mut self,
+        _: &IncreaseFontSize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_font_size_offset(self.font_size_offset.saturating_add(1), cx);
+    }
+
+    fn decrease_font_size(
+        &mut self,
+        _: &DecreaseFontSize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_font_size_offset(self.font_size_offset.saturating_sub(1), cx);
+    }
+
+    fn reset_font_size(
+        &mut self,
+        _: &ResetFontSize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_font_size_offset(0, cx);
     }
 
     const MAX_EMBEDDED_LINES: usize = 1_000;
@@ -1925,6 +1974,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::clear))
             .on_action(cx.listener(TerminalView::scroll_line_up))
             .on_action(cx.listener(TerminalView::scroll_line_down))
+            .on_action(cx.listener(TerminalView::increase_font_size))
+            .on_action(cx.listener(TerminalView::decrease_font_size))
+            .on_action(cx.listener(TerminalView::reset_font_size))
             .on_action(cx.listener(TerminalView::scroll_page_up))
             .on_action(cx.listener(TerminalView::scroll_page_down))
             .on_action(cx.listener(TerminalView::scroll_to_top))
@@ -2515,6 +2567,7 @@ impl SerializableItem for TerminalView {
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
+        let font_size_offset = self.font_size_offset;
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
@@ -2524,6 +2577,8 @@ impl SerializableItem for TerminalView {
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
+                .await?;
+            db.save_font_size_offset(item_id, workspace_id, font_size_offset)
                 .await?;
             Ok(())
         }))
@@ -2542,7 +2597,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, font_size_offset) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -2564,10 +2619,16 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let font_size_offset = db
+                        .get_font_size_offset(item_id, workspace_id)
+                        .log_err()
+                        .flatten()
+                        .unwrap_or_default()
+                        .clamp(i64::from(i8::MIN), i64::from(i8::MAX)) as i8;
+                    (cwd, custom_title, font_size_offset)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, 0));
 
             let handler = cx
                 .update(|_, cx| {
@@ -2597,6 +2658,7 @@ impl SerializableItem for TerminalView {
                     if custom_title.is_some() {
                         view.custom_title = custom_title;
                     }
+                    view.font_size_offset = font_size_offset;
                     view
                 })
             })

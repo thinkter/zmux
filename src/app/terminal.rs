@@ -336,14 +336,16 @@ pub(crate) fn create_restored_terminals_for_workspace(
                     }
 
                     let terminal_view = cx.new(|cx| {
-                        TerminalView::new(
+                        let mut terminal_view = TerminalView::new(
                             terminal,
                             workspace_for_view,
                             database_id,
                             project_for_view,
                             window,
                             cx,
-                        )
+                        );
+                        terminal_view.set_font_size_offset(restored.font_size_offset, cx);
+                        terminal_view
                     });
                     workspace.add_item(
                         restored.pane,
@@ -437,6 +439,13 @@ pub(super) fn create_split_terminal(
     let working_directory = source_terminal_working_directory(workspace, cx)
         .or_else(|| panel.read(cx).active_default_directory())
         .or_else(|| default_working_directory(workspace, cx));
+    let font_size_offset = workspace
+        .active_pane()
+        .read(cx)
+        .active_item()
+        .and_then(|item| item.act_as::<TerminalView>(cx))
+        .map(|terminal_view| terminal_view.read(cx).font_size_offset())
+        .unwrap_or_default();
     let panel = panel.downgrade();
     let project = workspace.project().downgrade();
 
@@ -464,14 +473,16 @@ pub(super) fn create_split_terminal(
             }
 
             let terminal_view = cx.new(|cx| {
-                TerminalView::new(
+                let mut terminal_view = TerminalView::new(
                     terminal,
                     workspace.weak_handle(),
                     workspace.database_id(),
                     workspace.project().downgrade(),
                     window,
                     cx,
-                )
+                );
+                terminal_view.set_font_size_offset(font_size_offset, cx);
+                terminal_view
             });
             let new_pane = workspace.split_pane(pane_to_split, direction, window, cx);
             workspace.add_item(

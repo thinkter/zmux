@@ -672,27 +672,6 @@ impl Item for SettingsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
-
-    #[gpui::test]
-    async fn terminal_size_tracks_transient_zoom_shortcuts(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            settings::init(cx);
-            theme_settings::init(::theme::LoadThemes::JustBase, cx);
-            editor::EditorSettings::register(cx);
-            TerminalSettings::register(cx);
-            crate::theme::configure_terminal_fonts(cx);
-            crate::keymap::configure_zoom_actions(cx);
-
-            assert_eq!(current_terminal_font_size(cx), 14.0);
-
-            cx.dispatch_action(&zed_actions::IncreaseBufferFontSize { persist: false });
-            assert_eq!(current_terminal_font_size(cx), 15.0);
-
-            cx.dispatch_action(&zed_actions::DecreaseBufferFontSize { persist: false });
-            assert_eq!(current_terminal_font_size(cx), 14.0);
-        });
-    }
 
     #[test]
     fn enabling_vim_mode_disables_helix_mode() {
