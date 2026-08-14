@@ -819,42 +819,6 @@ impl WorkspacesPanel {
         self.pin_git_root_for_workspace(self.active, root, cx);
     }
 
-    pub(super) fn active_git_root_choices(&self) -> Vec<PathBuf> {
-        let Some(entry) = self.entries.iter().find(|entry| entry.id == self.active) else {
-            return Vec::new();
-        };
-        let mut roots = Vec::new();
-        for root in entry
-            .pinned_git_root
-            .iter()
-            .chain(entry.selected_git_root.iter())
-            .chain(entry.context.git_roots.iter())
-            .chain(entry.promoted_git_roots.iter())
-            .chain(entry.worktree_paths.iter())
-        {
-            if index_root_block_reason(root, &self.path_context_cache).is_none() {
-                push_unique_logical_path(&mut roots, root.clone(), &self.path_context_cache);
-            }
-        }
-        roots.sort();
-        roots
-    }
-
-    pub(super) fn active_git_root_is_pinned(&self) -> bool {
-        self.entries
-            .iter()
-            .find(|entry| entry.id == self.active)
-            .is_some_and(|entry| entry.pinned_git_root.is_some())
-    }
-
-    pub(super) fn active_git_root_attachment_pending(&self) -> bool {
-        self.active_git_root().is_some_and(|root| {
-            self.pending_worktrees
-                .iter()
-                .any(|pending| paths_match(&self.path_context_cache, pending, &root))
-        })
-    }
-
     pub(super) fn pin_active_git_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.pin_git_root_for_workspace(self.active, root, cx);
     }
@@ -892,30 +856,6 @@ impl WorkspacesPanel {
             &mut entry.pinned_git_root,
             &mut entry.promoted_git_roots,
             logical_root,
-            &self.path_context_cache,
-        );
-        entry.metadata_checked_at = None;
-        self.reconcile_git_context(cx);
-        self.request_metadata_refreshes(cx);
-        self.schedule_session_persistence(cx);
-        cx.notify();
-    }
-
-    pub(super) fn follow_terminal_git_root(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == self.active)
-        else {
-            return;
-        };
-        entry.pinned_git_root = None;
-        entry.promoted_git_roots.clear();
-        reconcile_selected_git_root(
-            &mut entry.selected_git_root,
-            None,
-            &entry.context.git_roots,
-            entry.git_discovery,
             &self.path_context_cache,
         );
         entry.metadata_checked_at = None;

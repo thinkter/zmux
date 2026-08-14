@@ -11,7 +11,7 @@ use gpui::{
     SharedString, Window, div, px,
 };
 use ui::prelude::*;
-use ui::{Button, ButtonSize, ContextMenu, IconButtonShape, Indicator, PopoverMenu, Tooltip};
+use ui::{Button, ButtonSize, IconButtonShape, Indicator, PopoverMenu, Tooltip};
 use workspace::dock::{DockPosition, Panel};
 
 use crate::OpenSettings;
@@ -788,13 +788,14 @@ impl Render for WorkspacesPanel {
                     })
                     .trigger_with_tooltip(
                         Button::new("worktree-selector-button", active_workspace_name)
-                            .size(ButtonSize::None)
+                            .size(ButtonSize::Default)
                             .start_icon(Icon::new(IconName::GitWorktree).size(IconSize::Small))
                             .disabled(active_worktree_operation.is_some())
                             .truncate(true),
                         |_, cx| Tooltip::simple("Switch or create a Git worktree", cx),
                     )
-                    .anchor(Anchor::BottomLeft)
+                    .anchor(Anchor::TopLeft)
+                    .attach(Anchor::BottomLeft)
             });
 
         let branch_selector = active_repository.map(|repository| {
@@ -811,12 +812,13 @@ impl Render for WorkspacesPanel {
                 })
                 .trigger_with_tooltip(
                     Button::new("workspace-branch-selector-button", active_branch_name)
-                        .size(ButtonSize::None)
+                        .size(ButtonSize::Default)
                         .start_icon(Icon::new(IconName::GitBranch).size(IconSize::Small))
                         .truncate(true),
                     |_, cx| Tooltip::simple("Switch or create a Git branch", cx),
                 )
-                .anchor(Anchor::BottomLeft)
+                .anchor(Anchor::TopLeft)
+                .attach(Anchor::BottomLeft)
         });
 
         let agent_chats = self.render_agent_chats(cx);
