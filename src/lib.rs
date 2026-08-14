@@ -36,7 +36,6 @@ pub use env::{terminal_env, terminal_env_with_notification_endpoint};
 pub use fonts::load_embedded_fonts;
 pub use keymap::{
     NewTerminal, OpenSettings, SplitTerminalDown, SplitTerminalRight, configure_keybindings,
-    configure_zoom_actions,
 };
 pub use launcher::run_gui;
 pub use notifications::{

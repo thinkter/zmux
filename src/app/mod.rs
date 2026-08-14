@@ -29,7 +29,7 @@ use theme::ActiveTheme as _;
 use workspace::{AppState, WorkspaceStore};
 
 use crate::cli_server::CliServer;
-use crate::keymap::{Quit, configure_keybindings, configure_zoom_actions};
+use crate::keymap::{Quit, configure_keybindings};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::NotificationStore;
 use crate::theme::{DEFAULT_THEME, configure_terminal_fonts};
@@ -181,7 +181,6 @@ fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
     }
 
     configure_keybindings(cx);
-    configure_zoom_actions(cx);
 
     cx.on_action(|_: &Quit, cx| cx.quit());
 

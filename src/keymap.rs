@@ -1,8 +1,8 @@
 use gpui::{App, KeyBinding, actions};
 use terminal::{Copy, Paste, ScrollPageDown, ScrollPageUp, ScrollToBottom};
+use terminal_view::{DecreaseFontSize, IncreaseFontSize, ResetFontSize};
 use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
 use workspace::{ActivateNextPane, ActivatePreviousPane};
-use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 use crate::app::{JumpToLatestNotification, NotifyCurrentPane};
 use crate::workspaces::{
@@ -111,38 +111,20 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-d", SplitTerminalRight, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-shift-d", SplitTerminalDown, None),
-        KeyBinding::new("ctrl-=", IncreaseBufferFontSize { persist: false }, None),
-        KeyBinding::new("ctrl-+", IncreaseBufferFontSize { persist: false }, None),
-        KeyBinding::new("ctrl--", DecreaseBufferFontSize { persist: false }, None),
-        KeyBinding::new("ctrl-0", ResetBufferFontSize { persist: false }, None),
+        KeyBinding::new("ctrl-=", IncreaseFontSize, None),
+        KeyBinding::new("ctrl-+", IncreaseFontSize, None),
+        KeyBinding::new("ctrl--", DecreaseFontSize, None),
+        KeyBinding::new("ctrl-0", ResetFontSize, None),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-=", IncreaseBufferFontSize { persist: false }, None),
+        KeyBinding::new("cmd-=", IncreaseFontSize, None),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-+", IncreaseBufferFontSize { persist: false }, None),
+        KeyBinding::new("cmd-+", IncreaseFontSize, None),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd--", DecreaseBufferFontSize { persist: false }, None),
+        KeyBinding::new("cmd--", DecreaseFontSize, None),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-0", ResetBufferFontSize { persist: false }, None),
+        KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
-}
-
-pub fn configure_zoom_actions(cx: &mut App) {
-    cx.on_action(|action: &IncreaseBufferFontSize, cx| {
-        if !action.persist {
-            theme_settings::increase_buffer_font_size(cx);
-        }
-    });
-    cx.on_action(|action: &DecreaseBufferFontSize, cx| {
-        if !action.persist {
-            theme_settings::decrease_buffer_font_size(cx);
-        }
-    });
-    cx.on_action(|action: &ResetBufferFontSize, cx| {
-        if !action.persist {
-            theme_settings::reset_buffer_font_size(cx);
-        }
-    });
 }

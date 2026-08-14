@@ -168,6 +168,7 @@ pub(crate) fn install_session_store_for_test(store: SessionStore, cx: &mut App) 
 pub(crate) struct RestoredTerminal {
     pub(crate) pane: Entity<Pane>,
     pub(crate) working_directory: Option<PathBuf>,
+    pub(crate) font_size_offset: i8,
     pub(crate) activate: bool,
     pub(crate) failed_slot: FailedRestoreSlot,
 }
@@ -695,7 +696,10 @@ fn terminal_snapshot(item: &dyn ItemHandle, cx: &App) -> Option<TerminalSnapshot
     let terminal_view = item.act_as::<TerminalView>(cx)?;
     let terminal = terminal_view.read(cx).terminal().clone();
     let working_directory = terminal.read(cx).working_directory();
-    Some(TerminalSnapshot::fresh_shell(working_directory))
+    let font_size_offset = terminal_view.read(cx).font_size_offset();
+    let mut snapshot = TerminalSnapshot::fresh_shell(working_directory);
+    snapshot.font_size_offset = font_size_offset;
+    Some(snapshot)
 }
 
 fn snapshot_active_layout(workspace: &Workspace, cx: &App) -> LayoutSnapshot {
@@ -837,6 +841,7 @@ pub(super) fn restore_snapshot_layout(
                             .map(|(index, terminal)| RestoredTerminal {
                                 pane: target.clone(),
                                 working_directory: terminal.working_directory.clone(),
+                                font_size_offset: terminal.font_size_offset,
                                 activate: index == *active_tab,
                                 failed_slot: FailedRestoreSlot {
                                     path: state.path.clone(),
