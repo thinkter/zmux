@@ -75,10 +75,14 @@ pub fn init_zmux(cx: &mut App) -> Task<Arc<AppState>> {
         eprintln!("failed to load embedded fonts: {error:#}");
     }
     crate::visual_power::VisualPowerMonitor::init(cx);
-    release_channel::init(
+    // zmux tracks Zed's extension API without shipping a Zed release channel.
+    // Use the development API range so current gallery packages (including HTML's
+    // WASM API v0.7) are admitted by the pinned host.
+    release_channel::init_test(
         env!("CARGO_PKG_VERSION")
             .parse()
             .expect("Cargo package versions are valid semver"),
+        release_channel::ReleaseChannel::Dev,
         cx,
     );
     gpui_tokio::init(cx);

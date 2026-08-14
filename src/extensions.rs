@@ -10,26 +10,11 @@ use extension::ExtensionHostProxy;
 use gpui::App;
 use workspace::AppState;
 
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-
-/// Initialize Zed's extension infrastructure against zmux's language registry.
-///
-/// `paths` is configured to zmux's data directory during bootstrap, so the stock
-/// extension store keeps its state under `<zmux data dir>/extensions`, never in a
-/// Zed installation's extension directory.
-=======
-=======
->>>>>>> Stashed changes
 /// Initialize Zed's extension infrastructure against zmux's language registry.
 ///
 /// `paths` is configured to zmux's data directory during bootstrap, so Zed's
 /// extension store keeps its state under `<zmux data dir>/extensions`, never in
 /// a Zed installation's extension directory.
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 pub fn init(app_state: &Arc<AppState>, cx: &mut App) {
     extension::init(cx);
     let extension_host = ExtensionHostProxy::default_global(cx);
@@ -47,13 +32,6 @@ pub fn init(app_state: &Arc<AppState>, cx: &mut App) {
     );
 }
 
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -82,15 +60,7 @@ mod tests {
                 ..Default::default()
             },
             false,
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-            Arc::new(|| anyhow::bail!("fixture language loading is not exercised here")),
-=======
             Arc::new(|| anyhow::bail!("fixture loading is not exercised here")),
->>>>>>> Stashed changes
-=======
-            Arc::new(|| anyhow::bail!("fixture loading is not exercised here")),
->>>>>>> Stashed changes
         );
 
         assert_eq!(
@@ -102,10 +72,3 @@ mod tests {
         );
     }
 }
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
