@@ -305,7 +305,7 @@ impl IndexRootBlockReason {
     }
 }
 
-fn index_root_block_reason(
+fn protected_location_block_reason(
     root: &Path,
     cache: &Mutex<PathContextCache>,
 ) -> Option<IndexRootBlockReason> {
@@ -313,15 +313,6 @@ fn index_root_block_reason(
         log::error!("recovering poisoned path context cache during admission check");
         poisoned.into_inner()
     });
-    let Some(discovered_root) = cache.cached_nearest_git_root(root) else {
-        return Some(IndexRootBlockReason::Unverifiable);
-    };
-    let Some(discovered_root) = discovered_root else {
-        return Some(IndexRootBlockReason::NotGitRepository);
-    };
-    if !cache.paths_match_cached(root, &discovered_root) {
-        return Some(IndexRootBlockReason::NotGitRepository);
-    }
     let Some(root) = cache.cached_canonical_identity(root).flatten() else {
         return Some(IndexRootBlockReason::Unverifiable);
     };
@@ -341,17 +332,44 @@ fn index_root_block_reason(
     None
 }
 
+/// Explorer roots may be non-Git directories, but must never cover the whole
+/// filesystem or a protected directory tree.
+fn explorer_root_block_reason(
+    root: &Path,
+    cache: &Mutex<PathContextCache>,
+) -> Option<IndexRootBlockReason> {
+    protected_location_block_reason(root, cache)
+}
+
+fn index_root_block_reason(
+    root: &Path,
+    cache: &Mutex<PathContextCache>,
+) -> Option<IndexRootBlockReason> {
+    {
+        let mut path_context = cache.lock().unwrap_or_else(|poisoned| {
+            log::error!("recovering poisoned path context cache during admission check");
+            poisoned.into_inner()
+        });
+        let Some(discovered_root) = path_context.cached_nearest_git_root(root) else {
+            return Some(IndexRootBlockReason::Unverifiable);
+        };
+        let Some(discovered_root) = discovered_root else {
+            return Some(IndexRootBlockReason::NotGitRepository);
+        };
+        if !path_context.paths_match_cached(root, &discovered_root) {
+            return Some(IndexRootBlockReason::NotGitRepository);
+        }
+    }
+    protected_location_block_reason(root, cache)
+}
+
 #[cfg(test)]
-fn index_root_block_reason_with(
+fn protected_location_block_reason_with(
     root: &Path,
     home: &Path,
     data_dir: &Path,
-    is_git_root: impl Fn(&Path) -> bool,
     canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
 ) -> Option<IndexRootBlockReason> {
-    if !is_git_root(root) {
-        return Some(IndexRootBlockReason::NotGitRepository);
-    }
     let Ok(root) = canonicalize(root) else {
         return Some(IndexRootBlockReason::Unverifiable);
     };
@@ -366,6 +384,30 @@ fn index_root_block_reason_with(
         }
     }
     None
+}
+
+#[cfg(test)]
+fn explorer_root_block_reason_with(
+    root: &Path,
+    home: &Path,
+    data_dir: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<IndexRootBlockReason> {
+    protected_location_block_reason_with(root, home, data_dir, canonicalize)
+}
+
+#[cfg(test)]
+fn index_root_block_reason_with(
+    root: &Path,
+    home: &Path,
+    data_dir: &Path,
+    is_git_root: impl Fn(&Path) -> bool,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<IndexRootBlockReason> {
+    if !is_git_root(root) {
+        return Some(IndexRootBlockReason::NotGitRepository);
+    }
+    protected_location_block_reason_with(root, home, data_dir, canonicalize)
 }
 
 impl WorkspaceContext {
@@ -538,9 +580,11 @@ fn workspace_project_roots(
     cache: &Mutex<PathContextCache>,
 ) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    // The stable workspace directory is the explorer root and is valid without
-    // Git metadata. Git-derived roots remain attached for Git Panel support.
-    if let Some(root) = entry.default_directory.as_ref() {
+    // The stable workspace directory is the explorer root. It may be non-Git,
+    // but must be narrow enough to index safely.
+    if let Some(root) = entry.default_directory.as_ref()
+        && explorer_root_block_reason(root, cache).is_none()
+    {
         push_unique_logical_path(&mut roots, root.clone(), cache);
     }
     // Roots in `WorkspaceContext` come from the bounded Git-root probe, so
@@ -1828,6 +1872,33 @@ mod tests {
             Some(IndexRootBlockReason::ProtectedLocation)
         );
         assert_eq!(classify(Path::new("/users/me/project")), None);
+    }
+
+    #[test]
+    fn explorer_root_policy_allows_narrow_non_git_directories() {
+        let home = Path::new("/users/me");
+        let data = Path::new("/users/me/.local/share/zmux");
+        let classify = |root: &Path| {
+            explorer_root_block_reason_with(root, home, data, |path| Ok(path.to_path_buf()))
+        };
+
+        assert_eq!(
+            classify(Path::new("/")),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(
+            classify(home),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(
+            classify(Path::new("/users")),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(
+            classify(data),
+            Some(IndexRootBlockReason::ProtectedLocation)
+        );
+        assert_eq!(classify(Path::new("/tmp/scratch")), None);
     }
 
     #[test]
