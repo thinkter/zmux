@@ -19,17 +19,23 @@ git = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f
 gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extension_host = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 language_extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extensions_ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 =======
+=======
+>>>>>>> Stashed changes
 extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extension_host = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 extensions_ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 language_extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 grammars = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -140,8 +146,13 @@ gpui = { workspace = true }
 extension = { workspace = true }
 extension_host = { workspace = true }
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 gpui_tokio = { workspace = true }
 extensions_ui = { workspace = true }
+=======
+extensions_ui = { workspace = true }
+gpui_tokio = { workspace = true }
+>>>>>>> Stashed changes
 =======
 extensions_ui = { workspace = true }
 gpui_tokio = { workspace = true }
