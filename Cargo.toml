@@ -18,6 +18,11 @@ fuzzy_nucleo = { git = "https://github.com/zed-industries/zed", rev = "abbe85a33
 git = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+extension_host = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+language_extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+extensions_ui = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 grammars = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 task = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -50,6 +55,7 @@ paths = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb
 picker = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 pretty_assertions = { version = "1.3.0", features = ["unstable"] }
 prompt_store = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 proto = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 release_channel = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 remote = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -123,6 +129,11 @@ collections = { workspace = true }
 command_palette = { workspace = true }
 editor = { workspace = true }
 gpui = { workspace = true }
+extension = { workspace = true }
+extension_host = { workspace = true }
+gpui_tokio = { workspace = true }
+extensions_ui = { workspace = true }
+language_extension = { workspace = true }
 grammars = { workspace = true, features = ["load-grammars"] }
 hmac = "0.12"
 mio = { version = "1", features = ["net", "os-poll"] }
@@ -152,8 +163,10 @@ git_ui = { path = "vendor/git_ui", features = ["zmux-core"] }
 http_client = { workspace = true }
 language = { workspace = true }
 log = { workspace = true }
+release_channel = { workspace = true }
 project_panel = { workspace = true }
 node_runtime = { workspace = true }
+reqwest_client = { workspace = true }
 paths = { workspace = true }
 session = { workspace = true }
 ui = { workspace = true }

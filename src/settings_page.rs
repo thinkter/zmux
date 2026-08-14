@@ -140,6 +140,7 @@ impl SettingsPage {
         set_default_shell(shell, cx);
         cx.notify();
     }
+
 }
 
 fn new_input(

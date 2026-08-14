@@ -6,6 +6,7 @@ mod bootstrap;
 mod cli_server;
 mod desktop_notifications;
 mod env;
+mod extensions;
 mod fonts;
 mod keymap;
 mod launcher;
