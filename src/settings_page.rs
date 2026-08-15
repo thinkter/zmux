@@ -142,7 +142,6 @@ impl SettingsPage {
         set_default_shell(shell, cx);
         cx.notify();
     }
-
 }
 
 fn new_input(
@@ -722,6 +721,7 @@ impl Item for SettingsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
 
     #[test]
     fn enabling_vim_mode_disables_helix_mode() {

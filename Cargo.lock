@@ -11859,6 +11859,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "theme_extension"
+version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
+dependencies = [
+ "anyhow",
+ "extension",
+ "fs",
+ "gpui",
+ "theme",
+ "theme_settings",
+]
+
+[[package]]
 name = "theme_settings"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/zed?rev=abbe85a3321bf6cb7f5b241e623d9c2e16c29187#abbe85a3321bf6cb7f5b241e623d9c2e16c29187"
@@ -15619,6 +15632,7 @@ dependencies = [
  "terminal",
  "terminal_view",
  "theme",
+ "theme_extension",
  "theme_settings",
  "ui",
  "ui_input",

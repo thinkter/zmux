@@ -1,8 +1,8 @@
 //! A theme-only adaptation of Zed's theme selector at revision
 //! `abbe85a3321bf6cb7f5b241e623d9c2e16c29187`.
 //!
-//! Zmux does not initialize Zed's extension or icon-theme systems, so keeping
-//! the selector local prevents it from exposing controls that cannot work.
+//! It stays local so the command-palette picker selects UI themes without
+//! exposing unsupported icon-theme controls.
 
 use std::sync::Arc;
 

@@ -1,6 +1,6 @@
-//! Default appearance settings for zmux. The bundled Vercel theme is registered
-//! before these settings are applied, and the `.ZedMono` alias resolves to the
-//! embedded Lilex family (see `crate::fonts`).
+//! Default appearance settings for zmux. Bundled themes are loaded from
+//! `assets/themes`, and the `.ZedMono` alias resolves to the embedded Lilex
+//! family (see `crate::fonts`).
 
 use gpui::{App, UpdateGlobal};
 use serde_json::json;
@@ -38,14 +38,6 @@ pub fn default_settings_json() -> String {
 }
 
 pub fn configure_terminal_fonts(cx: &mut App) {
-    let registry = ::theme::ThemeRegistry::global(cx);
-    if let Err(error) = theme_settings::load_user_theme(
-        &registry,
-        include_bytes!("../assets/themes/vercel-theme.json"),
-    ) {
-        eprintln!("failed to load bundled Vercel theme: {error:#}");
-    }
-
     let settings_json = default_settings_json();
     settings::SettingsStore::update_global(cx, |store, cx| {
         let _ = store.set_user_settings(&settings_json, cx);
