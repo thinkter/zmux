@@ -8,6 +8,7 @@
 pub(crate) enum AgentKind {
     Claude,
     Codex,
+    Omp,
     OpenCode,
     Pi,
     Amp,
@@ -28,6 +29,7 @@ impl AgentKind {
         match executable {
             "claude" | "claude-code" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "omp" => Some(Self::Omp),
             "opencode" => Some(Self::OpenCode),
             "pi" => Some(Self::Pi),
             "amp" => Some(Self::Amp),
@@ -42,6 +44,7 @@ impl AgentKind {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
+            Self::Omp => "OMP",
             Self::OpenCode => "opencode",
             Self::Pi => "Pi",
             Self::Amp => "Amp",
