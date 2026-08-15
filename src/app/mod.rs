@@ -88,7 +88,9 @@ pub fn init_zmux(cx: &mut App) -> Task<Arc<AppState>> {
     gpui_tokio::init(cx);
 
     settings::init(cx);
-    theme_settings::init(theme::LoadThemes::JustBase, cx);
+    // `all` loads every theme JSON under the embedded `themes/` directory, so
+    // adding a theme to `assets/themes/` is enough to offer it in settings.
+    theme_settings::init(theme::LoadThemes::All(Box::new(crate::assets::Assets)), cx);
     editor::init(cx);
     ::terminal::terminal_settings::TerminalSettings::register(cx);
     configure_terminal_fonts(cx);
@@ -117,6 +119,7 @@ fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
     workspace::init(app_state.clone(), cx);
     extensions_ui::init(cx);
     command_palette::init(cx);
+    crate::theme_selector::init(cx);
     vim::init(cx);
     git_ui::init(cx);
     project_panel::init(cx);

@@ -30,6 +30,7 @@ terminal = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf
 terminal_view = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 tab_switcher = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 theme = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
+theme_extension = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 theme_settings = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 util = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
 vim = { git = "https://github.com/zed-industries/zed", rev = "abbe85a3321bf6cb7f5b241e623d9c2e16c29187" }
@@ -128,6 +129,7 @@ async-process = "2"
 collections = { workspace = true }
 command_palette = { workspace = true }
 editor = { workspace = true }
+fuzzy = { workspace = true }
 gpui = { workspace = true }
 extension = { workspace = true }
 extension_host = { workspace = true }
@@ -138,6 +140,8 @@ grammars = { workspace = true, features = ["load-grammars"] }
 hmac = "0.12"
 mio = { version = "1", features = ["net", "os-poll"] }
 settings = { workspace = true }
+picker = { workspace = true }
+theme_extension = { workspace = true }
 sha2 = "0.10"
 task = { workspace = true }
 terminal = { workspace = true }

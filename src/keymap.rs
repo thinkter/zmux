@@ -1,4 +1,4 @@
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, KeyBinding, Unbind, actions};
 use terminal::{Copy, Paste, ScrollPageDown, ScrollPageUp, ScrollToBottom};
 use terminal_view::{DecreaseFontSize, IncreaseFontSize, ResetFontSize};
 use workspace::pane::{CloseActiveItem, CloseAllItems, CloseOtherItems};
@@ -126,6 +126,18 @@ pub fn configure_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("ctrl-shift-x", zed_actions::Extensions::default(), None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new(
+            "cmd-k cmd-t",
+            Unbind("theme_selector::Toggle".into()),
+            Some("Workspace"),
+        ),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-k ctrl-t",
+            Unbind("theme_selector::Toggle".into()),
+            Some("Workspace"),
+        ),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
 }
