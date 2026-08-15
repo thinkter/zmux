@@ -2786,10 +2786,22 @@ fn normalize_path_command_name(command: &str) -> Option<String> {
 }
 
 fn foreground_process_command_from_argv(argv: &[String]) -> Option<String> {
-    let command = argv
-        .first()
-        .and_then(|command| normalize_path_command_name(command));
+    let command = argv.first().and_then(|command| {
+        normalize_path_command_name(command).or_else(|| {
+            let path = command.as_bytes();
+            let is_absolute_path = command.starts_with('/')
+                || command.starts_with("\\\\")
+                || (path.get(1) == Some(&b':')
+                    && path
+                        .get(2)
+                        .is_some_and(|separator| matches!(*separator, b'/' | b'\\')));
 
+            is_absolute_path
+                .then(|| command.rsplit(['/', '\\']).next())
+                .flatten()
+                .and_then(normalize_path_command_name)
+        })
+    });
     if !matches!(
         command.as_deref(),
         Some("node" | "python" | "python3" | "bun" | "deno")
@@ -3039,6 +3051,19 @@ mod tests {
             foreground_process_command_from_argv(&[
                 "python3".to_string(),
                 "/Users/me/.local/bin/codex.py".to_string(),
+            ]),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            foreground_process_command_from_argv(&[
+                "/home/user/.codex/packages/standalone/releases/0.147.0-x86_64-unknown-linux-musl/bin/codex"
+                    .to_string(),
+            ]),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            foreground_process_command_from_argv(&[
+                r"C:\Users\me\.codex\packages\standalone\current\bin\codex.exe".to_string(),
             ]),
             Some("codex".to_string())
         );

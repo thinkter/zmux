@@ -98,6 +98,7 @@ impl AgentKind {
             Self::OpenCode => Some(ForegroundProcessIcon::Named(IconName::AiOpenCode)),
             Self::Gemini => Some(ForegroundProcessIcon::Named(IconName::AiGemini)),
             Self::Pi => Some(ForegroundProcessIcon::Embedded("icons/ai_pi.svg")),
+            Self::Omp => Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg")),
             Self::Amp | Self::Aider | Self::Goose => None,
         }
     }
@@ -1093,6 +1094,7 @@ fn foreground_process_icon(process: &str) -> Option<ForegroundProcessIcon> {
     match executable {
         "codex" => Some(ForegroundProcessIcon::Named(IconName::AiOpenAi)),
         "claude" | "claude-code" => Some(ForegroundProcessIcon::Named(IconName::AiClaude)),
+        "omp" => Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg")),
         "git" => Some(ForegroundProcessIcon::Named(IconName::GitBranch)),
         "nvim" | "neovim" => Some(ForegroundProcessIcon::Embedded("icons/neovim.svg")),
         _ => None,
@@ -1226,6 +1228,10 @@ mod tests {
             AgentKind::Pi.icon(),
             Some(ForegroundProcessIcon::Embedded("icons/ai_pi.svg"))
         );
+        assert_eq!(
+            AgentKind::Omp.icon(),
+            Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg"))
+        );
         assert_eq!(AgentKind::Amp.icon(), None);
         assert_eq!(AgentKind::Aider.icon(), None);
         assert_eq!(AgentKind::Goose.icon(), None);
@@ -1244,6 +1250,10 @@ mod tests {
         assert_eq!(
             foreground_process_icon(r"C:\\tools\\claude-code.exe"),
             Some(ForegroundProcessIcon::Named(IconName::AiClaude))
+        );
+        assert_eq!(
+            foreground_process_icon("/home/user/.bun/bin/omp"),
+            Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg"))
         );
         assert_eq!(
             foreground_process_icon("/usr/bin/git"),

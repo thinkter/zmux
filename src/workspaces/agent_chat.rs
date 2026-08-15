@@ -596,6 +596,7 @@ mod tests {
             Some(AgentKind::Claude)
         );
         assert_eq!(AgentKind::from_process("codex"), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::from_process("omp"), Some(AgentKind::Omp));
         assert_eq!(
             AgentKind::from_process("opencode"),
             Some(AgentKind::OpenCode)

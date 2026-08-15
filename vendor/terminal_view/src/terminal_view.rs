@@ -611,6 +611,7 @@ impl TerminalView {
             "claude" | "claude-code" => Some(TerminalTabIcon::Named(IconName::AiClaude)),
             "opencode" => Some(TerminalTabIcon::Named(IconName::AiOpenCode)),
             "pi" => Some(TerminalTabIcon::Embedded("icons/ai_pi.svg")),
+            "omp" => Some(TerminalTabIcon::Embedded("icons/ai_omp.svg")),
             "nvim" | "neovim" => Some(TerminalTabIcon::Embedded("icons/neovim.svg")),
             _ => None,
         }
@@ -3213,6 +3214,7 @@ mod tests {
             ("claude", TerminalTabIcon::Named(IconName::AiClaude)),
             ("opencode", TerminalTabIcon::Named(IconName::AiOpenCode)),
             ("pi", TerminalTabIcon::Embedded("icons/ai_pi.svg")),
+            ("omp", TerminalTabIcon::Embedded("icons/ai_omp.svg")),
             ("nvim", TerminalTabIcon::Embedded("icons/neovim.svg")),
             (
                 r"C:\\Program Files\\Neovim\\bin\\nvim.EXE",
