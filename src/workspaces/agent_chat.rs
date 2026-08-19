@@ -598,6 +598,20 @@ mod tests {
         assert_eq!(AgentKind::from_process("codex"), Some(AgentKind::Codex));
         assert_eq!(AgentKind::from_process("omp"), Some(AgentKind::Omp));
         assert_eq!(
+            AgentKind::from_process("cursor-agent"),
+            Some(AgentKind::Cursor)
+        );
+        assert_eq!(
+            AgentKind::from_process("/home/user/.local/bin/agent"),
+            Some(AgentKind::Cursor)
+        );
+        assert_eq!(
+            AgentKind::from_process(
+                "/home/user/.local/share/cursor-agent/versions/2026.08.11-e8db854/cursor-agent"
+            ),
+            Some(AgentKind::Cursor)
+        );
+        assert_eq!(
             AgentKind::from_process("opencode"),
             Some(AgentKind::OpenCode)
         );
@@ -617,6 +631,8 @@ mod tests {
         // "pi" must match exactly; near-misses stay out.
         assert_eq!(AgentKind::from_process("pip"), None);
         assert_eq!(AgentKind::from_process("pixi"), None);
+        assert_eq!(AgentKind::from_process("agents"), None);
+        assert_eq!(AgentKind::from_process("agentd"), None);
     }
 
     fn observation(

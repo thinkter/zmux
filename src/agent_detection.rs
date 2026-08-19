@@ -8,6 +8,7 @@
 pub(crate) enum AgentKind {
     Claude,
     Codex,
+    Cursor,
     Omp,
     OpenCode,
     Pi,
@@ -29,6 +30,7 @@ impl AgentKind {
         match executable {
             "claude" | "claude-code" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "cursor-agent" | "agent" => Some(Self::Cursor),
             "omp" => Some(Self::Omp),
             "opencode" => Some(Self::OpenCode),
             "pi" => Some(Self::Pi),
@@ -44,6 +46,7 @@ impl AgentKind {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
             Self::Omp => "OMP",
             Self::OpenCode => "opencode",
             Self::Pi => "Pi",
@@ -55,7 +58,7 @@ impl AgentKind {
     }
 
     pub(crate) fn has_detailed_detection(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex)
+        matches!(self, Self::Claude | Self::Codex | Self::Cursor)
     }
 }
 
@@ -86,6 +89,7 @@ pub(crate) fn detect_agent(kind: AgentKind, snapshot: AgentSnapshot<'_>) -> Dete
     match kind {
         AgentKind::Codex => detect_codex(snapshot),
         AgentKind::Claude => detect_claude(snapshot),
+        AgentKind::Cursor => detect_cursor(snapshot),
         _ => DetectionOutcome {
             signal: DetectionSignal::Quiet,
             evidence: "process_only",
@@ -205,17 +209,54 @@ fn detect_claude(snapshot: AgentSnapshot<'_>) -> DetectionOutcome {
     outcome(DetectionSignal::Quiet, "claude_no_live_signal")
 }
 
-pub(crate) fn submitted_prompt(kind: AgentKind, recent: &str) -> Option<String> {
-    let marker = match kind {
-        AgentKind::Codex => '›',
-        AgentKind::Claude => '❯',
-        _ => return None,
-    };
+fn detect_cursor(snapshot: AgentSnapshot<'_>) -> DetectionOutcome {
+    let title = snapshot.osc_title.trim();
+    if starts_with_braille_spinner(title) {
+        return outcome(DetectionSignal::Working, "cursor_title_spinner");
+    }
 
+    let lower = snapshot.recent.to_lowercase();
+    if cursor_trust_or_permission(&lower) {
+        return outcome(DetectionSignal::NeedsInput, "cursor_permission_prompt");
+    }
+    if contains_ci(snapshot.recent, "↑/↓ to navigate") {
+        return outcome(DetectionSignal::Hold, "cursor_picker");
+    }
+    if contains_ci(&lower, "ctrl+c to stop") {
+        return outcome(DetectionSignal::Working, "cursor_ctrl_c_to_stop");
+    }
+    if cursor_idle_placeholder(&lower) {
+        return outcome(DetectionSignal::Idle, "cursor_tui_placeholder");
+    }
+    if cursor_idle_prompt(snapshot.recent) {
+        return outcome(DetectionSignal::Idle, "cursor_prompt");
+    }
+    if cursor_live_spinner(snapshot.recent) {
+        return outcome(DetectionSignal::Working, "cursor_live_spinner");
+    }
+
+    outcome(DetectionSignal::Quiet, "cursor_no_live_signal")
+}
+
+pub(crate) fn submitted_prompt(kind: AgentKind, recent: &str) -> Option<String> {
+    match kind {
+        AgentKind::Codex => submitted_prompt_with_markers(recent, &['›']),
+        AgentKind::Claude => submitted_prompt_with_markers(recent, &['❯']),
+        AgentKind::Cursor => submitted_prompt_with_markers(recent, &['❯', '→']),
+        _ => None,
+    }
+}
+
+fn submitted_prompt_with_markers(recent: &str, markers: &[char]) -> Option<String> {
     recent.lines().rev().find_map(|line| {
         let trimmed = line.trim_start();
-        let text = trimmed.strip_prefix(marker)?.trim();
-        if text.is_empty() || prompt_control_text(text) {
+        let text = markers.iter().find_map(|marker| {
+            trimmed
+                .strip_prefix(*marker)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })?;
+        if prompt_control_text(text) || cursor_placeholder_text(text) {
             return None;
         }
         bounded_normalized(text, 96)
@@ -236,7 +277,11 @@ pub(crate) fn sanitized_osc_title(kind: AgentKind, title: &str) -> Option<String
     if let Some(rest) = title.strip_prefix('✳') {
         title = rest.trim_start();
     }
-    if title.is_empty() || AgentKind::from_process(title) == Some(kind) {
+    if title.is_empty()
+        || AgentKind::from_process(title) == Some(kind)
+        || title.eq_ignore_ascii_case(kind.label())
+        || (kind == AgentKind::Cursor && title.eq_ignore_ascii_case("cursor agent"))
+    {
         return None;
     }
     bounded_normalized(title, 96)
@@ -308,6 +353,41 @@ fn prompt_control_text(text: &str) -> bool {
         || lower.contains("enter to select")
         || lower.contains("esc to cancel")
         || lower.contains("arrow keys")
+}
+
+fn cursor_trust_or_permission(lower: &str) -> bool {
+    contains_ci(lower, "do you trust")
+        || contains_ci(lower, "confirm folder trust")
+        || contains_ci(lower, "do you want to allow")
+        || contains_ci(lower, "do you want to run")
+        || contains_ci(lower, "approve this action")
+        || contains_ci(lower, "[y/n]")
+}
+
+fn cursor_idle_placeholder(lower: &str) -> bool {
+    contains_ci(lower, "plan, search, build anything") || contains_ci(lower, "add a follow-up")
+}
+
+fn cursor_placeholder_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    cursor_idle_placeholder(&lower) || contains_ci(&lower, "ctrl+c to stop")
+}
+
+fn cursor_idle_prompt(recent: &str) -> bool {
+    recent.lines().rev().any(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix('❯')
+            .or_else(|| trimmed.strip_prefix('→'))
+            .is_some_and(|rest| rest.trim().is_empty())
+    })
+}
+
+fn cursor_live_spinner(recent: &str) -> bool {
+    recent.lines().rev().any(|line| {
+        let trimmed = line.trim_start();
+        starts_with_braille_spinner(trimmed) && (trimmed.contains('…') || trimmed.contains("..."))
+    })
 }
 
 fn bounded_normalized(text: &str, max_chars: usize) -> Option<String> {
@@ -447,6 +527,38 @@ mod tests {
             detect_agent(AgentKind::Claude, snapshot("ordinary output", "")).signal,
             DetectionSignal::Quiet
         );
+        assert_eq!(
+            detect_agent(AgentKind::Cursor, snapshot("ordinary output", "")).signal,
+            DetectionSignal::Quiet
+        );
+    }
+
+    #[test]
+    fn cursor_distinguishes_working_blocked_idle_and_transient_views() {
+        assert_eq!(
+            detect_agent(AgentKind::Cursor, snapshot("", "⠋ implementing")).signal,
+            DetectionSignal::Working
+        );
+        let working = "Composer 2.5 Fast\n→ Add a follow-up  ctrl+c to stop";
+        assert_eq!(
+            detect_agent(AgentKind::Cursor, snapshot(working, "Cursor Agent")).signal,
+            DetectionSignal::Working
+        );
+        let permission = "Do you trust the files in this folder?\n[y/n]";
+        assert_eq!(
+            detect_agent(AgentKind::Cursor, snapshot(permission, "")).signal,
+            DetectionSignal::NeedsInput
+        );
+        let idle = "Run Everything\n→ Add a follow-up";
+        assert_eq!(
+            detect_agent(AgentKind::Cursor, snapshot(idle, "Cursor Agent")).signal,
+            DetectionSignal::Idle
+        );
+        let picker = "Select model\n↑/↓ to navigate · enter to select";
+        assert_eq!(
+            detect_agent(AgentKind::Cursor, snapshot(picker, "")).signal,
+            DetectionSignal::Hold
+        );
     }
 
     #[test]
@@ -460,11 +572,24 @@ mod tests {
             Some("review the API".into())
         );
         assert_eq!(
+            submitted_prompt(AgentKind::Cursor, "→ implement the agent rail"),
+            Some("implement the agent rail".into())
+        );
+        assert_eq!(
+            submitted_prompt(AgentKind::Cursor, "→ Add a follow-up"),
+            None
+        );
+        assert_eq!(
             sanitized_osc_title(AgentKind::Codex, "Action Required"),
             None
         );
         assert_eq!(
             sanitized_osc_title(AgentKind::Codex, "⠋ refactor workspace state"),
+            Some("refactor workspace state".into())
+        );
+        assert_eq!(sanitized_osc_title(AgentKind::Cursor, "Cursor Agent"), None);
+        assert_eq!(
+            sanitized_osc_title(AgentKind::Cursor, "⠋ refactor workspace state"),
             Some("refactor workspace state".into())
         );
         assert!(
