@@ -2424,6 +2424,7 @@ fn embedded_assets_include_bundled_fonts() {
         "icons/ai_open_code.svg",
         "icons/ai_pi.svg",
         "icons/ai_omp.svg",
+        "icons/ai_cursor.svg",
         "icons/neovim.svg",
     ] {
         assert!(

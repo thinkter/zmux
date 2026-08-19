@@ -99,6 +99,7 @@ impl AgentKind {
             Self::Gemini => Some(ForegroundProcessIcon::Named(IconName::AiGemini)),
             Self::Pi => Some(ForegroundProcessIcon::Embedded("icons/ai_pi.svg")),
             Self::Omp => Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg")),
+            Self::Cursor => Some(ForegroundProcessIcon::Embedded("icons/ai_cursor.svg")),
             Self::Amp | Self::Aider | Self::Goose => None,
         }
     }
@@ -1094,6 +1095,7 @@ fn foreground_process_icon(process: &str) -> Option<ForegroundProcessIcon> {
     match executable {
         "codex" => Some(ForegroundProcessIcon::Named(IconName::AiOpenAi)),
         "claude" | "claude-code" => Some(ForegroundProcessIcon::Named(IconName::AiClaude)),
+        "cursor-agent" | "agent" => Some(ForegroundProcessIcon::Embedded("icons/ai_cursor.svg")),
         "omp" => Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg")),
         "git" => Some(ForegroundProcessIcon::Named(IconName::GitBranch)),
         "nvim" | "neovim" => Some(ForegroundProcessIcon::Embedded("icons/neovim.svg")),
@@ -1232,6 +1234,10 @@ mod tests {
             AgentKind::Omp.icon(),
             Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg"))
         );
+        assert_eq!(
+            AgentKind::Cursor.icon(),
+            Some(ForegroundProcessIcon::Embedded("icons/ai_cursor.svg"))
+        );
         assert_eq!(AgentKind::Amp.icon(), None);
         assert_eq!(AgentKind::Aider.icon(), None);
         assert_eq!(AgentKind::Goose.icon(), None);
@@ -1254,6 +1260,16 @@ mod tests {
         assert_eq!(
             foreground_process_icon("/home/user/.bun/bin/omp"),
             Some(ForegroundProcessIcon::Embedded("icons/ai_omp.svg"))
+        );
+        assert_eq!(
+            foreground_process_icon(
+                "/home/user/.local/share/cursor-agent/versions/2026.08.11-e8db854/cursor-agent"
+            ),
+            Some(ForegroundProcessIcon::Embedded("icons/ai_cursor.svg"))
+        );
+        assert_eq!(
+            foreground_process_icon("/home/user/.local/bin/agent"),
+            Some(ForegroundProcessIcon::Embedded("icons/ai_cursor.svg"))
         );
         assert_eq!(
             foreground_process_icon("/usr/bin/git"),

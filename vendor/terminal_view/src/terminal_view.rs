@@ -612,6 +612,7 @@ impl TerminalView {
             "opencode" => Some(TerminalTabIcon::Named(IconName::AiOpenCode)),
             "pi" => Some(TerminalTabIcon::Embedded("icons/ai_pi.svg")),
             "omp" => Some(TerminalTabIcon::Embedded("icons/ai_omp.svg")),
+            "cursor-agent" | "agent" => Some(TerminalTabIcon::Embedded("icons/ai_cursor.svg")),
             "nvim" | "neovim" => Some(TerminalTabIcon::Embedded("icons/neovim.svg")),
             _ => None,
         }
@@ -3215,6 +3216,8 @@ mod tests {
             ("opencode", TerminalTabIcon::Named(IconName::AiOpenCode)),
             ("pi", TerminalTabIcon::Embedded("icons/ai_pi.svg")),
             ("omp", TerminalTabIcon::Embedded("icons/ai_omp.svg")),
+            ("cursor-agent", TerminalTabIcon::Embedded("icons/ai_cursor.svg")),
+            ("agent", TerminalTabIcon::Embedded("icons/ai_cursor.svg")),
             ("nvim", TerminalTabIcon::Embedded("icons/neovim.svg")),
             (
                 r"C:\\Program Files\\Neovim\\bin\\nvim.EXE",
