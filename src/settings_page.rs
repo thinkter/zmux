@@ -1,13 +1,14 @@
-//! The Settings tab: a workspace item exposing zmux's appearance settings.
-//! Every control writes through Zed's `SettingsStore::update_settings_file`,
-//! so changes land in the user's `settings.json` and apply live via the
-//! settings-file watcher installed by `crate::app::load_user_settings`.
+//! The Settings tab: appearance, terminal, agent rail, and editing settings.
+//! Appearance and terminal controls write through Zed's
+//! `SettingsStore::update_settings_file`, so those changes land in the user's
+//! `settings.json`. Agent-rail scope is zmux-owned and lives in
+//! `state/prefs-v1.json`.
 
 use std::path::Path;
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement,
-    Render, SharedString, Styled, Window,
+    Render, SharedString, Styled, Subscription, Window,
 };
 use settings::{
     Settings, SettingsContent, SettingsStore, Shell as SettingsShell, ThemeName, ThemeSelection,
@@ -25,6 +26,7 @@ use vim_mode_setting::VimModeSetting;
 use workspace::AppState;
 use workspace::item::{Item, ItemEvent};
 
+use crate::prefs::{AgentChatScope, ZmuxPrefs, set_agent_chat_scope};
 use crate::shell_settings::{ShellCandidate, detect_shell_candidates, resolve_custom_shell};
 use crate::theme::{DEFAULT_MONO_FONT, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_UI_FONT_SIZE};
 
@@ -44,6 +46,7 @@ pub struct SettingsPage {
     custom_arguments: Vec<Entity<InputField>>,
     next_argument_id: usize,
     show_custom_shell: bool,
+    _prefs_subscription: Subscription,
 }
 
 impl SettingsPage {
@@ -66,6 +69,8 @@ impl SettingsPage {
             })
             .collect::<Vec<_>>();
         let next_argument_id = custom_arguments.len() + 1;
+        ZmuxPrefs::init(cx);
+        let _prefs_subscription = cx.observe_global::<ZmuxPrefs>(|_, cx| cx.notify());
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -74,6 +79,7 @@ impl SettingsPage {
             custom_arguments,
             next_argument_id,
             show_custom_shell,
+            _prefs_subscription,
         }
     }
 
@@ -334,6 +340,10 @@ fn set_vim_mode(enabled: bool, cx: &mut App) {
     update_settings_file(cx, move |content, _| apply_vim_mode(content, enabled));
 }
 
+fn current_agent_chat_scope(cx: &App) -> AgentChatScope {
+    ZmuxPrefs::get(cx).agent_chat_scope
+}
+
 #[derive(IntoElement)]
 struct SectionHeader {
     title: SharedString,
@@ -427,6 +437,7 @@ impl Render for SettingsPage {
         let terminal_font_size = current_terminal_font_size(cx);
         let vim_mode = current_vim_mode(cx);
         let configured_shell = TerminalSettings::get_global(cx).shell.clone();
+        let agent_chat_scope = current_agent_chat_scope(cx);
 
         let theme_menu = ContextMenu::build(window, cx, |mut menu, _window, cx| {
             let mut themes = ::theme::ThemeRegistry::global(cx).list();
@@ -500,6 +511,15 @@ impl Render for SettingsPage {
                         this.begin_custom_shell(window, cx);
                     });
                 })
+        });
+
+        let agent_scope_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
+            menu.entry(AgentChatScope::Global.label(), None, |_window, cx| {
+                set_agent_chat_scope(AgentChatScope::Global, cx);
+            })
+            .entry(AgentChatScope::Workspace.label(), None, |_window, cx| {
+                set_agent_chat_scope(AgentChatScope::Workspace, cx);
+            })
         });
 
         let custom_argument_rows = self
@@ -669,6 +689,20 @@ impl Render for SettingsPage {
                                         ),
                                 )
                             }),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_full()
+                            .child(SectionHeader::new("Agents"))
+                            .child(setting_row(
+                                "Agent list",
+                                "Show agents from every workspace, or only the one you are in",
+                                DropdownMenu::new(
+                                    "agent-chat-scope",
+                                    agent_chat_scope.label(),
+                                    agent_scope_menu,
+                                ),
+                            )),
                     )
                     .child(
                         v_flex()

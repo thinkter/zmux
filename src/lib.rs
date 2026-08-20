@@ -14,6 +14,7 @@ mod metadata;
 mod notification_runtime;
 mod notifications;
 mod osc;
+mod prefs;
 mod session;
 mod settings_page;
 mod shell_settings;

@@ -47,6 +47,7 @@ use crate::app::{
 use crate::metadata::{GitMetadata, MetadataState};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{NotificationStore, WorkspaceId};
+use crate::prefs::ZmuxPrefs;
 use crate::session::{LayoutSnapshot, SessionOwnerGeneration, SessionStore};
 use crate::welcome::ZmuxWelcome;
 
@@ -375,6 +376,7 @@ pub struct WorkspacesPanel {
     _notification_subscription: Subscription,
     _workspace_subscription: Subscription,
     _project_subscription: Option<Subscription>,
+    _prefs_subscription: Subscription,
     terminal_registry: HashMap<EntityId, RegisteredTerminal>,
     dirty_agent_terminals: HashSet<EntityId>,
     agent_refresh_queue: DeadlineQueue<EntityId>,
@@ -504,6 +506,8 @@ impl WorkspacesPanel {
                 this.handle_workspace_event(event, window, cx);
             },
         );
+        ZmuxPrefs::init(cx);
+        let _prefs_subscription = cx.observe_global::<ZmuxPrefs>(|_, cx| cx.notify());
         cx.on_release(|this, cx| {
             this.session_owner_generation = None;
             release_session_panel(this.scope_id, cx);
@@ -544,6 +548,7 @@ impl WorkspacesPanel {
             _notification_subscription: notification_subscription,
             _workspace_subscription: workspace_subscription,
             _project_subscription: None,
+            _prefs_subscription,
             terminal_registry: HashMap::new(),
             dirty_agent_terminals: HashSet::new(),
             agent_refresh_queue: DeadlineQueue::default(),
@@ -1722,11 +1727,15 @@ impl WorkspacesPanel {
 
     fn focus_terminal_item(
         &mut self,
+        workspace_id: WorkspaceId,
         item_id: EntityId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(chat) = self.agent_chats.get_mut(&(self.active, item_id)) {
+        if workspace_id != self.active {
+            self.activate_workspace(workspace_id, window, cx);
+        }
+        if let Some(chat) = self.agent_chats.get_mut(&(workspace_id, item_id)) {
             chat.focused = true;
             if chat.state == AgentChatState::Idle {
                 chat.seen = true;

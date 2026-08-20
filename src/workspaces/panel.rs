@@ -19,11 +19,12 @@ use crate::agent_detection::AgentKind;
 use crate::metadata::{GitMetadata, MetadataState};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::{Notification, NotificationStore, WorkspaceId};
+use crate::prefs::{AgentChatScope, ZmuxPrefs};
 use crate::theme::DEFAULT_MONO_FONT;
 
 use super::agent_chat::{
     AgentChatState, agent_chat_detail, agent_chat_display_title, agent_chat_tooltip,
-    agent_chats_for_workspace,
+    agent_chats_for_scope, workspace_agent_attention,
 };
 use super::git_context::WorkspaceContext;
 use super::{ToggleWorkspacesPanel, WorkspacesPanel, path_display_name, workspace_cwd_label};
@@ -141,8 +142,17 @@ impl Render for DraggedWorkspace {
 }
 
 impl WorkspacesPanel {
+    fn workspace_display_name(&self, id: WorkspaceId) -> String {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.display_name().to_string())
+            .unwrap_or_else(|| format!("Workspace {id}"))
+    }
+
     fn render_agent_chats(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let chats = agent_chats_for_workspace(&self.agent_chats, self.active);
+        let scope = ZmuxPrefs::get(cx).agent_chat_scope;
+        let chats = agent_chats_for_scope(&self.agent_chats, scope, self.active);
         if chats.is_empty() {
             return None;
         }
@@ -167,7 +177,7 @@ impl WorkspacesPanel {
                         .py_1()
                         .justify_between()
                         .child(
-                            Label::new("Chats")
+                            Label::new("Agents")
                                 .size(LabelSize::Small)
                                 .weight(FontWeight::SEMIBOLD),
                         )
@@ -187,10 +197,14 @@ impl WorkspacesPanel {
                         .overflow_y_scroll()
                         .children(chats.into_iter().map(|chat| {
                             let item_id = chat.item_id;
+                            let workspace_id = chat.workspace_id;
+                            let workspace_name = (scope == AgentChatScope::Global)
+                                .then(|| self.workspace_display_name(workspace_id));
                             let title = agent_chat_display_title(&chat);
-                            let detail = agent_chat_detail(&chat);
-                            let tooltip = agent_chat_tooltip(&chat, &title);
-                            let focused = chat.focused;
+                            let detail = agent_chat_detail(&chat, workspace_name.as_deref());
+                            let tooltip =
+                                agent_chat_tooltip(&chat, &title, workspace_name.as_deref());
+                            let focused = chat.focused && workspace_id == self.active;
 
                             h_flex()
                                 .id(("agent-chat-row", item_id))
@@ -207,7 +221,7 @@ impl WorkspacesPanel {
                                 .cursor_pointer()
                                 .tooltip(Tooltip::text(tooltip))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.focus_terminal_item(item_id, window, cx);
+                                    this.focus_terminal_item(workspace_id, item_id, window, cx);
                                 }))
                                 .child(Indicator::dot().color(chat.state.color(chat.seen)))
                                 .child(match chat.kind.icon() {
@@ -265,6 +279,7 @@ impl WorkspacesPanel {
             .map(|rename| rename.editor.clone());
         let group = SharedString::from(format!("ws-row-{id}"));
         let can_close = self.entries.len() > 1;
+        let agent_attention = workspace_agent_attention(&self.agent_chats, id);
 
         let editor = renaming.clone();
         let is_renaming = renaming.is_some();
@@ -273,6 +288,15 @@ impl WorkspacesPanel {
             .flex_1()
             .gap_1()
             .overflow_hidden()
+            .when_some(agent_attention, |this, color| {
+                this.child(
+                    div()
+                        .id(("ws-agent-attention", id as usize))
+                        .flex_none()
+                        .tooltip(Tooltip::text("An agent in this workspace needs attention"))
+                        .child(Indicator::dot().color(color)),
+                )
+            })
             .when(unread_count > 0, |this| {
                 this.child(
                     div()

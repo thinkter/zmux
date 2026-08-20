@@ -32,6 +32,7 @@ use crate::cli_server::CliServer;
 use crate::keymap::{Quit, configure_keybindings};
 use crate::notification_runtime::NotificationRuntime;
 use crate::notifications::NotificationStore;
+use crate::prefs::ZmuxPrefs;
 use crate::theme::{DEFAULT_THEME, configure_terminal_fonts};
 use crate::workspaces::{WorkspacesPanel, install_git_repository_scope};
 
@@ -152,6 +153,7 @@ fn finish_zmux_init(app_state: Arc<AppState>, cx: &mut App) -> Arc<AppState> {
         cx,
     );
     NotificationRuntime::init(cx);
+    ZmuxPrefs::init(cx);
     terminal_view::set_terminal_tab_indicator_handler(
         Arc::new(|item_id, cx| {
             NotificationStore::global(cx)
