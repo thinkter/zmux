@@ -43,7 +43,14 @@ its missing-sample count is cleared.
 
 ## Presentation
 
-Rows sort by attention state and then recent activity. Titles prefer an explicit
-terminal title, a bounded submitted-prompt snippet, and sanitized OSC metadata
-before falling back to the agent label. Focusing the terminal updates read state;
-the rail never owns or persists the agent process itself.
+The rail is global by default: every live agent across every workspace appears
+in one list, sorted by attention state and then recent activity. A Settings
+option scopes it to the current workspace instead. Global rows include the
+owning workspace name. Titles prefer an explicit terminal title, a bounded
+submitted-prompt snippet, and sanitized OSC metadata before falling back to
+the agent label. Clicking a row activates that workspace and focuses the
+terminal. Focusing the terminal updates read state; the rail never owns or
+persists the agent process itself.
+
+Workspace rows keep the user's order. A compact attention dot marks a workspace
+whose agent needs input or has an unseen completed turn.
