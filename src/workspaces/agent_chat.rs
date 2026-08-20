@@ -20,6 +20,7 @@ use crate::agent_detection::{
     AgentKind, AgentSnapshot, DetectionSignal, detect_agent, sanitized_osc_title, submitted_prompt,
 };
 use crate::notifications::WorkspaceId;
+use crate::prefs::AgentChatScope;
 
 const AGENT_DETECTION_TAIL_LINES: usize = 80;
 const AGENT_STATE_CONFIRMATIONS: u8 = 2;
@@ -511,8 +512,12 @@ pub(super) fn agent_chat_display_title(chat: &AgentChat) -> String {
         .unwrap_or_else(|| format!("{} chat #{}", chat.kind.label(), chat.creation_sequence))
 }
 
-pub(super) fn agent_chat_detail(chat: &AgentChat) -> String {
+pub(super) fn agent_chat_detail(chat: &AgentChat, workspace_name: Option<&str>) -> String {
     let mut detail = format!("{} · {}", chat.state.label(chat.seen), chat.kind.label());
+    if let Some(workspace_name) = workspace_name.filter(|name| !name.is_empty()) {
+        detail.push_str(" · ");
+        detail.push_str(workspace_name);
+    }
     if let Some(cwd) = chat
         .cwd
         .as_deref()
@@ -526,12 +531,20 @@ pub(super) fn agent_chat_detail(chat: &AgentChat) -> String {
     detail
 }
 
-pub(super) fn agent_chat_tooltip(chat: &AgentChat, title: &str) -> String {
+pub(super) fn agent_chat_tooltip(
+    chat: &AgentChat,
+    title: &str,
+    workspace_name: Option<&str>,
+) -> String {
     let mut tooltip = format!(
         "Open {title}\n{} · {}",
         chat.state.label(chat.seen),
         chat.kind.label()
     );
+    if let Some(workspace_name) = workspace_name.filter(|name| !name.is_empty()) {
+        tooltip.push('\n');
+        tooltip.push_str(workspace_name);
+    }
     if let Some(cwd) = &chat.cwd {
         tooltip.push('\n');
         tooltip.push_str(&cwd.to_string_lossy());
@@ -559,17 +572,44 @@ fn sort_agent_chats(chats: &mut [AgentChat]) {
     });
 }
 
-pub(super) fn agent_chats_for_workspace(
+pub(super) fn agent_chats_for_scope(
     chats: &HashMap<(WorkspaceId, EntityId), AgentChat>,
-    workspace_id: WorkspaceId,
+    scope: AgentChatScope,
+    active_workspace_id: WorkspaceId,
 ) -> Vec<AgentChat> {
     let mut chats = chats
         .values()
-        .filter(|chat| chat.workspace_id == workspace_id)
+        .filter(|chat| match scope {
+            AgentChatScope::Global => true,
+            AgentChatScope::Workspace => chat.workspace_id == active_workspace_id,
+        })
         .cloned()
         .collect::<Vec<_>>();
     sort_agent_chats(&mut chats);
     chats
+}
+
+#[cfg(test)]
+pub(super) fn agent_chats_for_workspace(
+    chats: &HashMap<(WorkspaceId, EntityId), AgentChat>,
+    workspace_id: WorkspaceId,
+) -> Vec<AgentChat> {
+    agent_chats_for_scope(chats, AgentChatScope::Workspace, workspace_id)
+}
+
+/// Highest-priority attention cue for a workspace row: needs-input, then an
+/// unseen completed turn. Working/quiet/idle-seen agents stay off the dot so
+/// the workspace list does not flash while agents merely run.
+pub(super) fn workspace_agent_attention(
+    chats: &HashMap<(WorkspaceId, EntityId), AgentChat>,
+    workspace_id: WorkspaceId,
+) -> Option<Color> {
+    chats
+        .values()
+        .filter(|chat| chat.workspace_id == workspace_id)
+        .filter(|chat| agent_chat_attention_priority(chat) >= 4)
+        .max_by_key(|chat| agent_chat_attention_priority(*chat))
+        .map(|chat| chat.state.color(chat.seen))
 }
 
 #[cfg(test)]
@@ -927,6 +967,61 @@ mod tests {
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].workspace_id, 1);
         assert_eq!(visible[0].item_id, first_item);
+
+        let scoped = agent_chats_for_scope(&chats, AgentChatScope::Workspace, 1);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].item_id, first_item);
+    }
+
+    #[test]
+    fn global_chat_list_includes_every_workspace_and_sorts_by_attention() {
+        let working_id = EntityId::from(21_u64);
+        let needs_input_id = EntityId::from(22_u64);
+        let working = chat(working_id, AgentChatState::Working, true, 10);
+        let needs_input = AgentChat {
+            workspace_id: 2,
+            ..chat(needs_input_id, AgentChatState::NeedsInput, true, 1)
+        };
+        let chats = [working, needs_input]
+            .into_iter()
+            .map(|chat| ((chat.workspace_id, chat.item_id), chat))
+            .collect();
+
+        let visible = agent_chats_for_scope(&chats, AgentChatScope::Global, 1);
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|chat| (chat.workspace_id, chat.item_id))
+                .collect::<Vec<_>>(),
+            vec![(2, needs_input_id), (1, working_id)]
+        );
+    }
+
+    #[test]
+    fn workspace_attention_dot_covers_needs_input_and_unseen_done() {
+        let needs_input = AgentChat {
+            workspace_id: 2,
+            ..chat(EntityId::from(31_u64), AgentChatState::NeedsInput, true, 1)
+        };
+        let unseen_done = chat(EntityId::from(32_u64), AgentChatState::Idle, false, 2);
+        let working = chat(EntityId::from(33_u64), AgentChatState::Working, true, 3);
+        let chats = [needs_input, unseen_done.clone(), working]
+            .into_iter()
+            .map(|chat| ((chat.workspace_id, chat.item_id), chat))
+            .collect();
+
+        assert_eq!(workspace_agent_attention(&chats, 2), Some(Color::Error));
+        assert_eq!(workspace_agent_attention(&chats, 1), Some(Color::Accent));
+        assert_eq!(workspace_agent_attention(&chats, 9), None);
+
+        let working_only = [(
+            (1, unseen_done.item_id),
+            chat(unseen_done.item_id, AgentChatState::Working, true, 4),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(workspace_agent_attention(&working_only, 1), None);
     }
 
     #[test]
