@@ -39,6 +39,7 @@ than serialized processes, so their PTYs keep running.
   fresh-shell directories. It also coalesces logical-session writes.
 - `workspaces/panel.rs` renders the workspace rail, agent rows, Git metadata and
   pickers, rename controls, and notification drawer.
+- `prefs.rs` stores zmux-owned UI preferences such as agent-rail scope.
 - `workspace_switcher.rs` provides the modifier-aware workspace switcher.
 
 The durable schema and atomic file I/O live in `session.rs`. Sessions contain
@@ -50,7 +51,9 @@ environment variables, and process state are never persisted.
 `agent_detection.rs` maps known process names to `AgentKind` and classifies the
 bounded live UI as working, needing input, idle, quiet, or a transient view.
 `workspaces/agent_chat.rs` owns row identity, ordering, presentation metadata,
-and the confirmation state machine. See [Agent chat rail](agent-chat-rail.md).
+and the confirmation state machine. The rail is global by default, with a
+Settings toggle to scope it to the active workspace. Preferences live in
+`prefs.rs` (`state/prefs-v1.json`). See [Agent chat rail](agent-chat-rail.md).
 
 ## Notifications
 
@@ -73,8 +76,9 @@ owns platform tokens and callbacks but never becomes the canonical history.
 - `assets.rs` embeds fonts, icons, images, and themes.
 - `fonts.rs` registers the embedded font families.
 - `theme.rs` defines first-run appearance and terminal font defaults.
-- `settings_page.rs` renders settings and writes them through Zed's settings
-  store; `app/mod.rs` watches the same file for hand edits.
+- `settings_page.rs` renders settings and writes appearance/terminal options
+  through Zed's settings store; `app/mod.rs` watches the same file for hand
+  edits. Agent-rail scope is stored separately in `prefs.rs`.
 - `syntax.rs` registers bundled parsers and connects the active theme.
 - `keymap.rs` defines terminal, pane, workspace, settings, zoom, and quit keys.
 - `env.rs` builds scrubbed shell environments and injects per-terminal CLI
